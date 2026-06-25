@@ -36,6 +36,10 @@ from typing import Dict, Iterable, List, Optional, Sequence, Set, Tuple
 import pandas as pd
 
 
+DEFAULT_INPUT_PATH = Path(__file__).with_name("payoffline_pulse_hier_1.xlsx")
+DEFAULT_OUTPUT_PATH = Path(__file__).with_name("Результат_1.xlsx")
+
+
 TECH_COLUMNS = {
     "period",
     "cal_date",
@@ -77,10 +81,10 @@ class Thresholds:
         0.75
     """
 
-    min_segment_delta: float = 200_000_000.0
-    min_child_delta: float = 100_000_000.0
-    min_gross_movement: float = 150_000_000.0
-    net_share_threshold: float = 0.75
+    min_segment_delta: float = 2_000_000.0
+    min_child_delta: float = 1_000_000.0
+    min_gross_movement: float = 1_500_000.0
+    net_share_threshold: float = 0.6
     same_direction_threshold: float = 0.75
     concentration_threshold: float = 0.80
 
@@ -647,7 +651,8 @@ def calculate_candidate_score(action: str, metrics: Dict[str, float | str]) -> f
     dominant_abs = float(metrics["dominant_child_abs_delta"])
 
     if action == "основной_родитель":
-        return net_abs * net_share * same_direction * (1.0 - 0.35 * concentration)
+        # return net_abs * net_share * same_direction * (1.0 - 0.35 * concentration)
+        return net_abs * net_share * (1.0 - 0.35 * concentration)
     if action == "блок_компенсации":
         return gross * cancellation * (1.0 - 0.20 * concentration)
     if action == "доминирующий_ребёнок":
@@ -779,12 +784,6 @@ def get_active_children(active: Dict[str, ActiveBlock], parent_atoms: frozenset[
 
     Returns:
         Список активных блоков внутри родителя.
-
-    Raises:
-        ValueError: Не выбрасывается.
-
-    Examples:
-        >>> # children = get_active_children(active, parent_atoms)
     """
 
     return [block for block in active.values() if block.atomic_ids.issubset(parent_atoms)]
@@ -922,13 +921,6 @@ def select_best_component_candidates(component: Sequence[ParentCandidate]) -> Li
 
     Returns:
         Список выбранных кандидатов.
-
-    Raises:
-        ValueError: Не выбрасывается.
-
-    Examples:
-        >>> select_best_component_candidates([])
-        []
     """
 
     ordered = sorted(component, key=candidate_rank)
@@ -1330,10 +1322,10 @@ def run_bottom_up_algorithm(slice_df: pd.DataFrame, dim_cols: Sequence[str], thr
 
     return {
         "parent_diagnostics": pd.DataFrame(parent_diag_rows),
-        "decision_log": pd.DataFrame(decision_rows),
+        "decision_log": pd.DataFrame(decision_rows), #весь журнал решений
         "final_partition": final_df,
         "detail_children": pd.DataFrame(detail_rows),
-        "excluded_segments": pd.DataFrame(excluded_rows),
+        "excluded_segments": pd.DataFrame(excluded_rows), #только отклонённые / невыбранные кандидаты
         "atomic_assignment": assignment_df,
         "control": control_df,
     }
@@ -1391,6 +1383,181 @@ def _detail_row(parent: pd.Series, child: ActiveBlock, reason: str) -> Dict[str,
     }
 
 
+def _format_rub(value: float) -> str:
+    """Отформатировать вклад GMV в рублях без дробной части.
+
+    Args:
+        value: Значение GMV в рублях.
+
+    Returns:
+        Строка с суммой в рублях и разделителем групп разрядов.
+
+    Raises:
+        ValueError: Не выбрасывается.
+
+    Examples:
+        >>> _format_rub(25894762.45)
+        '+25 894 762 руб.'
+    """
+
+    sign = "+" if value >= 0 else "-"
+    amount = f"{int(abs(value)):,}".replace(",", " ")
+    return f"{sign}{amount} руб."
+
+
+def _short_segment_name(segment_key: object) -> str:
+    """Сократить технический ключ сегмента до менеджерского названия.
+
+    Args:
+        segment_key: Технический ключ сегмента.
+
+    Returns:
+        Короткое название сегмента.
+
+    Raises:
+        ValueError: Не выбрасывается.
+
+    Examples:
+        >>> _short_segment_name("products=FULLPAYMENT x is_terminal_or_cpqr=QR")
+        'FULLPAYMENT x QR'
+    """
+
+    parts = []
+    for part in str(segment_key).split(" x "):
+        if "=" in part:
+            parts.append(part.split("=", 1)[1])
+        else:
+            parts.append(part)
+    return " x ".join(parts)
+
+
+def build_manager_summary(result: Dict[str, pd.DataFrame]) -> pd.DataFrame:
+    """Сформировать менеджерский вывод по итоговому изменению GMV.
+
+    Args:
+        result: Словарь таблиц результата алгоритма.
+
+    Returns:
+        DataFrame для отдельного листа Excel с менеджерским выводом.
+
+    Raises:
+        KeyError: Если в result отсутствуют обязательные таблицы.
+
+    Examples:
+        >>> # summary = build_manager_summary(result)
+    """
+
+    final_df = result["final_partition"].copy()
+    detail_df = result["detail_children"].copy()
+    control = result["control"].iloc[0].to_dict()
+    total_delta = float(control["total_delta_from_atomic"])
+
+    rows: List[Dict[str, object]] = [
+        {
+            "раздел": "Заголовок",
+            "блок": "",
+            "сегмент": "Менеджерский вывод по изменению GMV WoW",
+            "вклад": _format_rub(total_delta),
+            "интерпретация": f"За неделю GMV изменился на {_format_rub(total_delta)}.",
+        }
+    ]
+
+    if final_df.empty:
+        return pd.DataFrame(rows)
+
+    main_driver = final_df.sort_values("abs_delta_gmv", ascending=False).iloc[0]
+    rows.append(
+        {
+            "раздел": "Краткий вывод",
+            "блок": "Главный фактор",
+            "сегмент": _short_segment_name(main_driver["block_key"]),
+            "вклад": _format_rub(float(main_driver["delta_gmv"])),
+            "интерпретация": (
+                "Главный вклад в изменение GMV даёт сегмент "
+                f"{_short_segment_name(main_driver['block_key'])}."
+            ),
+        }
+    )
+
+    for _, block in final_df.sort_values("abs_delta_gmv", ascending=False).iterrows():
+        output_block = str(block["output_block"])
+        delta = float(block["delta_gmv"])
+        segment = _short_segment_name(block["block_key"])
+
+        if output_block == "основной драйвер":
+            manager_block = "Основной драйвер"
+            interpretation = "Главная самостоятельная причина изменения GMV."
+        elif output_block == "блок взаимной компенсации":
+            manager_block = "Компенсационный блок"
+            children = detail_df.loc[detail_df["parent_id"] == block["block_id"]].copy()
+            if not children.empty:
+                children["abs_child_delta"] = children["child_delta_gmv"].abs()
+                top_children = children.sort_values("abs_child_delta", ascending=False).head(3)
+                child_text = "; ".join(
+                    f"{_short_segment_name(row['child_key'])}: {_format_rub(float(row['child_delta_gmv']))}"
+                    for _, row in top_children.iterrows()
+                )
+                interpretation = (
+                    "Внутри есть разнонаправленные движения. "
+                    f"Крупнейшие дети: {child_text}."
+                )
+            else:
+                interpretation = "Внутри есть разнонаправленные движения; детализация детей отсутствует."
+        elif delta < 0:
+            manager_block = "Сдерживающий фактор"
+            interpretation = "Сегмент снижает общий результат GMV."
+        else:
+            manager_block = "Остаток / прочее"
+            interpretation = "Не формирует отдельную крупную бизнес-причину."
+
+        rows.append(
+            {
+                "раздел": "Таблица факторов",
+                "блок": manager_block,
+                "сегмент": segment,
+                "вклад": _format_rub(delta),
+                "интерпретация": interpretation,
+            }
+        )
+
+    rows.extend(
+        [
+            {
+                "раздел": "Основной вывод",
+                "блок": "",
+                "сегмент": "",
+                "вклад": "",
+                "интерпретация": (
+                    "Рост или снижение GMV следует читать через крупнейшие основные драйверы; "
+                    "компенсационные блоки требуют отдельного просмотра детей."
+                ),
+            },
+            {
+                "раздел": "Что проверить дальше",
+                "блок": "1",
+                "сегмент": "",
+                "вклад": "",
+                "интерпретация": "За счёт чего изменился главный драйвер: регион, мерчанты, пользователи, средний чек или количество платежей.",
+            },
+            {
+                "раздел": "Что проверить дальше",
+                "блок": "2",
+                "сегмент": "",
+                "вклад": "",
+                "интерпретация": "В компенсационных блоках отдельно посмотреть растущие и падающие дочерние сегменты.",
+            },
+            {
+                "раздел": "Что проверить дальше",
+                "блок": "3",
+                "сегмент": "",
+                "вклад": "",
+                "интерпретация": "По отрицательным блокам проверить, является ли снижение разовым эффектом или устойчивым трендом.",
+            },
+        ]
+    )
+    return pd.DataFrame(rows)
+
+
 def write_result_excel(result: Dict[str, pd.DataFrame], slice_df: pd.DataFrame, output_path: str | Path, thresholds: Thresholds, dim_cols: Sequence[str]) -> None:
     """Записать результат алгоритма в один Excel-файл.
 
@@ -1427,14 +1594,21 @@ def write_result_excel(result: Dict[str, pd.DataFrame], slice_df: pd.DataFrame, 
     with pd.ExcelWriter(output_path, engine="openpyxl") as writer:
         params.to_excel(writer, sheet_name="00_Параметры", index=False)
         slice_df.to_excel(writer, sheet_name="01_Входные_срезы", index=False)
-        result["parent_diagnostics"].to_excel(writer, sheet_name="02_Диагностика", index=False)
+        result["parent_diagnostics"].to_excel(writer, sheet_name="02_Диагностика родителей", index=False)
         result["decision_log"].to_excel(writer, sheet_name="03_Журнал_решений", index=False)
         result["final_partition"].to_excel(writer, sheet_name="04_Итог", index=False)
-        result["detail_children"].to_excel(writer, sheet_name="05_Детализация", index=False)
+        result["detail_children"].to_excel(writer, sheet_name="05_Детализация поглощения", index=False)
         result["excluded_segments"].to_excel(writer, sheet_name="06_Исключённые", index=False)
         result["atomic_assignment"].to_excel(writer, sheet_name="07_Назначение_атомов", index=False)
         result["control"].to_excel(writer, sheet_name="08_Контроль", index=False)
-
+        build_manager_summary(result).to_excel(writer, sheet_name="09_Менеджерский_вывод", index=False)
+    # "parent_diagnostics": pd.DataFrame(parent_diag_rows),
+    #     "decision_log": pd.DataFrame(decision_rows), #весь журнал решений
+    #     "final_partition": final_df,
+    #     "detail_children": pd.DataFrame(detail_rows),
+    #     "excluded_segments": pd.DataFrame(excluded_rows), #только отклонённые / невыбранные кандидаты
+    #     "atomic_assignment": assignment_df,
+    #     "control": control_df,
         for sheet_name, worksheet in writer.sheets.items():
             worksheet.freeze_panes = "A2"
             for col_cells in worksheet.columns:
@@ -1463,8 +1637,16 @@ def parse_args() -> argparse.Namespace:
     """
 
     parser = argparse.ArgumentParser(description="Итоговый алгоритм v2 для анализа вклада сегментов в изменение GMV.")
-    parser.add_argument("--input", required=True, help="Путь к входному .xlsx/.xls/.csv файлу с готовыми группировками.")
-    parser.add_argument("--output", required=True, help="Путь к итоговому .xlsx файлу.")
+    parser.add_argument(
+        "--input",
+        default=str(DEFAULT_INPUT_PATH),
+        help="Путь к входному .xlsx/.xls/.csv файлу с готовыми группировками.",
+    )
+    parser.add_argument(
+        "--output",
+        default=str(DEFAULT_OUTPUT_PATH),
+        help="Путь к итоговому .xlsx файлу.",
+    )
     parser.add_argument("--sheet-name", default=0, help="Имя или номер листа Excel. По умолчанию первый лист.")
     parser.add_argument("--period", default=None, help="Период для фильтрации, например 1W.")
     parser.add_argument("--dims", nargs="*", default=None, help="Список признаков. Если не указан, признаки определяются автоматически.")
@@ -1525,7 +1707,7 @@ def main() -> None:
 
     control = result["control"].iloc[0].to_dict()
     print("Готово.")
-    print(f"Признаки: {' × '.join(dim_cols)}")
+    print(f"Признаки: {' x '.join(dim_cols)}")
     print(f"Итоговый файл: {args.output}")
     print(f"Сумма атомарных дельт: {control['total_delta_from_atomic']:.2f}")
     print(f"Сумма итогового разбиения: {control['final_partition_delta']:.2f}")
