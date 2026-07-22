@@ -8,8 +8,6 @@
 
 
 # Исправить, доработать в будущем:
-# 1) пусть в ветке с отобранными аномальными сегментами максимальная глубина = 3 вместо 4. Тогда этот сегмент будет штрафоваться. Надо ли это? 
-# он ведь не самый глубокий.
 # 2) отсутствующие недели заменяются на 0, добавляется флаг на пропуск. Но это может влиять на расчет медианы изменения. Рассмотреть в будущем
 
 from __future__ import annotations
@@ -97,7 +95,7 @@ class AnomalyThresholds:
 
     min_anomaly_abs: float = 200_000.0
     min_z_score: float = 2.0
-    min_materiality_share: float = 0.0001
+    min_materiality_share: float = 0.00001
     sigma_floor: float = 0.00001
     z_cap: float = 6.0
     set_packing_gap_tolerance: float = 1e-9
@@ -552,14 +550,6 @@ def build_anomaly_candidates(
     candidates["materiality_share"] = 0.0
     if gross_atomic_movement > 0:
         candidates["materiality_share"] = candidates["wow_delta_gmv"].astype(float).abs() / gross_atomic_movement
-    # ADDED: Depth discount keeps the deepest segments at weight 1.0 and mildly lowers broader segments.
-    candidates["depth_score_weight"] = 0.9 ** (max_depth - candidates["slice_depth"].astype(int))
-    candidates["anomaly_score"] = (
-        candidates["abs_z_capped"].astype(float)
-        * candidates["materiality_share"].astype(float)
-        * candidates["reliability_factor"].astype(float)
-        * candidates["depth_score_weight"].astype(float)
-    )
     # ADDED: Предварительный фильтр аномальности. Неаномальные или нематериальные сегменты
     # остаются в диагностике, но не участвуют в оптимизационном выборе.
     candidates["passes_initial_anomaly_filter"] = (
@@ -603,8 +593,119 @@ def build_atomic_coverage(candidates: pd.DataFrame, dim_cols: Sequence[str]) -> 
     return coverage
 
 
+def apply_local_depth_penalty(
+    candidates: pd.DataFrame,
+    coverage: Dict[str, frozenset[str]],
+    depth_factor: float = 0.9,
+) -> pd.DataFrame:
+    """ADDED: Рассчитать локальный штраф за глубину относительно ветки сегмента.
 
+    Args:
+        candidates: Таблица всех кандидатов до оптимизационного отбора.
+        coverage: Атомарное покрытие `segment_id -> set[atomic_segment_id]`, построенное по всем сегментам.
+        depth_factor: Коэффициент штрафа за один уровень до максимальной eligible-глубины ветки.
 
+    Returns:
+        Копия `candidates` с колонками `base_anomaly_score`, `local_max_eligible_depth`,
+        `local_depth_gap`, `eligible_descendant_count`, `depth_score_weight`, `anomaly_score`.
+
+    Raises:
+        ValueError: Если не хватает обязательных колонок, depth_factor некорректен,
+            или eligible-сегмент имеет отсутствующее/пустое покрытие либо некорректный base score.
+
+    Examples:
+        >>> df = pd.DataFrame([
+        ...     {'segment_id': 'p', 'slice_depth': 1, 'passes_initial_anomaly_filter': True,
+        ...      'abs_z_capped': 2.0, 'materiality_share': 0.5, 'reliability_factor': 1.0},
+        ... ])
+        >>> apply_local_depth_penalty(df, {'p': frozenset({'a'})})['depth_score_weight'].iloc[0]
+        1.0
+    """
+
+    required_columns = {
+        "segment_id",
+        "slice_depth",
+        "passes_initial_anomaly_filter",
+        "abs_z_capped",
+        "materiality_share",
+        "reliability_factor",
+    }
+    missing_columns = sorted(required_columns - set(candidates.columns))
+    if missing_columns:
+        raise ValueError(f"Для apply_local_depth_penalty не хватает колонок: {missing_columns}")
+    if not 0.0 < float(depth_factor) <= 1.0:
+        raise ValueError("depth_factor должен быть в интервале (0, 1]")
+
+    result = candidates.copy()
+    result["segment_id"] = result["segment_id"].astype(str)
+    result["slice_depth"] = result["slice_depth"].astype(int)
+    result["base_anomaly_score"] = (
+        pd.to_numeric(result["abs_z_capped"], errors="coerce")
+        * pd.to_numeric(result["materiality_share"], errors="coerce")
+        * pd.to_numeric(result["reliability_factor"], errors="coerce")
+    )
+    result["local_max_eligible_depth"] = result["slice_depth"].astype(int)
+    result["local_depth_gap"] = 0
+    result["eligible_descendant_count"] = 0
+    result["depth_score_weight"] = 1.0
+    result["anomaly_score"] = result["base_anomaly_score"] * result["depth_score_weight"]
+
+    normalized_coverage = {
+        str(segment_id): frozenset(str(atom_id) for atom_id in (atoms or frozenset()))
+        for segment_id, atoms in coverage.items()
+    }
+    eligible_mask = result["passes_initial_anomaly_filter"].eq(True) & result["slice_depth"].gt(0)
+    eligible = result[eligible_mask].copy()
+    fatal_issues: List[str] = []
+    coverage_by_id: Dict[str, frozenset[str]] = {}
+    depth_by_id: Dict[str, int] = {}
+    for _, row in eligible.iterrows():
+        segment_id = str(row["segment_id"])
+        segment_atoms = normalized_coverage.get(segment_id)
+        if segment_atoms is None:
+            fatal_issues.append(f"{segment_id} ({row.get('segment_key', '')}): отсутствует атомарное покрытие")
+            continue
+        if not segment_atoms:
+            fatal_issues.append(f"{segment_id} ({row.get('segment_key', '')}): пустое атомарное покрытие")
+            continue
+        base_score = _safe_float(row.get("base_anomaly_score"), math.nan)
+        if not math.isfinite(base_score):
+            fatal_issues.append(f"{segment_id} ({row.get('segment_key', '')}): некорректный base_anomaly_score")
+            continue
+        coverage_by_id[segment_id] = segment_atoms
+        depth_by_id[segment_id] = int(row["slice_depth"])
+    if fatal_issues:
+        raise ValueError(
+            "Нельзя рассчитать локальный depth penalty для eligible-сегментов: "
+            + "; ".join(fatal_issues[:10])
+        )
+
+    descendant_depths_by_id: Dict[str, List[int]] = {segment_id: [] for segment_id in coverage_by_id}
+    for parent_id, parent_atoms in coverage_by_id.items():
+        parent_depth = depth_by_id[parent_id]
+        for child_id, child_atoms in coverage_by_id.items():
+            if child_id == parent_id:
+                continue
+            child_depth = depth_by_id[child_id]
+            if child_depth > parent_depth and child_atoms.issubset(parent_atoms):
+                descendant_depths_by_id[parent_id].append(child_depth)
+
+    index_by_id = {
+        str(segment_id): index
+        for index, segment_id in result["segment_id"].items()
+    }
+    for segment_id, descendant_depths in descendant_depths_by_id.items():
+        index = index_by_id[segment_id]
+        current_depth = depth_by_id[segment_id]
+        local_max_depth = max([current_depth, *descendant_depths])
+        local_gap = local_max_depth - current_depth
+        result.at[index, "local_max_eligible_depth"] = int(local_max_depth)
+        result.at[index, "local_depth_gap"] = int(local_gap)
+        result.at[index, "eligible_descendant_count"] = int(len(descendant_depths))
+        result.at[index, "depth_score_weight"] = float(depth_factor) ** int(local_gap)
+
+    result["anomaly_score"] = result["base_anomaly_score"].astype(float) * result["depth_score_weight"].astype(float)
+    return result
 
 
 def _segment_feature_set_from_key(segment_key: object) -> frozenset[Tuple[str, str]]:
@@ -2031,13 +2132,19 @@ def search_anomal(
 
 
 
-def build_manager_summary(final_df: pd.DataFrame, thresholds: AnomalyThresholds, current_total_gmv: float) -> pd.DataFrame:
+def build_manager_summary(
+    final_df: pd.DataFrame,
+    thresholds: AnomalyThresholds,
+    current_total_gmv: float,
+    candidates: Optional[pd.DataFrame] = None,
+) -> pd.DataFrame:
     """Сформировать менеджерский вывод по необычным сегментам.
 
     Args:
         final_df: Итоговые выбранные аномалии.
         thresholds: Пороги алгоритма.
         current_total_gmv: Total GMV текущей недели.
+        candidates: Диагностика всех кандидатов для добавления структурных изменений.
 
     Returns:
         Таблица менеджерского вывода.
@@ -2073,6 +2180,114 @@ def build_manager_summary(final_df: pd.DataFrame, thresholds: AnomalyThresholds,
             for source_col, display_col in MANAGER_METRIC_PCT_COLUMNS.items()
         }
 
+    structure_state_labels = {
+        "новый сегмент": "новый",
+        "возобновившийся сегмент": "возобновившийся",
+        "исчезнувший сегмент": "исчезнувший",
+    }
+
+    def structure_change_label(row: pd.Series) -> str:
+        """ADDED: Вернуть короткий тип структурного изменения.
+
+        Args:
+            row: Строка кандидата или выбранной аномалии.
+
+        Returns:
+            Одно из значений `новый`, `возобновившийся`, `исчезнувший` или пустая строка.
+
+        Raises:
+            ValueError: Не выбрасывается.
+
+        Examples:
+            >>> structure_change_label(pd.Series({'state': 'новый сегмент'}))
+            'новый'
+        """
+
+        return structure_state_labels.get(str(row.get("state", "")).strip(), "")
+
+    def structure_change_interpretation(row: pd.Series) -> str:
+        """ADDED: Сформировать интерпретацию структурного изменения для менеджера.
+
+        Args:
+            row: Строка кандидата или выбранной аномалии.
+
+        Returns:
+            Текст с типом изменения и GMV текущей/предыдущей недели.
+
+        Raises:
+            ValueError: Не выбрасывается.
+
+        Examples:
+            >>> structure_change_interpretation(pd.Series({'state': 'новый сегмент', 'gmv_current': 10, 'gmv_previous': 0, 'wow_delta_gmv': 10}))
+            'Тип изменения: новый. Сегмент появился впервые на последней неделе; GMV текущей недели: +10 ₽, GMV предыдущей недели: 0 ₽, Delta GMV: +10 ₽.'
+        """
+
+        change_label = structure_change_label(row)
+        current_gmv_text = _format_rub(float(row.get("gmv_current", 0.0)))
+        previous_gmv_text = _format_rub(float(row.get("gmv_previous", 0.0)))
+        delta_text = _format_rub(float(row.get("wow_delta_gmv", 0.0)))
+        if change_label == "новый":
+            detail = "Сегмент появился впервые на последней неделе"
+        elif change_label == "возобновившийся":
+            detail = "Сегмент вернулся на последней неделе после нулевой предыдущей недели"
+        elif change_label == "исчезнувший":
+            detail = "Сегмент исчез на последней неделе после ненулевой предыдущей недели"
+        else:
+            detail = "Зафиксировано структурное изменение сегмента"
+        return (
+            f"Тип изменения: {change_label}. "
+            f"{detail}; GMV текущей недели: {current_gmv_text}, "
+            f"GMV предыдущей недели: {previous_gmv_text}, Delta GMV: {delta_text}."
+        )
+
+    def structure_change_rows() -> List[Dict[str, object]]:
+        """ADDED: Собрать дополнительные строки менеджерского вывода по структурным изменениям.
+
+        Args:
+            Нет аргументов.
+
+        Returns:
+            Список строк для вкладки `01_Менеджерский_вывод`.
+
+        Raises:
+            ValueError: Не выбрасывается.
+
+        Examples:
+            >>> structure_change_rows()
+            []
+        """
+
+        if candidates is None or candidates.empty or "state" not in candidates.columns:
+            return []
+        state_order = {"новый сегмент": 0, "возобновившийся сегмент": 1, "исчезнувший сегмент": 2}
+        structure_df = candidates[
+            candidates["state"].astype(str).isin(structure_state_labels)
+            & candidates["slice_depth"].astype(int).gt(0)
+        ].copy()
+        if structure_df.empty:
+            return []
+        structure_df["state_order"] = structure_df["state"].astype(str).map(state_order).fillna(99).astype(int)
+        structure_df["abs_delta_sort"] = structure_df["wow_delta_gmv"].astype(float).abs()
+        structure_df = structure_df.sort_values(
+            ["state_order", "abs_delta_sort", "slice_depth", "segment_key"],
+            ascending=[True, False, False, True],
+            kind="stable",
+        )
+        rows_out: List[Dict[str, object]] = []
+        for _, row in structure_df.iterrows():
+            rows_out.append(
+                {
+                    "раздел": "Изменение структуры",
+                    "тип": "Изменение структуры",
+                    "сегмент": str(row["segment_key"]),
+                    "Delta GMV": _format_rub(float(row["wow_delta_gmv"])),
+                    **metric_pct_output(row),
+                    "z_score": round(float(row["robust_z"]), 2),
+                    "интерпретация": structure_change_interpretation(row),
+                }
+            )
+        return rows_out
+
     rows: List[Dict[str, object]] = [
         {
             "раздел": "Заголовок",
@@ -2097,39 +2312,40 @@ def build_manager_summary(final_df: pd.DataFrame, thresholds: AnomalyThresholds,
                 "интерпретация": "Материальные необычные сегменты по заданным порогам не найдены.",
             }
         )
-        return pd.DataFrame(rows)
-
-    top = final_df.head(thresholds.max_manager_facts)
-    main = top.iloc[0]
-    rows.append(
-        {
-            "раздел": "Краткий вывод",
-            "тип": str(main["output_block"]),
-            "сегмент": str(main["segment_key"]),
-            "Delta GMV": _format_rub(float(main["wow_delta_gmv"])),
-            **metric_pct_output(main),
-            "z_score": round(float(main["robust_z"]), 2),
-            "интерпретация": "Самый сильный выбранный сегмент из глобально оптимального непересекающегося набора по anomaly_score.",
-        }
-    )
-
-    for _, row in top.iterrows():
-        direction = "выше" if float(row["abnormal_gmv"]) > 0 else "ниже"
-        interpretation = (
-            f"Фактический GMV сегмента {direction} ожидаемого уровня. "
-            f"Причина отбора: {row['reason']}."
-        )
+    else:
+        top = final_df.head(thresholds.max_manager_facts)
+        main = top.iloc[0]
         rows.append(
             {
-                "раздел": "Таблица факторов",
-                "тип": str(row["output_block"]),
-                "сегмент": str(row["segment_key"]),
-                "Delta GMV": _format_rub(float(row["wow_delta_gmv"])),
-                **metric_pct_output(row),
-                "z_score": round(float(row["robust_z"]), 2),
-                "интерпретация": interpretation,
+                "раздел": "Краткий вывод",
+                "тип": str(main["output_block"]),
+                "сегмент": str(main["segment_key"]),
+                "Delta GMV": _format_rub(float(main["wow_delta_gmv"])),
+                **metric_pct_output(main),
+                "z_score": round(float(main["robust_z"]), 2),
+                "интерпретация": "Самый сильный выбранный сегмент из глобально оптимального непересекающегося набора по anomaly_score.",
             }
         )
+
+        for _, row in top.iterrows():
+            direction = "выше" if float(row["abnormal_gmv"]) > 0 else "ниже"
+            interpretation = (
+                f"Фактический GMV сегмента {direction} ожидаемого уровня. "
+                f"Причина отбора: {row['reason']}."
+            )
+            rows.append(
+                {
+                    "раздел": "Таблица факторов",
+                    "тип": str(row["output_block"]),
+                    "сегмент": str(row["segment_key"]),
+                    "Delta GMV": _format_rub(float(row["wow_delta_gmv"])),
+                    **metric_pct_output(row),
+                    "z_score": round(float(row["robust_z"]), 2),
+                    "интерпретация": interpretation,
+                }
+            )
+
+    rows.extend(structure_change_rows())
 
     return pd.DataFrame(rows)
 
@@ -2341,6 +2557,11 @@ def build_anomaly_analysis_sheet(candidates: pd.DataFrame, final_df: pd.DataFram
         "сегмент",
         "глубина",
         "z_scope",
+        "base_anomaly_score",
+        "depth_score_weight",
+        "local_max_eligible_depth",
+        "local_depth_gap",
+        "eligible_descendant_count",
         "anomaly_score",
         "выбран",
         "разрешён",
@@ -2423,6 +2644,26 @@ def build_anomaly_analysis_sheet(candidates: pd.DataFrame, final_df: pd.DataFram
             "сегмент": analysis["segment_key"].astype(str),
             "глубина": analysis["slice_depth"].astype(int),
             "z_scope": analysis["robust_z_capped"].astype(float).round(2),
+            "base_anomaly_score": pd.to_numeric(
+                analysis.get("base_anomaly_score", pd.Series(math.nan, index=analysis.index)),
+                errors="coerce",
+            ),
+            "depth_score_weight": pd.to_numeric(
+                analysis.get("depth_score_weight", pd.Series(math.nan, index=analysis.index)),
+                errors="coerce",
+            ),
+            "local_max_eligible_depth": pd.to_numeric(
+                analysis.get("local_max_eligible_depth", pd.Series(pd.NA, index=analysis.index)),
+                errors="coerce",
+            ).astype("Int64"),
+            "local_depth_gap": pd.to_numeric(
+                analysis.get("local_depth_gap", pd.Series(pd.NA, index=analysis.index)),
+                errors="coerce",
+            ).astype("Int64"),
+            "eligible_descendant_count": pd.to_numeric(
+                analysis.get("eligible_descendant_count", pd.Series(pd.NA, index=analysis.index)),
+                errors="coerce",
+            ).astype("Int64"),
             "anomaly_score": analysis["anomaly_score"].astype(float),
             "выбран": analysis.get(
                 "selected", pd.Series(False, index=analysis.index)
@@ -3490,7 +3731,7 @@ def write_anomaly_excel(
     control.insert(0, "раздел", "Контроль")
     params_and_control = pd.concat([params, control], ignore_index=True)
 
-    manager_df = build_manager_summary(final_df, thresholds, float(total_by_date.loc[current_cal_date]))
+    manager_df = build_manager_summary(final_df, thresholds, float(total_by_date.loc[current_cal_date]), candidates)
     anomaly_analysis = build_anomaly_analysis_sheet(candidates, final_df, thresholds)
     history_top = build_history_for_selected(panel_df, final_df, total_by_date)
     missing_zero = build_missing_zero_report(panel_df, dates, current_cal_date)
@@ -3511,6 +3752,12 @@ def write_anomaly_excel(
         "robust_z_capped",
         "materiality_share",
         "gross_atomic_movement",
+        "base_anomaly_score",
+        "depth_score_weight",
+        "local_max_eligible_depth",
+        "local_depth_gap",
+        "eligible_descendant_count",
+        "anomaly_score",
         "abnormal_gmv",
         "abs_abnormal_gmv",
         "selection_score",
@@ -3611,6 +3858,7 @@ def run_anomaly_analysis(
     panel_df = build_full_week_grid(history_df, dims, dates)
     candidates, total_by_date = build_anomaly_candidates(panel_df, dims, dates, thresholds, current)
     coverage = build_atomic_coverage(candidates, dims)
+    candidates = apply_local_depth_penalty(candidates, coverage)
     final_df, diagnostics, optimization_decision_log = search_anomal(candidates, thresholds, coverage=coverage, dim_cols=dims)
     write_anomaly_excel(
         output_path,
