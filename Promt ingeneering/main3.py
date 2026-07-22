@@ -8,6 +8,7 @@
 
 
 # Исправить, доработать в будущем:
+
 # 2) отсутствующие недели заменяются на 0, добавляется флаг на пропуск. Но это может влиять на расчет медианы изменения. Рассмотреть в будущем
 
 from __future__ import annotations
@@ -24,17 +25,10 @@ from typing import Dict, List, Optional, Sequence, Tuple
 import pandas as pd
 from openpyxl.styles import PatternFill
 
-from main2 import (
-    build_segment_key_and_level,
-    candidate_covers_atomic,
-    normalize_dim_value,
-    segment_id_from_row,
-)
-
 
 DEFAULT_INPUT_PATH = Path(__file__).with_name("payoffline_pulse_hier_4_13w_2207.xlsx")
-DEFAULT_OUTPUT_PATH = Path(__file__).with_name("gmv_anomaly_report_2_2207.xlsx")
-DEFAULT_TREE_OUTPUT_PATH = Path(__file__).with_name("Граф_2207.png")
+DEFAULT_OUTPUT_PATH = Path(__file__).with_name("gmv_anomaly_report_2_2207_test.xlsx")
+DEFAULT_TREE_OUTPUT_PATH = Path(__file__).with_name("Граф_2207_test.png")
 
 # ADDED: Для исторического anomaly-файла исключаем все технические и метрические колонки.
 ANOMALY_TECH_COLUMNS = {
@@ -68,6 +62,140 @@ MANAGER_METRIC_PCT_COLUMNS = {
 }
 
 
+def _is_missing(value: object) -> bool:
+    """REMOVED import dependency: проверить, является ли значение отсутствующим.
+
+    Args:
+        value: Исходное значение признака.
+
+    Returns:
+        True, если значение нужно считать отсутствующим.
+
+    Raises:
+        ValueError: Не выбрасывается.
+
+    Examples:
+        >>> _is_missing(float('nan'))
+        True
+        >>> _is_missing('QR')
+        False
+    """
+
+    if value is None:
+        return True
+    if isinstance(value, float) and math.isnan(value):
+        return True
+    if isinstance(value, str) and value.strip() == "":
+        return True
+    return False
+
+
+def normalize_dim_value(value: object) -> Optional[str]:
+    """ADDED: Нормализовать значение признака.
+
+    Args:
+        value: Исходное значение признака.
+
+    Returns:
+        Строковое значение признака или None, если признак не входит в срез.
+
+    Raises:
+        ValueError: Не выбрасывается.
+
+    Examples:
+        >>> normalize_dim_value(' QR ')
+        'QR'
+        >>> normalize_dim_value(None) is None
+        True
+    """
+
+    if _is_missing(value):
+        return None
+    return str(value).strip()
+
+
+def segment_id_from_row(row: pd.Series, dim_cols: Sequence[str]) -> str:
+    """ADDED: Создать технический идентификатор сегмента.
+
+    Args:
+        row: Строка таблицы.
+        dim_cols: Список признаков.
+
+    Returns:
+        Идентификатор сегмента.
+
+    Raises:
+        ValueError: Не выбрасывается.
+
+    Examples:
+        >>> segment_id_from_row(pd.Series({'geo': 'РФ', 'channel': None}), ['geo', 'channel'])
+        'РФ|∅'
+    """
+
+    parts = []
+    for col in dim_cols:
+        value = normalize_dim_value(row.get(col))
+        parts.append(value if value is not None else "∅")
+    return "|".join(parts)
+
+
+def build_segment_key_and_level(row: pd.Series, dim_cols: Sequence[str]) -> Tuple[str, str, int]:
+    """ADDED: Построить человекочитаемый ключ и уровень сегмента.
+
+    Args:
+        row: Строка таблицы.
+        dim_cols: Список признаков.
+
+    Returns:
+        Кортеж: ключ сегмента, уровень сегмента, глубина.
+
+    Raises:
+        ValueError: Не выбрасывается.
+
+    Examples:
+        >>> s = pd.Series({'geo': 'РФ', 'channel': None})
+        >>> build_segment_key_and_level(s, ['geo', 'channel'])
+        ('geo=РФ', 'geo', 1)
+    """
+
+    used = []
+    key_parts = []
+    for col in dim_cols:
+        value = normalize_dim_value(row.get(col))
+        if value is not None:
+            used.append(col)
+            key_parts.append(f"{col}={value}")
+    if not used:
+        return "ИТОГО", "ИТОГО", 0
+    return " × ".join(key_parts), " × ".join(used), len(used)
+
+
+def candidate_covers_atomic(candidate: pd.Series, atomic: pd.Series, dim_cols: Sequence[str]) -> bool:
+    """ADDED: Проверить, покрывает ли кандидат атомарный сегмент.
+
+    Args:
+        candidate: Строка кандидата-родителя.
+        atomic: Строка атомарного сегмента.
+        dim_cols: Список признаков.
+
+    Returns:
+        True, если кандидат покрывает атом.
+
+    Raises:
+        ValueError: Не выбрасывается.
+
+    Examples:
+        >>> candidate_covers_atomic(pd.Series({'x': None}), pd.Series({'x': 'a'}), ['x'])
+        True
+    """
+
+    for col in dim_cols:
+        value = normalize_dim_value(candidate.get(col))
+        if value is not None and value != normalize_dim_value(atomic.get(col)):
+            return False
+    return True
+
+
 @dataclass(frozen=True)
 class AnomalyThresholds:
     """Пороги алгоритма поиска необычных сегментов.
@@ -95,7 +223,7 @@ class AnomalyThresholds:
 
     min_anomaly_abs: float = 200_000.0
     min_z_score: float = 2.0
-    min_materiality_share: float = 0.0001
+    min_materiality_share: float = 0.00001
     sigma_floor: float = 0.00001
     z_cap: float = 6.0
     set_packing_gap_tolerance: float = 1e-9
@@ -2212,33 +2340,17 @@ def build_manager_summary(
             row: Строка кандидата или выбранной аномалии.
 
         Returns:
-            Текст с типом изменения и GMV текущей/предыдущей недели.
+            Короткий тип изменения.
 
         Raises:
             ValueError: Не выбрасывается.
 
         Examples:
-            >>> structure_change_interpretation(pd.Series({'state': 'новый сегмент', 'gmv_current': 10, 'gmv_previous': 0, 'wow_delta_gmv': 10}))
-            'Тип изменения: новый. Сегмент появился впервые на последней неделе; GMV текущей недели: +10 ₽, GMV предыдущей недели: 0 ₽, Delta GMV: +10 ₽.'
+        >>> structure_change_interpretation(pd.Series({'state': 'новый сегмент', 'gmv_current': 10, 'gmv_previous': 0, 'wow_delta_gmv': 10}))
+            'новый'
         """
 
-        change_label = structure_change_label(row)
-        current_gmv_text = _format_rub(float(row.get("gmv_current", 0.0)))
-        previous_gmv_text = _format_rub(float(row.get("gmv_previous", 0.0)))
-        delta_text = _format_rub(float(row.get("wow_delta_gmv", 0.0)))
-        if change_label == "новый":
-            detail = "Сегмент появился впервые на последней неделе"
-        elif change_label == "возобновившийся":
-            detail = "Сегмент вернулся на последней неделе после нулевой предыдущей недели"
-        elif change_label == "исчезнувший":
-            detail = "Сегмент исчез на последней неделе после ненулевой предыдущей недели"
-        else:
-            detail = "Зафиксировано структурное изменение сегмента"
-        return (
-            f"Тип изменения: {change_label}. "
-            f"{detail}; GMV текущей недели: {current_gmv_text}, "
-            f"GMV предыдущей недели: {previous_gmv_text}, Delta GMV: {delta_text}."
-        )
+        return structure_change_label(row)
 
     def structure_change_rows() -> List[Dict[str, object]]:
         """ADDED: Собрать дополнительные строки менеджерского вывода по структурным изменениям.
@@ -2318,25 +2430,26 @@ def build_manager_summary(
         rows.append(
             {
                 "раздел": "Краткий вывод",
-                "тип": str(main["output_block"]),
+                "тип": "оптимальная аномалия",
                 "сегмент": str(main["segment_key"]),
                 "Delta GMV": _format_rub(float(main["wow_delta_gmv"])),
                 **metric_pct_output(main),
                 "z_score": round(float(main["robust_z"]), 2),
-                "интерпретация": "Самый сильный выбранный сегмент из глобально оптимального непересекающегося набора по anomaly_score.",
+                "интерпретация": (
+                    f"Фактический GMV сегмента {'выше' if float(main['abnormal_gmv']) > 0 else 'ниже'} ожидаемого уровня"
+                ),
             }
         )
 
         for _, row in top.iterrows():
             direction = "выше" if float(row["abnormal_gmv"]) > 0 else "ниже"
             interpretation = (
-                f"Фактический GMV сегмента {direction} ожидаемого уровня. "
-                f"Причина отбора: {row['reason']}."
+                f"Фактический GMV сегмента {direction} ожидаемого уровня"
             )
             rows.append(
                 {
                     "раздел": "Таблица факторов",
-                    "тип": str(row["output_block"]),
+                    "тип": "оптимальная аномалия",
                     "сегмент": str(row["segment_key"]),
                     "Delta GMV": _format_rub(float(row["wow_delta_gmv"])),
                     **metric_pct_output(row),
@@ -3679,6 +3792,7 @@ def write_anomaly_excel(
     panel_df: pd.DataFrame,
     candidates: pd.DataFrame,
     final_df: pd.DataFrame,
+    manager_df: pd.DataFrame,
     total_by_date: pd.Series,
     dates: Sequence[int],
     current_cal_date: int,
@@ -3695,6 +3809,7 @@ def write_anomaly_excel(
         panel_df: Полная недельная панель.
         candidates: Диагностика кандидатов.
         final_df: Итоговые выбранные аномалии.
+        manager_df: Готовая таблица вкладки `01_Менеджерский_вывод`.
         total_by_date: Total GMV по неделям.
         dates: Список недель.
         current_cal_date: Текущая неделя.
@@ -3708,7 +3823,7 @@ def write_anomaly_excel(
         OSError: Если Excel-файл невозможно записать.
 
     Examples:
-        >>> # write_anomaly_excel('gmv_anomaly_report.xlsx', thresholds, dims, history_df, panel, candidates, final_df, total, dates, dates[-1], coverage, log)
+        >>> # write_anomaly_excel('gmv_anomaly_report.xlsx', thresholds, dims, history_df, panel, candidates, final_df, manager_df, total, dates, dates[-1], coverage, log)
     """
 
     output_path = Path(output_path)
@@ -3731,7 +3846,6 @@ def write_anomaly_excel(
     control.insert(0, "раздел", "Контроль")
     params_and_control = pd.concat([params, control], ignore_index=True)
 
-    manager_df = build_manager_summary(final_df, thresholds, float(total_by_date.loc[current_cal_date]), candidates)
     anomaly_analysis = build_anomaly_analysis_sheet(candidates, final_df, thresholds)
     history_top = build_history_for_selected(panel_df, final_df, total_by_date)
     missing_zero = build_missing_zero_report(panel_df, dates, current_cal_date)
@@ -3860,6 +3974,7 @@ def run_anomaly_analysis(
     coverage = build_atomic_coverage(candidates, dims)
     candidates = apply_local_depth_penalty(candidates, coverage)
     final_df, diagnostics, optimization_decision_log = search_anomal(candidates, thresholds, coverage=coverage, dim_cols=dims)
+    manager_df = build_manager_summary(final_df, thresholds, float(total_by_date.loc[current]), diagnostics)
     write_anomaly_excel(
         output_path,
         thresholds,
@@ -3868,6 +3983,7 @@ def run_anomaly_analysis(
         panel_df,
         diagnostics,
         final_df,
+        manager_df,
         total_by_date,
         dates,
         current,
@@ -3882,6 +3998,7 @@ def run_anomaly_analysis(
         "panel": panel_df,
         "candidates": diagnostics,
         "final": final_df,
+        "manager": manager_df,
         "optimization_decision_log": optimization_decision_log,
         "control": build_control_table(history_df, panel_df, diagnostics, final_df, coverage, dates, current, total_by_date),
     }
