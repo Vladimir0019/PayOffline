@@ -95,7 +95,7 @@ class AnomalyThresholds:
 
     min_anomaly_abs: float = 200_000.0
     min_z_score: float = 2.0
-    min_materiality_share: float = 0.00001
+    min_materiality_share: float = 0.0001
     sigma_floor: float = 0.00001
     z_cap: float = 6.0
     set_packing_gap_tolerance: float = 1e-9
