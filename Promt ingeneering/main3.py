@@ -5,10 +5,20 @@
 выбирает компактный набор непересекающихся управленческих сегментов.
 """
 
+
+
+# Исправить, доработать в будущем:
+# 1) пусть в ветке с отобранными аномальными сегментами максимальная глубина = 3 вместо 4. Тогда этот сегмент будет штрафоваться. Надо ли это? 
+# он ведь не самый глубокий.
+# 2) отсутствующие недели заменяются на 0, добавляется флаг на пропуск. Но это может влиять на расчет медианы изменения. Рассмотреть в будущем
+
 from __future__ import annotations
 
 import argparse
+from itertools import combinations
 import math
+import re
+import time
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Dict, List, Optional, Sequence, Tuple
@@ -24,9 +34,9 @@ from main2 import (
 )
 
 
-DEFAULT_INPUT_PATH = Path(__file__).with_name("payoffline_pulse_hier_4_13w.xlsx")
-DEFAULT_OUTPUT_PATH = Path(__file__).with_name("gmv_anomaly_report_2.xlsx")
-DEFAULT_TREE_OUTPUT_PATH = Path(__file__).with_name("Граф.png")
+DEFAULT_INPUT_PATH = Path(__file__).with_name("payoffline_pulse_hier_4_13w_2207.xlsx")
+DEFAULT_OUTPUT_PATH = Path(__file__).with_name("gmv_anomaly_report_2_2207.xlsx")
+DEFAULT_TREE_OUTPUT_PATH = Path(__file__).with_name("Граф_2207.png")
 
 # ADDED: Для исторического anomaly-файла исключаем все технические и метрические колонки.
 ANOMALY_TECH_COLUMNS = {
@@ -70,11 +80,8 @@ class AnomalyThresholds:
         min_materiality_share: Минимальная доля изменения GMV в gross movement атомарного слоя.
         sigma_floor: Нижняя граница масштаба колебаний доли.
         z_cap: Верхняя граница z-score, участвующего в score.
-        dominance_threshold: Доля доминирующего ребёнка в движении детей.
-        compensation_threshold: Минимальная доля взаимной компенсации детей.
-        single_child_z_multiplier: Множитель Z ребёнка для правила активного разбиения.
-        single_child_gross_share_threshold: Порог gross_share единственного активного ребёнка.
-        parent_child_absorption_k_threshold: Порог k для поглощения ребёнка родителем.
+        set_packing_gap_tolerance: Максимальный относительный MIP gap для признания решения оптимальным.
+        max_exact_fallback_size: Максимальный размер компоненты для собственного exact fallback.
         max_manager_facts: Максимальное число фактов в менеджерском выводе.
 
     Returns:
@@ -93,12 +100,8 @@ class AnomalyThresholds:
     min_materiality_share: float = 0.0001
     sigma_floor: float = 0.00001
     z_cap: float = 6.0
-    dominance_threshold: float = 0.80
-    compensation_threshold: float = 0.60
-    anomaly_gross_move_threshold: float = 0.50
-    single_child_z_multiplier: float = 1.20
-    single_child_gross_share_threshold: float = 0.70
-    parent_child_absorption_k_threshold: float = 1.35
+    set_packing_gap_tolerance: float = 1e-9
+    max_exact_fallback_size: int = 25
     max_manager_facts: int = 10
 
 
@@ -218,67 +221,13 @@ def _segment_key_parts(segment_key: object) -> List[Tuple[str, str]]:
     """
 
     parts: List[Tuple[str, str]] = []
-    for raw_part in str(segment_key).replace(" x ", " × ").split(" × "):
+    for raw_part in re.split(r"\s+(?:x|\u00d7|\u0413\u2014)\s+", str(segment_key)):
         part = raw_part.strip()
         if "=" not in part:
             continue
         dimension, value = part.split("=", 1)
         parts.append((dimension.strip(), value.strip()))
     return parts
-
-
-def _relative_child_segment_name(parent_key: object, child_key: object) -> str:
-    """Оставить в имени ребёнка только признаки, отсутствующие у родителя.
-
-    Args:
-        parent_key: Ключ родительского сегмента.
-        child_key: Ключ дочернего сегмента.
-
-    Returns:
-        Сокращённый ключ ребёнка относительно родителя.
-
-    Raises:
-        ValueError: Не выбрасывается.
-
-    Examples:
-        >>> _relative_child_segment_name(
-        ...     "products=FULLPAYMENT × merchants_type=SMB",
-        ...     "geo=РФ × products=FULLPAYMENT × merchants_type=SMB",
-        ... )
-        'geo=РФ'
-    """
-
-    parent_parts = dict(_segment_key_parts(parent_key))
-    child_only_parts = [
-        f"{dimension}={value}"
-        for dimension, value in _segment_key_parts(child_key)
-        if parent_parts.get(dimension) != value
-    ]
-    return " × ".join(child_only_parts) if child_only_parts else str(child_key)
-
-
-def _manager_segment_name(row: pd.Series) -> str:
-    """Добавить к имени родителя краткую отметку о поглощении.
-
-    Args:
-        row: Строка итогового сегмента.
-
-    Returns:
-        Имя сегмента для менеджерского вывода.
-
-    Raises:
-        ValueError: Не выбрасывается.
-
-    Examples:
-        >>> _manager_segment_name(pd.Series({'segment_key': 'products=A', 'absorbed_child_labels': 'geo=РФ'}))
-        'products=A (поглощён: geo=РФ)'
-    """
-
-    segment_key = str(row.get("segment_key", ""))
-    absorbed_labels = str(row.get("absorbed_child_labels", "")).strip()
-    if not absorbed_labels or absorbed_labels.lower() == "nan":
-        return segment_key
-    return f"{segment_key} (поглощён: {absorbed_labels})"
 
 
 def load_history_table(
@@ -519,6 +468,7 @@ def calculate_segment_anomaly(
         robust_z = thresholds.z_cap if state != "обычный" and wow_delta_gmv != 0 else 0.0
     else:
         robust_z = (relative_wow - baseline_growth) / sigma
+    # Ограничение на z снято специально
     # robust_z_capped = max(-thresholds.z_cap, min(thresholds.z_cap, robust_z))
     # abs_z_capped = min(abs(robust_z), thresholds.z_cap)
     robust_z_capped = robust_z
@@ -611,7 +561,7 @@ def build_anomaly_candidates(
         * candidates["depth_score_weight"].astype(float)
     )
     # ADDED: Предварительный фильтр аномальности. Неаномальные или нематериальные сегменты
-    # остаются в диагностике, но не участвуют в поглощении, компенсации и выборе.
+    # остаются в диагностике, но не участвуют в оптимизационном выборе.
     candidates["passes_initial_anomaly_filter"] = (
         (candidates["slice_depth"].astype(int) > 0)
         & (candidates["abs_z_capped"].astype(float) >= thresholds.min_z_score)
@@ -653,531 +603,8 @@ def build_atomic_coverage(candidates: pd.DataFrame, dim_cols: Sequence[str]) -> 
     return coverage
 
 
-def add_child_context(candidates: pd.DataFrame, coverage: Dict[str, frozenset[str]]) -> pd.DataFrame:
-    """Добавить метрики детей для оценки родителя.
 
-    Args:
-        candidates: Таблица кандидатов.
-        coverage: Покрытие кандидатов атомами.
 
-    Returns:
-        Таблица кандидатов с детскими метриками.
-
-    Raises:
-        ValueError: Не выбрасывается.
-
-    Examples:
-        >>> # candidates = add_child_context(candidates, coverage)
-    """
-
-    result = candidates.copy()
-    rows: List[Dict[str, object]] = []
-    max_depth = int(result["slice_depth"].max())
-
-    for _, parent in result.iterrows():
-        parent_id = str(parent["segment_id"])
-        parent_depth = int(parent["slice_depth"])
-        parent_atoms = coverage.get(parent_id, frozenset())
-        child_rows = []
-        if parent_depth < max_depth:
-            possible_children = result[
-                (result["slice_depth"].astype(int) == parent_depth + 1)
-                & (result["passes_initial_anomaly_filter"].astype(bool))
-            ]
-            for _, child in possible_children.iterrows():
-                child_atoms = coverage.get(str(child["segment_id"]), frozenset())
-                if child_atoms and child_atoms.issubset(parent_atoms):
-                    child_rows.append(child)
-
-        if not child_rows:
-            rows.append(
-                {
-                    "segment_id": parent_id,
-                    "direct_child_count": 0,
-                    "child_net_abnormal": 0.0,
-                    "child_gross_abnormal": 0.0,
-                    "child_cancellation_ratio": 0.0,
-                    "child_same_direction_share": 1.0,
-                    "child_dominance_share": 0.0,
-                    "dominant_child_id": "",
-                    "dominant_child_key": "",
-                    "dominant_child_abs_abnormal": 0.0,
-                }
-            )
-            continue
-
-        child_df = pd.DataFrame(child_rows)
-        deltas = child_df["abnormal_gmv"].astype(float)
-        gross = float(deltas.abs().sum())
-        net = float(deltas.sum())
-        positive = float(deltas[deltas > 0].sum())
-        negative = float(deltas[deltas < 0].sum())
-        dominant_idx = deltas.abs().idxmax()
-        dominant = child_df.loc[dominant_idx]
-        dominant_abs = abs(float(dominant["abnormal_gmv"]))
-
-        rows.append(
-            {
-                "segment_id": parent_id,
-                "direct_child_count": int(len(child_df)),
-                "child_net_abnormal": net,
-                "child_gross_abnormal": gross,
-                "child_cancellation_ratio": 0.0 if gross == 0 else 1.0 - abs(net) / gross,
-                "child_same_direction_share": 1.0 if gross == 0 else max(positive, abs(negative)) / gross,
-                "child_dominance_share": 0.0 if gross == 0 else dominant_abs / gross,
-                "dominant_child_id": str(dominant["segment_id"]),
-                "dominant_child_key": str(dominant["segment_key"]),
-                "dominant_child_abs_abnormal": dominant_abs,
-            }
-        )
-
-    context = pd.DataFrame(rows)
-    return result.merge(context, how="left", on="segment_id")
-
-
-def classify_anomaly_candidates(candidates: pd.DataFrame, thresholds: AnomalyThresholds) -> pd.DataFrame:
-    """Классифицировать кандидатов по управленческой роли.
-
-    Args:
-        candidates: Таблица кандидатов с метриками аномальности и детей.
-        thresholds: Пороги алгоритма.
-
-    Returns:
-        Таблица кандидатов с полями action, output_block, reason и selection_score.
-
-    Raises:
-        ValueError: Не выбрасывается.
-
-    Examples:
-        >>> # candidates = classify_anomaly_candidates(candidates, AnomalyThresholds())
-    """
-
-    rows: List[Dict[str, object]] = []
-    max_depth = int(candidates["slice_depth"].max())
-
-    for _, row in candidates.iterrows():
-        depth = int(row["slice_depth"])
-        state = str(row["state"])
-        abs_abnormal = abs(float(row["abnormal_gmv"]))
-        abs_z = abs(float(row["robust_z_capped"]))
-        base_score = float(row["anomaly_score"])
-        child_gross = float(row.get("child_gross_abnormal", 0.0))
-        gross_atomic = float(row.get("gross_atomic_movement", 0.0))
-        child_gross_materiality = 0.0 if gross_atomic == 0 else child_gross / gross_atomic
-        child_cancel = float(row.get("child_cancellation_ratio", 0.0))
-        child_dom = float(row.get("child_dominance_share", 0.0))
-        child_dom_abs = float(row.get("dominant_child_abs_abnormal", 0.0))
-        child_count = int(row.get("direct_child_count", 0))
-
-        action = "исключён"
-        output_block = "исключён"
-        reason = "не прошёл пороги необычности и материальности"
-        eligible = False
-        selection_score = base_score
-
-        if depth == 0:
-            reason = "total не выбирается как аномальный сегмент"
-        elif not bool(row.get("passes_initial_anomaly_filter", False)):
-            reason = "сегмент не прошёл предварительный фильтр: z-score или доля изменения GMV в gross movement ниже порога"
-        elif child_dom >= thresholds.dominance_threshold and child_dom_abs >= thresholds.min_anomaly_abs:
-            action = "пропустить_из-за_доминирующего_ребёнка"
-            output_block = "доминирующий ребёнок"
-            reason = f"аномальность родителя в основном сосредоточена в ребёнке: {row.get('dominant_child_key', '')}"
-        elif (
-            child_count >= 2
-            and child_gross >= thresholds.min_anomaly_abs
-            and child_cancel >= thresholds.compensation_threshold
-        ):
-            action = "блок_аномальной_компенсации"
-            output_block = "блок аномальной компенсации"
-            reason = "внутри родителя есть встречные аномальные движения детей"
-            eligible = True
-            selection_score = max(
-                base_score,
-                child_gross_materiality * child_cancel * float(row.get("reliability_factor", 1.0)),
-            )
-        elif state != "обычный" and abs_abnormal >= thresholds.min_anomaly_abs:
-            action = "аномалия_статуса"
-            output_block = state
-            reason = "сегмент изменил статус присутствия относительно истории"
-            eligible = True
-        elif abs_abnormal >= thresholds.min_anomaly_abs and abs_z >= thresholds.min_z_score:
-            action = "основная_аномалия" if depth < max_depth else "атомарная_аномалия"
-            output_block = "основная аномалия" if depth < max_depth else "атомарная аномалия"
-            reason = "сегмент материально отклонился от собственной исторической нормы"
-            eligible = True
-
-        rows.append(
-            {
-                "segment_id": str(row["segment_id"]),
-                "action": action,
-                "output_block": output_block,
-                "reason": reason,
-                "is_eligible": eligible,
-                "selection_score": float(selection_score),
-            }
-        )
-
-    classified = candidates.merge(pd.DataFrame(rows), how="left", on="segment_id")
-    classified["covered_atomic_count"] = 0
-    return classified
-
-
-def select_hierarchical_anomalies(
-    candidates: pd.DataFrame,
-    coverage: Dict[str, frozenset[str]],
-) -> Tuple[pd.DataFrame, pd.DataFrame]:
-    """Выбрать непересекающиеся управленческие аномалии.
-
-    Args:
-        candidates: Таблица классифицированных кандидатов.
-        coverage: Покрытие кандидатов атомами.
-
-    Returns:
-        Кортеж: итоговые выбранные аномалии и обновлённая диагностика кандидатов.
-
-    Raises:
-        ValueError: Не выбрасывается.
-
-    Examples:
-        >>> # final_df, diagnostics = select_hierarchical_anomalies(candidates, coverage)
-    """
-
-    diagnostics = candidates.copy()
-    diagnostics["covered_atomic_count"] = diagnostics["segment_id"].map(lambda sid: len(coverage.get(str(sid), frozenset())))
-    diagnostics["selected"] = False
-    diagnostics["selection_exclusion_reason"] = ""
-
-    eligible = diagnostics[diagnostics["is_eligible"].astype(bool)].copy()
-    eligible = eligible.sort_values(
-        by=[
-            "selection_score",
-            "abs_z_capped",
-            "materiality_share",
-            "abs_abnormal_gmv",
-            "reliability_factor",
-            "covered_atomic_count",
-            "segment_key",
-        ],
-        ascending=[False, False, False, False, False, False, True],
-    )
-
-    selected_ids: List[str] = []
-    used_atoms: set[str] = set()
-    for _, candidate in eligible.iterrows():
-        segment_id = str(candidate["segment_id"])
-        atoms = set(coverage.get(segment_id, frozenset()))
-        if not atoms:
-            diagnostics.loc[diagnostics["segment_id"] == segment_id, "selection_exclusion_reason"] = "нет атомарного покрытия"
-            continue
-        if used_atoms.intersection(atoms):
-            diagnostics.loc[diagnostics["segment_id"] == segment_id, "selection_exclusion_reason"] = "пересекается с уже выбранным сегментом"
-            continue
-        selected_ids.append(segment_id)
-        used_atoms.update(atoms)
-        diagnostics.loc[diagnostics["segment_id"] == segment_id, "selected"] = True
-
-    diagnostics.loc[
-        (~diagnostics["selected"]) & (diagnostics["selection_exclusion_reason"] == "") & diagnostics["is_eligible"].astype(bool),
-        "selection_exclusion_reason",
-    ] = "уступил более сильному непересекающемуся кандидату"
-    diagnostics.loc[
-        (~diagnostics["selected"]) & (diagnostics["selection_exclusion_reason"] == "") & (~diagnostics["is_eligible"].astype(bool)),
-        "selection_exclusion_reason",
-    ] = diagnostics["reason"]
-
-    final_df = diagnostics[diagnostics["selected"]].copy()
-    final_df = final_df.sort_values(
-        by=[
-            "selection_score",
-            "abs_z_capped",
-            "materiality_share",
-            "abs_abnormal_gmv",
-            "reliability_factor",
-            "segment_key",
-        ],
-        ascending=[False, False, False, False, False, True],
-    ).reset_index(drop=True)
-    final_df.insert(0, "rank", range(1, len(final_df) + 1))
-    return final_df, diagnostics
-
-
-def _segment_feature_set(row: pd.Series, dim_cols: Sequence[str]) -> frozenset[Tuple[str, str]]:
-    """Построить множество заполненных признаков сегмента.
-
-    Args:
-        row: Строка сегмента.
-        dim_cols: Упорядоченный список измерений.
-
-    Returns:
-        Множество пар `(dimension, value)`.
-
-    Raises:
-        ValueError: Не выбрасывается.
-
-    Examples:
-        >>> _segment_feature_set(pd.Series({'geo': 'РФ', 'products': None}), ['geo', 'products'])
-        frozenset({('geo', 'РФ')})
-    """
-
-    return frozenset(
-        (dimension, value)
-        for dimension in dim_cols
-        if (value := normalize_dim_value(row.get(dimension))) is not None
-    )
-
-
-def _nearest_active_child_map(
-    active_ids: Sequence[str],
-    feature_sets: Dict[str, frozenset[Tuple[str, str]]],
-) -> Dict[str, List[str]]:
-    """Найти ближайших активных потомков каждого активного сегмента.
-
-    Args:
-        active_ids: Идентификаторы активных аномальных сегментов.
-        feature_sets: Наборы признаков сегментов.
-
-    Returns:
-        Словарь `parent_id -> [nearest_child_id, ...]`.
-
-    Raises:
-        KeyError: Если для активного сегмента отсутствует набор признаков.
-
-    Examples:
-        >>> features = {'p': frozenset({('a', '1')}), 'c': frozenset({('a', '1'), ('b', '2')})}
-        >>> _nearest_active_child_map(['p', 'c'], features)
-        {'c': [], 'p': ['c']}
-    """
-
-    ordered_ids = sorted(set(str(segment_id) for segment_id in active_ids))
-    result: Dict[str, List[str]] = {}
-    for parent_id in ordered_ids:
-        parent_features = feature_sets[parent_id]
-        descendants = [
-            child_id
-            for child_id in ordered_ids
-            if parent_features < feature_sets[child_id]
-        ]
-        nearest_children = []
-        for child_id in descendants:
-            child_features = feature_sets[child_id]
-            has_active_middle = any(
-                parent_features < feature_sets[middle_id] < child_features
-                for middle_id in ordered_ids
-                if middle_id not in {parent_id, child_id}
-            )
-            if not has_active_middle:
-                nearest_children.append(child_id)
-        result[parent_id] = sorted(
-            nearest_children,
-            key=lambda segment_id: (len(feature_sets[segment_id]), segment_id),
-        )
-    return result
-
-
-def _single_child_gross_share(
-    child_delta_gmv: float,
-    parent_residual_atoms: frozenset[str],
-    atomic_deltas: Dict[str, float],
-) -> float:
-    """Посчитать долю движения ребёнка в residual gross movement родителя.
-
-    Args:
-        child_delta_gmv: Изменение GMV единственного активного ребёнка.
-        parent_residual_atoms: Текущее остаточное атомарное покрытие родителя.
-        atomic_deltas: Изменения GMV физических атомов.
-
-    Returns:
-        Неотрицательная доля gross movement; ноль при нулевом знаменателе.
-
-    Raises:
-        KeyError: Если для атома отсутствует изменение GMV.
-
-    Examples:
-        >>> _single_child_gross_share(-70.0, frozenset({'a', 'b'}), {'a': -70.0, 'b': 30.0})
-        0.7
-    """
-
-    residual_gross_movement = float(
-        sum(abs(float(atomic_deltas[atom_id])) for atom_id in parent_residual_atoms)
-    )
-    if residual_gross_movement == 0.0:
-        return 0.0
-    return abs(float(child_delta_gmv)) / residual_gross_movement
-
-
-def _single_child_decision(
-    parent_abs_z: float,
-    child_abs_z: float,
-    gross_share: float,
-    thresholds: AnomalyThresholds,
-) -> str:
-    """Применить правило выбора между родителем и единственным ребёнком.
-
-    Args:
-        parent_abs_z: Абсолютный z-score родителя.
-        child_abs_z: Абсолютный z-score ребёнка.
-        gross_share: Неотрицательная доля движения ребёнка.
-        thresholds: Порог доли и множитель Z.
-
-    Returns:
-        `CHILD_WINS` или `PARENT_WINS`.
-
-    Raises:
-        ValueError: Не выбрасывается.
-
-    Examples:
-        >>> _single_child_decision(2.0, 3.0, 0.8, AnomalyThresholds())
-        'CHILD_WINS'
-        >>> _single_child_decision(3.6, 3.0, 0.8, AnomalyThresholds())
-        'PARENT_WINS'
-    """
-
-    if (
-        gross_share > thresholds.single_child_gross_share_threshold
-        and child_abs_z >= parent_abs_z * thresholds.single_child_z_multiplier
-    ):
-        return "CHILD_WINS"
-    return "PARENT_WINS"
-
-
-def _active_child_group_key(
-    parent_features: frozenset[Tuple[str, str]],
-    child_features: frozenset[Tuple[str, str]],
-) -> Tuple[str, ...]:
-    """Определить родственную группу ребёнка относительно родителя.
-
-    Args:
-        parent_features: Набор признаков родительского сегмента.
-        child_features: Набор признаков дочернего сегмента.
-
-    Returns:
-        Кортеж добавленных измерений; дети с одинаковым набором измерений считаются одной родственной группой.
-
-    Raises:
-        ValueError: Не выбрасывается.
-
-    Examples:
-        >>> _active_child_group_key(frozenset({('merchant', 'SMB')}), frozenset({('merchant', 'SMB'), ('geo', 'RF')}))
-        ('geo',)
-    """
-
-    return tuple(sorted(dimension for dimension, _ in child_features - parent_features))
-
-
-def _segments_overlap_by_atoms(segment_ids: Sequence[str], coverage: Dict[str, frozenset[str]]) -> bool:
-    """Проверить, пересекаются ли сегменты по атомарному покрытию.
-
-    Args:
-        segment_ids: Идентификаторы сегментов.
-        coverage: Словарь атомарного покрытия.
-
-    Returns:
-        True, если хотя бы два сегмента имеют общий атом.
-
-    Raises:
-        ValueError: Не выбрасывается.
-
-    Examples:
-        >>> _segments_overlap_by_atoms(['a', 'b'], {'a': frozenset({'1'}), 'b': frozenset({'2'})})
-        False
-    """
-
-    used_atoms: set[str] = set()
-    for segment_id in segment_ids:
-        atoms = set(coverage.get(str(segment_id), frozenset()))
-        if used_atoms & atoms:
-            return True
-        used_atoms.update(atoms)
-    return False
-
-
-def _split_sibling_groups(
-    parent_id: str,
-    child_ids: Sequence[str],
-    feature_sets: Dict[str, frozenset[Tuple[str, str]]],
-    coverage: Dict[str, frozenset[str]],
-) -> List[List[str]]:
-    """Построить родственные группы детей для правила 1:N.
-
-    Args:
-        parent_id: Идентификатор родителя.
-        child_ids: Ближайшие активные дети родителя.
-        feature_sets: Наборы признаков сегментов.
-        coverage: Словарь атомарного покрытия.
-
-    Returns:
-        Список групп детей. Если внутри группы остаётся пересечение, группа дробится до одиночных сегментов.
-
-    Raises:
-        KeyError: Если для сегмента нет набора признаков.
-
-    Examples:
-        >>> features = {'p': frozenset({('m', 'SMB')}), 'c': frozenset({('m', 'SMB'), ('geo', 'RF')})}
-        >>> _split_sibling_groups('p', ['c'], features, {'c': frozenset({'1'})})
-        [['c']]
-    """
-
-    parent_features = feature_sets[parent_id]
-    grouped: Dict[Tuple[str, ...], List[str]] = {}
-    for child_id in child_ids:
-        group_key = _active_child_group_key(parent_features, feature_sets[child_id])
-        grouped.setdefault(group_key, []).append(str(child_id))
-
-    result: List[List[str]] = []
-    for _, group_ids in sorted(grouped.items(), key=lambda item: (item[0], item[1])):
-        ordered_group = sorted(group_ids)
-        if _segments_overlap_by_atoms(ordered_group, coverage):
-            result.extend([[child_id] for child_id in ordered_group])
-        else:
-            result.append(ordered_group)
-    return result
-
-
-def _sum_abs_delta(segment_ids: Sequence[str], lookup: Dict[str, pd.Series]) -> float:
-    """Посчитать сумму модулей delta GMV по сегментам.
-
-    Args:
-        segment_ids: Идентификаторы сегментов.
-        lookup: Словарь `segment_id -> строка кандидата`.
-
-    Returns:
-        Сумма `abs(wow_delta_gmv)`.
-
-    Raises:
-        KeyError: Если сегмент отсутствует в lookup.
-
-    Examples:
-        >>> _sum_abs_delta(['a'], {'a': pd.Series({'wow_delta_gmv': -10})})
-        10.0
-    """
-
-    return float(sum(abs(_safe_float(lookup[str(segment_id)].get("wow_delta_gmv"))) for segment_id in segment_ids))
-
-
-def _nearest_parent_map(child_map: Dict[str, List[str]]) -> Dict[str, List[str]]:
-    """Инвертировать карту ближайших детей в карту ближайших родителей.
-
-    Args:
-        child_map: Словарь `parent_id -> child_ids`.
-
-    Returns:
-        Словарь `child_id -> parent_ids`.
-
-    Raises:
-        ValueError: Не выбрасывается.
-
-    Examples:
-        >>> _nearest_parent_map({'p': ['c']})
-        {'c': ['p']}
-    """
-
-    result: Dict[str, List[str]] = {}
-    for parent_id, child_ids in child_map.items():
-        result.setdefault(str(parent_id), result.get(str(parent_id), []))
-        for child_id in child_ids:
-            result.setdefault(str(child_id), []).append(str(parent_id))
-    return {segment_id: sorted(parent_ids) for segment_id, parent_ids in result.items()}
 
 
 def _segment_feature_set_from_key(segment_key: object) -> frozenset[Tuple[str, str]]:
@@ -1256,72 +683,1077 @@ def _build_coverage_from_segment_keys(candidates: pd.DataFrame) -> Dict[str, fro
     return coverage
 
 
-def _same_nonzero_direction(left: float, right: float) -> bool:
-    """ADDED: Проверить, что два изменения GMV ненулевые и направлены одинаково.
+
+
+def _set_packing_canonical_key(segment_id: str, lookup: Dict[str, pd.Series]) -> Tuple[str, int, str]:
+    """ADDED: Build a deterministic segment key for solver-independent ordering.
 
     Args:
-        left: Первое изменение GMV.
-        right: Второе изменение GMV.
+        segment_id: Segment identifier.
+        lookup: Mapping `segment_id -> candidate row`.
 
     Returns:
-        True, если оба значения одного знака и не равны нулю.
+        Tuple with human segment key, depth and technical identifier.
 
     Raises:
-        ValueError: Не выбрасывается.
+        ValueError: Not raised.
 
     Examples:
-        >>> _same_nonzero_direction(-10, -3)
+        >>> _set_packing_canonical_key('s', {'s': pd.Series({'segment_key': 'a=1', 'slice_depth': 1})})
+        ('a=1', 1, 's')
+    """
+
+    row = lookup[segment_id]
+    return (str(row.get("segment_key", "")), int(row.get("slice_depth", 0)), str(segment_id))
+
+
+def _validate_set_packing_duplicates(candidates: pd.DataFrame) -> None:
+    """ADDED: Validate that candidates do not contain duplicate segment identifiers or keys.
+
+    Args:
+        candidates: Candidate table.
+
+    Returns:
+        None.
+
+    Raises:
+        ValueError: If duplicate segment ids or duplicate segment keys are found.
+
+    Examples:
+        >>> _validate_set_packing_duplicates(pd.DataFrame({'segment_id': ['a'], 'segment_key': ['x']}))
+    """
+
+    duplicated_ids = sorted(candidates.loc[candidates["segment_id"].astype(str).duplicated(), "segment_id"].astype(str).unique())
+    if duplicated_ids:
+        raise ValueError(f"Duplicate segment_id values in candidates: {duplicated_ids[:10]}")
+    duplicated_keys = sorted(candidates.loc[candidates["segment_key"].astype(str).duplicated(), "segment_key"].astype(str).unique())
+    if duplicated_keys:
+        raise ValueError(f"Duplicate segment_key values in candidates: {duplicated_keys[:10]}")
+
+
+def _validate_set_packing_segment_keys(
+    candidates: pd.DataFrame,
+    dim_cols: Optional[Sequence[str]],
+) -> Dict[str, Tuple[bool, str]]:
+    """ADDED: Validate that segment keys are parseable and use known dimensions.
+
+    Args:
+        candidates: Candidate table with `segment_id`, `segment_key` and `slice_depth`.
+        dim_cols: Known dimension columns. If None, only syntactic validation is applied.
+
+    Returns:
+        Mapping `segment_id -> (is_valid, reason)`.
+
+    Raises:
+        ValueError: Not raised; invalid keys are returned as diagnostic statuses.
+
+    Examples:
+        >>> df = pd.DataFrame([{'segment_id': 's', 'segment_key': 'a=1', 'slice_depth': 1}])
+        >>> _validate_set_packing_segment_keys(df, ['a'])['s'][0]
         True
     """
 
-    return float(left) * float(right) > 0.0
+    known_dims = set(dim_cols or [])
+    result: Dict[str, Tuple[bool, str]] = {}
+    for _, row in candidates.iterrows():
+        segment_id = str(row["segment_id"])
+        depth = int(row["slice_depth"])
+        if depth == 0:
+            result[segment_id] = (True, "")
+            continue
+        parts = _segment_key_parts(row.get("segment_key", ""))
+        part_dims = [dimension for dimension, _ in parts]
+        if not parts:
+            result[segment_id] = (False, "segment_key is not parseable")
+            continue
+        if len(set(part_dims)) != len(part_dims):
+            result[segment_id] = (False, "segment_key contains duplicate dimensions")
+            continue
+        unknown_dims = sorted(set(part_dims) - known_dims) if known_dims else []
+        if unknown_dims:
+            result[segment_id] = (False, f"segment_key contains unknown dimensions: {unknown_dims}")
+            continue
+        if len(parts) != depth:
+            result[segment_id] = (False, f"segment_key depth {len(parts)} does not match slice_depth {depth}")
+            continue
+        result[segment_id] = (True, "")
+    return result
 
 
-def _parent_child_absorption_k(parent: pd.Series, child: pd.Series) -> float:
-    """ADDED: Посчитать коэффициент поглощения родителем дочернего сегмента.
+def _prepare_set_packing_coverage(
+    candidates: pd.DataFrame,
+    coverage: Optional[Dict[str, frozenset[str]]],
+) -> Tuple[Dict[str, frozenset[str]], str, Dict[str, str]]:
+    """ADDED: Prepare factual atomic coverage or explicitly marked segment-key fallback.
 
     Args:
-        parent: Строка родительского сегмента.
-        child: Строка дочернего сегмента.
+        candidates: Candidate table.
+        coverage: Optional factual mapping `segment_id -> atomic segment ids`.
 
     Returns:
-        Неотрицательный коэффициент `k` или NaN, если расчёт некорректен.
+        Tuple with normalized coverage, coverage source and per-segment validation issue.
+
+    Raises:
+        ValueError: If fallback coverage cannot be built from segment keys.
+
+    Examples:
+        >>> df = pd.DataFrame([{'segment_id': 'a', 'segment_key': 'x=1', 'slice_depth': 1}])
+        >>> _prepare_set_packing_coverage(df, None)[1]
+        'SEGMENT_KEY_FALLBACK'
+    """
+
+    if coverage is None:
+        return _build_coverage_from_segment_keys(candidates), "SEGMENT_KEY_FALLBACK", {}
+
+    normalized: Dict[str, frozenset[str]] = {}
+    issues: Dict[str, str] = {}
+    for raw_segment_id, raw_atoms in coverage.items():
+        segment_id = str(raw_segment_id)
+        atom_list = [str(atom_id).strip() for atom_id in list(raw_atoms or []) if str(atom_id).strip()]
+        if len(atom_list) != len(set(atom_list)):
+            issues[segment_id] = "duplicate atomic ids were removed from coverage"
+        normalized[segment_id] = frozenset(atom_list)
+
+    for segment_id in candidates["segment_id"].astype(str).tolist():
+        if segment_id not in normalized:
+            normalized[segment_id] = frozenset()
+            issues[segment_id] = "coverage is missing for segment_id"
+    return normalized, "FACTUAL_ATOMIC_COVERAGE", issues
+
+
+def _build_set_packing_conflicts(
+    segment_ids: Sequence[str],
+    coverage: Dict[str, frozenset[str]],
+    lookup: Dict[str, pd.Series],
+) -> Tuple[Dict[str, List[str]], Dict[Tuple[str, str], frozenset[str]], Dict[str, int]]:
+    """ADDED: Build conflict graph through an atom-to-segments inverted index.
+
+    Args:
+        segment_ids: Eligible segment ids.
+        coverage: Mapping `segment_id -> atomic segment ids`.
+        lookup: Mapping `segment_id -> candidate row`.
+
+    Returns:
+        Tuple with `atom_to_segments`, conflict pairs and conflict count by segment.
+
+    Raises:
+        ValueError: Not raised.
+
+    Examples:
+        >>> lookup = {'a': pd.Series({'segment_key': 'a', 'slice_depth': 1})}
+        >>> _build_set_packing_conflicts(['a'], {'a': frozenset({'atom'})}, lookup)[2]['a']
+        0
+    """
+
+    sorted_segment_ids = sorted(segment_ids, key=lambda segment_id: _set_packing_canonical_key(segment_id, lookup))
+    atom_to_segments: Dict[str, List[str]] = {}
+    for segment_id in sorted_segment_ids:
+        for atom_id in sorted(coverage.get(segment_id, frozenset())):
+            atom_to_segments.setdefault(atom_id, []).append(segment_id)
+
+    for atom_id, atom_segment_ids in atom_to_segments.items():
+        atom_to_segments[atom_id] = sorted(atom_segment_ids, key=lambda segment_id: _set_packing_canonical_key(segment_id, lookup))
+
+    pair_atoms: Dict[Tuple[str, str], set[str]] = {}
+    conflict_neighbors: Dict[str, set[str]] = {segment_id: set() for segment_id in sorted_segment_ids}
+    for atom_id, atom_segment_ids in atom_to_segments.items():
+        if len(atom_segment_ids) <= 1:
+            continue
+        for left_id, right_id in combinations(atom_segment_ids, 2):
+            pair = tuple(sorted((left_id, right_id), key=lambda segment_id: _set_packing_canonical_key(segment_id, lookup)))
+            pair_atoms.setdefault(pair, set()).add(atom_id)
+            conflict_neighbors[left_id].add(right_id)
+            conflict_neighbors[right_id].add(left_id)
+
+    conflict_pair_atoms = {
+        pair: frozenset(atoms)
+        for pair, atoms in pair_atoms.items()
+    }
+    conflict_count_by_segment = {
+        segment_id: len(conflict_neighbors.get(segment_id, set()))
+        for segment_id in sorted_segment_ids
+    }
+    return atom_to_segments, conflict_pair_atoms, conflict_count_by_segment
+
+
+def _build_set_packing_components(
+    segment_ids: Sequence[str],
+    conflict_pair_atoms: Dict[Tuple[str, str], frozenset[str]],
+    coverage: Dict[str, frozenset[str]],
+    lookup: Dict[str, pd.Series],
+    scores: Dict[str, float],
+) -> List[Dict[str, object]]:
+    """ADDED: Split the conflict graph into exact independent components.
+
+    Args:
+        segment_ids: Eligible segment ids.
+        conflict_pair_atoms: Mapping conflict pair -> shared atomic ids.
+        coverage: Mapping `segment_id -> atomic segment ids`.
+        lookup: Mapping `segment_id -> candidate row`.
+        scores: Objective coefficient by segment.
+
+    Returns:
+        List of component dictionaries with deterministic component ids.
+
+    Raises:
+        ValueError: Not raised.
+
+    Examples:
+        >>> lookup = {'a': pd.Series({'segment_key': 'a', 'slice_depth': 1})}
+        >>> _build_set_packing_components(['a'], {}, {'a': frozenset({'atom'})}, lookup, {'a': 1.0})[0]['component_id']
+        'C001'
+    """
+
+    adjacency: Dict[str, set[str]] = {segment_id: set() for segment_id in segment_ids}
+    for left_id, right_id in conflict_pair_atoms:
+        adjacency[left_id].add(right_id)
+        adjacency[right_id].add(left_id)
+
+    raw_components: List[List[str]] = []
+    remaining = set(segment_ids)
+    while remaining:
+        seed_id = min(remaining, key=lambda segment_id: _set_packing_canonical_key(segment_id, lookup))
+        stack = [seed_id]
+        remaining.remove(seed_id)
+        component: List[str] = []
+        while stack:
+            segment_id = stack.pop()
+            component.append(segment_id)
+            for neighbor_id in sorted(adjacency.get(segment_id, set()), key=lambda sid: _set_packing_canonical_key(sid, lookup)):
+                if neighbor_id in remaining:
+                    remaining.remove(neighbor_id)
+                    stack.append(neighbor_id)
+        raw_components.append(sorted(component, key=lambda sid: _set_packing_canonical_key(sid, lookup)))
+
+    raw_components.sort(key=lambda component: _set_packing_canonical_key(component[0], lookup))
+    components: List[Dict[str, object]] = []
+    for component_index, component_segment_ids in enumerate(raw_components, start=1):
+        component_id = f"C{component_index:03d}"
+        component_atom_ids = sorted(
+            set().union(*(coverage.get(segment_id, frozenset()) for segment_id in component_segment_ids))
+        )
+        component_pair_count = sum(
+            1
+            for left_id, right_id in conflict_pair_atoms
+            if left_id in component_segment_ids and right_id in component_segment_ids
+        )
+        depths = [int(lookup[segment_id]["slice_depth"]) for segment_id in component_segment_ids]
+        components.append(
+            {
+                "component_id": component_id,
+                "segment_ids": component_segment_ids,
+                "atom_ids": component_atom_ids,
+                "conflict_pair_count": component_pair_count,
+                "segment_count": len(component_segment_ids),
+                "atom_count": len(component_atom_ids),
+                "min_depth": min(depths),
+                "max_depth": max(depths),
+                "score_sum": float(sum(scores.get(segment_id, 0.0) for segment_id in component_segment_ids)),
+            }
+        )
+    return components
+
+
+def _component_atom_to_segments(
+    component_segment_ids: Sequence[str],
+    coverage: Dict[str, frozenset[str]],
+    lookup: Dict[str, pd.Series],
+) -> Dict[str, List[str]]:
+    """ADDED: Build atom constraints for one optimization component.
+
+    Args:
+        component_segment_ids: Segment ids inside one conflict component.
+        coverage: Mapping `segment_id -> atomic segment ids`.
+        lookup: Mapping `segment_id -> candidate row`.
+
+    Returns:
+        Mapping `atomic_segment_id -> segment ids covering this atom`.
+
+    Raises:
+        ValueError: Not raised.
+
+    Examples:
+        >>> lookup = {'a': pd.Series({'segment_key': 'a', 'slice_depth': 1})}
+        >>> _component_atom_to_segments(['a'], {'a': frozenset({'atom'})}, lookup)['atom']
+        ['a']
+    """
+
+    atom_to_segments: Dict[str, List[str]] = {}
+    for segment_id in component_segment_ids:
+        for atom_id in coverage.get(segment_id, frozenset()):
+            atom_to_segments.setdefault(atom_id, []).append(segment_id)
+    return {
+        atom_id: sorted(atom_segment_ids, key=lambda sid: _set_packing_canonical_key(sid, lookup))
+        for atom_id, atom_segment_ids in sorted(atom_to_segments.items())
+    }
+
+
+def _set_packing_solver_result(
+    component: Dict[str, object],
+    solver_name: str,
+    solver_status: str,
+    selected_ids: Sequence[str],
+    objective_value: float,
+    best_bound: float,
+    absolute_gap: float,
+    relative_gap: float,
+    solve_time_sec: float,
+    variable_count: int,
+    constraint_count: int,
+    message: str = "",
+) -> Dict[str, object]:
+    """ADDED: Normalize solver output for diagnostics.
+
+    Args:
+        component: Component metadata.
+        solver_name: Solver label.
+        solver_status: Normalized status.
+        selected_ids: Selected segment ids.
+        objective_value: Proven or incumbent objective value.
+        best_bound: Solver bound in the same maximization scale.
+        absolute_gap: Absolute MIP gap.
+        relative_gap: Relative MIP gap.
+        solve_time_sec: Solver runtime.
+        variable_count: Number of binary variables.
+        constraint_count: Number of atom constraints.
+        message: Optional solver message.
+
+    Returns:
+        Component result dictionary.
+
+    Raises:
+        ValueError: Not raised.
+
+    Examples:
+        >>> _set_packing_solver_result({'component_id': 'C001'}, 'TRIVIAL', 'OPTIMAL', [], 0, 0, 0, 0, 0, 0, 0)['component_id']
+        'C001'
+    """
+
+    return {
+        **component,
+        "solver_name": solver_name,
+        "solver_status": solver_status,
+        "selected_ids": list(selected_ids),
+        "objective_value": float(objective_value),
+        "best_bound": float(best_bound),
+        "absolute_gap": float(absolute_gap),
+        "relative_gap": float(relative_gap),
+        "solve_time_sec": float(solve_time_sec),
+        "variable_count": int(variable_count),
+        "constraint_count": int(constraint_count),
+        "message": message,
+        "is_optimal": solver_status == "OPTIMAL" and abs(float(absolute_gap)) <= 1e-7,
+    }
+
+
+def _set_packing_result_is_proven_optimal(result: Dict[str, object], gap_tolerance: float) -> bool:
+    """ADDED: Проверить, что результат компоненты доказанно оптимален.
+
+    Args:
+        result: Нормализованный результат solver-а.
+        gap_tolerance: Допустимый gap для признания оптимума доказанным.
+
+    Returns:
+        True, если статус OPTIMAL и absolute или relative gap находится в допустимой точности.
 
     Raises:
         ValueError: Не выбрасывается.
 
     Examples:
-        >>> _parent_child_absorption_k(
-        ...     pd.Series({'robust_z_capped': 4, 'wow_delta_gmv': 200}),
-        ...     pd.Series({'robust_z_capped': 2, 'wow_delta_gmv': 100}),
-        ... )
-        4.0
+        >>> _set_packing_result_is_proven_optimal({'solver_status': 'OPTIMAL', 'relative_gap': 0.0, 'absolute_gap': 0.0}, 1e-9)
+        True
     """
 
-    parent_z = abs(_safe_float(parent.get("robust_z_capped")))
-    child_z = abs(_safe_float(child.get("robust_z_capped")))
-    parent_delta = abs(_safe_float(parent.get("wow_delta_gmv")))
-    child_delta = abs(_safe_float(child.get("wow_delta_gmv")))
-    if child_z == 0.0 or child_delta == 0.0:
-        return math.nan
-    return (parent_z / child_z) * (parent_delta / child_delta)
+    if str(result.get("solver_status", "")) != "OPTIMAL":
+        return False
+    relative_gap = _safe_float(result.get("relative_gap"), math.nan)
+    absolute_gap = _safe_float(result.get("absolute_gap"), math.nan)
+    tolerance = float(gap_tolerance) + 1e-12
+    return relative_gap <= tolerance or absolute_gap <= tolerance
 
 
-def search_anomal(candidates: pd.DataFrame, thresholds: AnomalyThresholds) -> Tuple[pd.DataFrame, pd.DataFrame, pd.DataFrame]:
-    """ADDED: Найти итоговые аномалии через активное разбиение снизу вверх.
+def _try_solve_component_with_gurobi(
+    component: Dict[str, object],
+    atom_to_segments: Dict[str, List[str]],
+    lookup: Dict[str, pd.Series],
+    scores: Dict[str, float],
+    gap_tolerance: float,
+) -> Optional[Dict[str, object]]:
+    """ADDED: Try solving one component with Gurobi if it is installed and licensed.
 
     Args:
-        candidates: Таблица кандидатов после `build_anomaly_candidates` и `add_child_context`.
-        thresholds: Пороги алгоритма, включая `parent_child_absorption_k_threshold`.
+        component: Component metadata.
+        atom_to_segments: Atom constraints for the component.
+        lookup: Mapping `segment_id -> candidate row`.
+        scores: Objective coefficient by segment.
+        gap_tolerance: Allowed relative MIP gap.
 
     Returns:
-        Кортеж: итоговые аномалии, диагностика кандидатов, журнал решений.
+        Solver result or None if Gurobi is unavailable.
 
     Raises:
-        ValueError: Если отсутствуют обязательные колонки или физический атомарный слой.
+        ValueError: Not raised; solver errors trigger fallback to the next solver.
 
     Examples:
-        >>> # final_df, diagnostics, log = search_anomal(candidates, AnomalyThresholds())
+        >>> # result = _try_solve_component_with_gurobi(component, atoms, lookup, scores, 1e-9)
+    """
+
+    try:
+        import gurobipy as gp  # type: ignore[import-not-found]
+        from gurobipy import GRB  # type: ignore[import-not-found]
+    except Exception:
+        return None
+
+    start_time = time.perf_counter()
+    component_segment_ids = list(component["segment_ids"])
+    try:
+        model = gp.Model("gmv_set_packing")
+        model.Params.OutputFlag = 0
+        model.Params.MIPGap = gap_tolerance
+        variables = {
+            segment_id: model.addVar(vtype=GRB.BINARY, name=f"x_{position}")
+            for position, segment_id in enumerate(component_segment_ids)
+        }
+        model.setObjective(
+            gp.quicksum(float(scores[segment_id]) * variables[segment_id] for segment_id in component_segment_ids),
+            GRB.MAXIMIZE,
+        )
+        for atom_segment_ids in atom_to_segments.values():
+            model.addConstr(gp.quicksum(variables[segment_id] for segment_id in atom_segment_ids) <= 1)
+        model.optimize()
+    except Exception as exc:
+        return _set_packing_solver_result(
+            component,
+            "GUROBI",
+            "ERROR",
+            [],
+            0.0,
+            math.nan,
+            math.nan,
+            math.nan,
+            time.perf_counter() - start_time,
+            len(component_segment_ids),
+            len(atom_to_segments),
+            str(exc),
+        )
+
+    status = "OPTIMAL" if model.Status == GRB.OPTIMAL else str(model.Status)
+    selected_ids = [
+        segment_id
+        for segment_id in component_segment_ids
+        if variables[segment_id].X >= 0.5
+    ]
+    objective_value = float(model.ObjVal) if model.SolCount else 0.0
+    best_bound = float(model.ObjBound) if model.SolCount else math.nan
+    relative_gap = float(model.MIPGap) if model.SolCount else math.nan
+    absolute_gap = abs(best_bound - objective_value) if not math.isnan(best_bound) else math.nan
+    return _set_packing_solver_result(
+        component,
+        "GUROBI",
+        status,
+        selected_ids,
+        objective_value,
+        best_bound,
+        absolute_gap,
+        relative_gap,
+        time.perf_counter() - start_time,
+        len(component_segment_ids),
+        len(atom_to_segments),
+        "",
+    )
+
+
+def _try_solve_component_with_scipy(
+    component: Dict[str, object],
+    atom_to_segments: Dict[str, List[str]],
+    lookup: Dict[str, pd.Series],
+    scores: Dict[str, float],
+    gap_tolerance: float,
+) -> Optional[Dict[str, object]]:
+    """ADDED: Solve one component through scipy.optimize.milp and HiGHS.
+
+    Args:
+        component: Component metadata.
+        atom_to_segments: Atom constraints for the component.
+        lookup: Mapping `segment_id -> candidate row`.
+        scores: Objective coefficient by segment.
+        gap_tolerance: Allowed relative MIP gap.
+
+    Returns:
+        Solver result or None if SciPy MILP is unavailable.
+
+    Raises:
+        ValueError: Not raised; solver errors trigger fallback.
+
+    Examples:
+        >>> # result = _try_solve_component_with_scipy(component, atoms, lookup, scores, 1e-9)
+    """
+
+    try:
+        import numpy as np
+        from scipy.optimize import Bounds, LinearConstraint, milp
+        from scipy.sparse import coo_array
+    except Exception:
+        return None
+
+    start_time = time.perf_counter()
+    component_segment_ids = sorted(
+        list(component["segment_ids"]),
+        key=lambda segment_id: _set_packing_canonical_key(segment_id, lookup),
+    )
+    variable_index = {segment_id: position for position, segment_id in enumerate(component_segment_ids)}
+    row_indices: List[int] = []
+    col_indices: List[int] = []
+    data_values: List[float] = []
+    for row_index, atom_id in enumerate(sorted(atom_to_segments)):
+        for segment_id in atom_to_segments[atom_id]:
+            row_indices.append(row_index)
+            col_indices.append(variable_index[segment_id])
+            data_values.append(1.0)
+
+    try:
+        constraint_matrix = coo_array(
+            (data_values, (row_indices, col_indices)),
+            shape=(len(atom_to_segments), len(component_segment_ids)),
+        ).tocsr()
+        constraints = LinearConstraint(
+            constraint_matrix,
+            lb=-np.inf * np.ones(len(atom_to_segments)),
+            ub=np.ones(len(atom_to_segments)),
+        )
+        result = milp(
+            c=-np.array([float(scores[segment_id]) for segment_id in component_segment_ids], dtype=float),
+            integrality=np.ones(len(component_segment_ids), dtype=int),
+            bounds=Bounds(np.zeros(len(component_segment_ids)), np.ones(len(component_segment_ids))),
+            constraints=constraints,
+            options={"mip_rel_gap": gap_tolerance},
+        )
+    except Exception as exc:
+        return _set_packing_solver_result(
+            component,
+            "SCIPY_HIGHS",
+            "ERROR",
+            [],
+            0.0,
+            math.nan,
+            math.nan,
+            math.nan,
+            time.perf_counter() - start_time,
+            len(component_segment_ids),
+            len(atom_to_segments),
+            str(exc),
+        )
+
+    selected_ids = []
+    if getattr(result, "x", None) is not None:
+        selected_ids = [
+            segment_id
+            for segment_id, value in zip(component_segment_ids, result.x)
+            if float(value) >= 0.5
+        ]
+    objective_value = -float(result.fun) if getattr(result, "fun", None) is not None else 0.0
+    raw_dual_bound = getattr(result, "mip_dual_bound", math.nan)
+    best_bound = -float(raw_dual_bound) if raw_dual_bound is not None and not math.isnan(float(raw_dual_bound)) else objective_value
+    raw_gap = getattr(result, "mip_gap", 0.0 if int(getattr(result, "status", -1)) == 0 else math.nan)
+    relative_gap = float(raw_gap) if raw_gap is not None else math.nan
+    absolute_gap = abs(best_bound - objective_value) if not math.isnan(best_bound) else math.nan
+    status = "OPTIMAL" if int(getattr(result, "status", -1)) == 0 and relative_gap <= gap_tolerance + 1e-12 else str(getattr(result, "status", "UNKNOWN"))
+    return _set_packing_solver_result(
+        component,
+        "SCIPY_HIGHS",
+        status,
+        selected_ids,
+        objective_value,
+        best_bound,
+        absolute_gap,
+        relative_gap,
+        time.perf_counter() - start_time,
+        len(component_segment_ids),
+        len(atom_to_segments),
+        str(getattr(result, "message", "")),
+    )
+
+
+def _solve_component_exact_branch_and_bound(
+    component: Dict[str, object],
+    atom_to_segments: Dict[str, List[str]],
+    lookup: Dict[str, pd.Series],
+    coverage: Dict[str, frozenset[str]],
+    scores: Dict[str, float],
+) -> Dict[str, object]:
+    """ADDED: Solve set packing exactly without external MILP dependencies.
+
+    Args:
+        component: Component metadata.
+        atom_to_segments: Atom constraints for the component.
+        lookup: Mapping `segment_id -> candidate row`.
+        coverage: Mapping `segment_id -> atomic segment ids`.
+        scores: Objective coefficient by segment.
+
+    Returns:
+        Proven optimal component result.
+
+    Raises:
+        RecursionError: If Python recursion depth is exceeded on an unusually large component.
+
+    Examples:
+        >>> lookup = {'a': pd.Series({'segment_key': 'a', 'slice_depth': 1})}
+        >>> component = {'component_id': 'C001', 'segment_ids': ['a'], 'atom_ids': ['atom']}
+        >>> _solve_component_exact_branch_and_bound(component, {'atom': ['a']}, lookup, {'a': frozenset({'atom'})}, {'a': 1.0})['solver_status']
+        'OPTIMAL'
+    """
+
+    start_time = time.perf_counter()
+    ordered_ids = sorted(
+        list(component["segment_ids"]),
+        key=lambda sid: (-float(scores.get(sid, 0.0)), _set_packing_canonical_key(sid, lookup)),
+    )
+    suffix_positive_score = [0.0] * (len(ordered_ids) + 1)
+    for index in range(len(ordered_ids) - 1, -1, -1):
+        suffix_positive_score[index] = suffix_positive_score[index + 1] + max(0.0, float(scores.get(ordered_ids[index], 0.0)))
+
+    best_score = 0.0
+    best_selected: List[str] = []
+    best_signature: Tuple[int, Tuple[Tuple[str, int, str], ...]] = (0, tuple())
+
+    def solution_signature(selected_ids: Sequence[str]) -> Tuple[int, Tuple[Tuple[str, int, str], ...]]:
+        """ADDED: Deterministic tie-break signature among equal-score optima.
+
+        Args:
+            selected_ids: Selected segment ids.
+
+        Returns:
+            Signature preferring fewer rows, then lexical segment order.
+
+        Raises:
+            ValueError: Not raised.
+
+        Examples:
+            >>> solution_signature([])
+            (0, ())
+        """
+
+        return (
+            len(selected_ids),
+            tuple(_set_packing_canonical_key(segment_id, lookup) for segment_id in sorted(selected_ids, key=lambda sid: _set_packing_canonical_key(sid, lookup))),
+        )
+
+    def update_best(selected_ids: Sequence[str], score_value: float) -> None:
+        """ADDED: Update incumbent solution with deterministic tie handling.
+
+        Args:
+            selected_ids: Candidate selected segment ids.
+            score_value: Candidate objective value.
+
+        Returns:
+            None.
+
+        Raises:
+            ValueError: Not raised.
+
+        Examples:
+            >>> # update_best(['a'], 1.0)
+        """
+
+        nonlocal best_score, best_selected, best_signature
+        signature = solution_signature(selected_ids)
+        if score_value > best_score + 1e-12 or (abs(score_value - best_score) <= 1e-12 and signature < best_signature):
+            best_score = float(score_value)
+            best_selected = sorted(selected_ids, key=lambda sid: _set_packing_canonical_key(sid, lookup))
+            best_signature = signature
+
+    def branch(index: int, used_atoms: frozenset[str], selected_ids: Tuple[str, ...], score_value: float) -> None:
+        """ADDED: Recursive exact branch-and-bound search.
+
+        Args:
+            index: Current position in ordered ids.
+            used_atoms: Atoms already covered by selected segments.
+            selected_ids: Current selected segment ids.
+            score_value: Current objective value.
+
+        Returns:
+            None.
+
+        Raises:
+            RecursionError: If recursion depth is exceeded.
+
+        Examples:
+            >>> # branch(0, frozenset(), tuple(), 0.0)
+        """
+
+        if score_value + suffix_positive_score[index] < best_score - 1e-12:
+            return
+        if index >= len(ordered_ids):
+            update_best(selected_ids, score_value)
+            return
+        segment_id = ordered_ids[index]
+        segment_score = float(scores.get(segment_id, 0.0))
+        segment_atoms = coverage.get(segment_id, frozenset())
+        if segment_score > 0.0 and not (used_atoms & segment_atoms):
+            branch(index + 1, used_atoms | segment_atoms, (*selected_ids, segment_id), score_value + segment_score)
+        branch(index + 1, used_atoms, selected_ids, score_value)
+
+    branch(0, frozenset(), tuple(), 0.0)
+    return _set_packing_solver_result(
+        component,
+        "EXACT_BRANCH_AND_BOUND",
+        "OPTIMAL",
+        best_selected,
+        best_score,
+        best_score,
+        0.0,
+        0.0,
+        time.perf_counter() - start_time,
+        len(ordered_ids),
+        len(atom_to_segments),
+        "",
+    )
+
+
+def _solve_set_packing_component(
+    component: Dict[str, object],
+    coverage: Dict[str, frozenset[str]],
+    lookup: Dict[str, pd.Series],
+    scores: Dict[str, float],
+    gap_tolerance: float,
+    max_exact_fallback_size: int,
+) -> Dict[str, object]:
+    """ADDED: Solve one independent set-packing component with the best available exact solver.
+
+    Args:
+        component: Component metadata.
+        coverage: Mapping `segment_id -> atomic segment ids`.
+        lookup: Mapping `segment_id -> candidate row`.
+        scores: Objective coefficient by segment.
+        gap_tolerance: Allowed relative MIP gap.
+        max_exact_fallback_size: Largest component allowed for internal exact fallback.
+
+    Returns:
+        Component solver result.
+
+    Raises:
+        RuntimeError: If MILP solvers do not prove optimum and the component is too large for fallback.
+        RecursionError: If exact fallback is allowed but exceeds recursion depth.
+
+    Examples:
+        >>> lookup = {'a': pd.Series({'segment_key': 'a', 'slice_depth': 1})}
+        >>> component = {'component_id': 'C001', 'segment_ids': ['a'], 'atom_ids': ['atom']}
+        >>> _solve_set_packing_component(component, {'a': frozenset({'atom'})}, lookup, {'a': 1.0}, 1e-9, 25)['solver_status']
+        'OPTIMAL'
+    """
+
+    component_segment_ids = list(component["segment_ids"])
+    atom_to_segments = _component_atom_to_segments(component_segment_ids, coverage, lookup)
+    if all(len(segment_ids) <= 1 for segment_ids in atom_to_segments.values()):
+        selected_ids = [
+            segment_id
+            for segment_id in component_segment_ids
+            if float(scores.get(segment_id, 0.0)) > 0.0
+        ]
+        objective_value = float(sum(scores.get(segment_id, 0.0) for segment_id in selected_ids))
+        return _set_packing_solver_result(
+            component,
+            "TRIVIAL",
+            "OPTIMAL",
+            sorted(selected_ids, key=lambda sid: _set_packing_canonical_key(sid, lookup)),
+            objective_value,
+            objective_value,
+            0.0,
+            0.0,
+            0.0,
+            len(component_segment_ids),
+            len(atom_to_segments),
+            "",
+        )
+
+    last_result: Optional[Dict[str, object]] = None
+    for solver in (_try_solve_component_with_gurobi, _try_solve_component_with_scipy):
+        result = solver(component, atom_to_segments, lookup, scores, gap_tolerance)
+        if result is None:
+            continue
+        last_result = result
+        if _set_packing_result_is_proven_optimal(result, gap_tolerance):
+            return result
+
+    if len(component_segment_ids) > int(max_exact_fallback_size):
+        last_solver = str(last_result["solver_name"]) if last_result is not None else "NONE"
+        last_status = str(last_result["solver_status"]) if last_result is not None else "UNAVAILABLE"
+        raise RuntimeError(
+            "MILP solver не доказал optimum, exact fallback слишком велик: "
+            f"component={component.get('component_id')}, "
+            f"segment_count={len(component_segment_ids)}, "
+            f"limit={int(max_exact_fallback_size)}, "
+            f"last_solver={last_solver}, last_status={last_status}. "
+            "Для production-расчёта нужен рабочий точный MILP solver."
+        )
+
+    exact_result = _solve_component_exact_branch_and_bound(component, atom_to_segments, lookup, coverage, scores)
+    if last_result is not None and exact_result["message"] == "":
+        exact_result["message"] = f"Fallback after {last_result['solver_name']} status {last_result['solver_status']}"
+    return exact_result
+
+
+def _build_set_packing_decision_log(
+    component_results: Sequence[Dict[str, object]],
+    atom_to_segments: Dict[str, List[str]],
+    conflict_pair_atoms: Dict[Tuple[str, str], frozenset[str]],
+    lookup: Dict[str, pd.Series],
+    scores: Dict[str, float],
+    global_status: str,
+) -> pd.DataFrame:
+    """ADDED: Build a transparent journal for set-packing optimization.
+
+    Args:
+        component_results: Solver results by independent component.
+        atom_to_segments: Inverted index `atomic_segment_id -> segment ids`.
+        conflict_pair_atoms: Mapping conflict pair -> shared atomic ids.
+        lookup: Mapping `segment_id -> candidate row`.
+        scores: Objective coefficient by segment.
+        global_status: Overall optimization status.
+
+    Returns:
+        Decision log DataFrame.
+
+    Raises:
+        ValueError: Not raised.
+
+    Examples:
+        >>> _build_set_packing_decision_log([], {}, {}, {}, {}, 'EMPTY').empty
+        False
+    """
+
+    rows: List[Dict[str, object]] = [
+        {
+            "event_type": "GLOBAL_OPTIMIZATION_SUMMARY",
+            "global_status": global_status,
+            "component_count": len(component_results),
+            "selected_count": sum(len(result.get("selected_ids", [])) for result in component_results),
+            "objective_value": sum(float(result.get("objective_value", 0.0)) for result in component_results),
+            "best_bound": sum(float(result.get("best_bound", 0.0)) for result in component_results),
+            "absolute_gap": sum(float(result.get("absolute_gap", 0.0)) for result in component_results),
+            "relative_gap": max((float(result.get("relative_gap", 0.0)) for result in component_results), default=0.0),
+            "solver_status": global_status,
+        }
+    ]
+
+    for atom_id, segment_ids in sorted(atom_to_segments.items()):
+        rows.append(
+            {
+                "event_type": "ATOM_TO_SEGMENTS",
+                "atomic_segment_id": atom_id,
+                "segment_count": len(segment_ids),
+                "segment_ids": " || ".join(segment_ids),
+                "segment_keys": " || ".join(str(lookup[segment_id]["segment_key"]) for segment_id in segment_ids),
+            }
+        )
+
+    for (left_id, right_id), shared_atoms in sorted(
+        conflict_pair_atoms.items(),
+        key=lambda item: (
+            _set_packing_canonical_key(item[0][0], lookup),
+            _set_packing_canonical_key(item[0][1], lookup),
+        ),
+    ):
+        rows.append(
+            {
+                "event_type": "CONFLICT_PAIR",
+                "left_segment_id": left_id,
+                "left_segment_key": str(lookup[left_id]["segment_key"]),
+                "right_segment_id": right_id,
+                "right_segment_key": str(lookup[right_id]["segment_key"]),
+                "shared_atomic_count": len(shared_atoms),
+                "shared_atomic_ids": " || ".join(sorted(shared_atoms)),
+            }
+        )
+
+    for result in component_results:
+        selected_ids = set(result.get("selected_ids", []))
+        rows.append(
+            {
+                "event_type": "COMPONENT_SOLVE",
+                "component_id": result["component_id"],
+                "solver_name": result["solver_name"],
+                "solver_status": result["solver_status"],
+                "objective_value": result["objective_value"],
+                "best_bound": result["best_bound"],
+                "absolute_gap": result["absolute_gap"],
+                "relative_gap": result["relative_gap"],
+                "solve_time_sec": result["solve_time_sec"],
+                "variable_count": result["variable_count"],
+                "constraint_count": result["constraint_count"],
+                "segment_count": result["segment_count"],
+                "atom_count": result["atom_count"],
+                "conflict_pair_count": result["conflict_pair_count"],
+                "min_depth": result["min_depth"],
+                "max_depth": result["max_depth"],
+                "score_sum": result["score_sum"],
+                "selected_ids": " || ".join(sorted(selected_ids, key=lambda sid: _set_packing_canonical_key(sid, lookup))),
+                "message": result.get("message", ""),
+            }
+        )
+        for segment_id in result["segment_ids"]:
+            rows.append(
+                {
+                    "event_type": "SEGMENT_DECISION",
+                    "component_id": result["component_id"],
+                    "segment_id": segment_id,
+                    "segment_key": str(lookup[segment_id]["segment_key"]),
+                    "slice_depth": int(lookup[segment_id]["slice_depth"]),
+                    "anomaly_score": float(scores.get(segment_id, 0.0)),
+                    "selected": segment_id in selected_ids,
+                    "solver_name": result["solver_name"],
+                    "solver_status": result["solver_status"],
+                    "global_status": global_status,
+                }
+            )
+    return pd.DataFrame(rows)
+
+
+def validate_set_packing_solution(
+    final_df: pd.DataFrame,
+    diagnostics: pd.DataFrame,
+    coverage: Dict[str, frozenset[str]],
+    component_results: Sequence[Dict[str, object]],
+    scores: Dict[str, float],
+    global_status: str,
+    gap_tolerance: float,
+) -> None:
+    """ADDED: Обязательно проверить корректность найденного Set Packing решения.
+
+    Args:
+        final_df: Итоговые выбранные сегменты.
+        diagnostics: Диагностика всех кандидатов после оптимизации.
+        coverage: Покрытие `segment_id -> atomic_segment_id`.
+        component_results: Результаты решения независимых компонент.
+        scores: Вес `anomaly_score` по каждому оптимизируемому сегменту.
+        global_status: Итоговый статус оптимизации.
+        gap_tolerance: Допустимый solver gap.
+
+    Returns:
+        None.
+
+    Raises:
+        RuntimeError: Если решение не доказано оптимальным, нарушает атомарные ограничения
+            или objective не совпадает с суммой score выбранных сегментов.
+
+    Examples:
+        >>> validate_set_packing_solution(pd.DataFrame(), pd.DataFrame(), {}, [], {}, "OPTIMAL", 1e-9)
+    """
+
+    objective_tolerance = max(1e-7, float(gap_tolerance) + 1e-12)
+    if str(global_status) != "OPTIMAL":
+        raise RuntimeError(f"Set Packing solution is not globally OPTIMAL: global_status={global_status}")
+
+    if not diagnostics.empty and {"passes_initial_anomaly_filter", "slice_depth", "set_packing_status"}.issubset(diagnostics.columns):
+        passed_mask = diagnostics["passes_initial_anomaly_filter"].eq(True) & diagnostics["slice_depth"].astype(int).gt(0)
+        valid_final_statuses = {"SET_PACKING_SELECTED", "SET_PACKING_NOT_SELECTED"}
+        unresolved = diagnostics.loc[passed_mask & ~diagnostics["set_packing_status"].isin(valid_final_statuses)]
+        if not unresolved.empty:
+            examples = [
+                f"{row.segment_id}: {row.set_packing_status}"
+                for row in unresolved.head(10).itertuples(index=False)
+            ]
+            raise RuntimeError(
+                "После оптимизации остались прошедшие первичный фильтр сегменты вне доказанного Set Packing: "
+                + "; ".join(examples)
+            )
+
+    selected_ids_from_components: List[str] = []
+    component_objective_sum = 0.0
+    for result in component_results:
+        if not _set_packing_result_is_proven_optimal(result, gap_tolerance):
+            raise RuntimeError(
+                "Компонента Set Packing не доказала OPTIMAL: "
+                f"component={result.get('component_id')}, "
+                f"solver={result.get('solver_name')}, "
+                f"status={result.get('solver_status')}, "
+                f"abs_gap={result.get('absolute_gap')}, rel_gap={result.get('relative_gap')}"
+            )
+        component_selected_ids = [str(segment_id) for segment_id in result.get("selected_ids", [])]
+        if len(component_selected_ids) != len(set(component_selected_ids)):
+            raise RuntimeError(f"Компонента {result.get('component_id')} содержит дубли selected_ids")
+        missing_scores = sorted(set(component_selected_ids) - set(scores))
+        if missing_scores:
+            raise RuntimeError(
+                f"Для выбранных сегментов компоненты {result.get('component_id')} отсутствует score: {missing_scores[:10]}"
+            )
+        selected_score_sum = float(sum(float(scores[segment_id]) for segment_id in component_selected_ids))
+        objective_value = _safe_float(result.get("objective_value"), math.nan)
+        if not math.isclose(selected_score_sum, objective_value, rel_tol=1e-9, abs_tol=objective_tolerance):
+            raise RuntimeError(
+                "Objective компоненты не равен сумме score выбранных сегментов: "
+                f"component={result.get('component_id')}, objective={objective_value}, selected_score_sum={selected_score_sum}"
+            )
+        component_objective_sum += objective_value
+        selected_ids_from_components.extend(component_selected_ids)
+
+    if len(selected_ids_from_components) != len(set(selected_ids_from_components)):
+        raise RuntimeError("Один и тот же сегмент выбран более чем в одной компоненте Set Packing")
+
+    final_ids = final_df["segment_id"].astype(str).tolist() if not final_df.empty and "segment_id" in final_df.columns else []
+    if set(final_ids) != set(selected_ids_from_components):
+        raise RuntimeError(
+            "final_df не совпадает с selected_ids solver-а: "
+            f"final_only={sorted(set(final_ids) - set(selected_ids_from_components))[:10]}, "
+            f"solver_only={sorted(set(selected_ids_from_components) - set(final_ids))[:10]}"
+        )
+    final_score_sum = (
+        float(pd.to_numeric(final_df["selection_score"], errors="coerce").sum())
+        if not final_df.empty and "selection_score" in final_df.columns
+        else 0.0
+    )
+    if not math.isclose(final_score_sum, component_objective_sum, rel_tol=1e-9, abs_tol=objective_tolerance):
+        raise RuntimeError(
+            "Глобальный objective не равен сумме objective компонент или score итоговых сегментов: "
+            f"final_score_sum={final_score_sum}, component_objective_sum={component_objective_sum}"
+        )
+
+    atom_to_selected_segments: Dict[str, List[str]] = {}
+    for segment_id in selected_ids_from_components:
+        segment_atoms = coverage.get(segment_id, frozenset())
+        if not segment_atoms:
+            raise RuntimeError(f"Выбранный сегмент {segment_id} не имеет атомарного покрытия")
+        for atom_id in segment_atoms:
+            atom_to_selected_segments.setdefault(str(atom_id), []).append(segment_id)
+    atom_violations = {
+        atom_id: segment_ids
+        for atom_id, segment_ids in atom_to_selected_segments.items()
+        if len(segment_ids) > 1
+    }
+    if atom_violations:
+        examples = [
+            f"{atom_id}: {' || '.join(segment_ids)}"
+            for atom_id, segment_ids in list(atom_violations.items())[:10]
+        ]
+        raise RuntimeError(
+            "Нарушено ограничение Set Packing sum(x_i covering atom) <= 1: "
+            + "; ".join(examples)
+        )
+
+
+def search_anomal(
+    candidates: pd.DataFrame,
+    thresholds: AnomalyThresholds,
+    coverage: Optional[Dict[str, frozenset[str]]] = None,
+    dim_cols: Optional[Sequence[str]] = None,
+) -> Tuple[pd.DataFrame, pd.DataFrame, pd.DataFrame]:
+    """FIXED: Select anomalies via exact Maximum Weighted Set Packing.
+
+    Args:
+        candidates: Candidate table after `build_anomaly_candidates`.
+        thresholds: Algorithm thresholds; only anomaly filters and set-packing gap tolerance affect selection.
+        coverage: Preferred factual mapping `segment_id -> observed atomic segment ids`.
+        dim_cols: Known dimension columns used to validate `segment_key`.
+
+    Returns:
+        Tuple with final selected anomalies, candidate diagnostics and optimization decision log.
+
+    Raises:
+        ValueError: If required columns are missing, duplicate candidates exist, or atomic coverage is invalid.
+        RecursionError: If all MILP solvers are unavailable and exact fallback exceeds recursion depth.
+
+    Examples:
+        >>> # final_df, diagnostics, log = search_anomal(candidates, AnomalyThresholds(), coverage, dims)
     """
 
     required_columns = {
@@ -1339,2064 +1771,231 @@ def search_anomal(candidates: pd.DataFrame, thresholds: AnomalyThresholds) -> Tu
 
     diagnostics = candidates.copy()
     if diagnostics.empty:
-        return diagnostics.copy(), diagnostics, pd.DataFrame()
+        return diagnostics.copy(), diagnostics, _build_set_packing_decision_log([], {}, {}, {}, {}, "EMPTY")
 
     diagnostics["segment_id"] = diagnostics["segment_id"].astype(str)
+    diagnostics["segment_key"] = diagnostics["segment_key"].astype(str)
     diagnostics["slice_depth"] = diagnostics["slice_depth"].astype(int)
-    max_depth = int(diagnostics["slice_depth"].max())
-    coverage = _build_coverage_from_segment_keys(diagnostics)
-    feature_sets = {
-        str(row["segment_id"]): _segment_feature_set_from_key(row.get("segment_key", ""))
-        for _, row in diagnostics.iterrows()
-    }
+    _validate_set_packing_duplicates(diagnostics)
+    normalized_coverage, coverage_source, coverage_issues = _prepare_set_packing_coverage(diagnostics, coverage)
+    key_validation = _validate_set_packing_segment_keys(diagnostics, dim_cols)
 
     string_columns = [
         "action",
         "output_block",
         "reason",
-        "active_child_ids",
-        "active_child_keys",
-        "active_parent_ids",
-        "active_parent_keys",
-        "active_partition_action",
-        "active_partition_reason",
-        "active_partition_status",
-        "active_partition_status_reason",
-        "active_graph_status",
-        "active_decision_code",
-        "active_decision_reason",
-        "active_decision_history",
-        "conflict_parent_ids",
-        "conflict_parent_keys",
-        "covered_by_segment",
-        "covered_by_segment_key",
-        "absorbed_child_ids",
-        "absorbed_child_keys",
-        "absorbed_child_labels",
-        "absorbed_by_parent_ids",
-        "absorbed_by_parent_keys",
         "original_atomic_descendants",
-        "active_atomic_descendants",
-        "residual_atomic_descendants",
-        "connection_break_reason",
-        "active_relationship_type",
-        "absorbed_by_role",
-        "absorbed_by_segment_key",
-        "absorption_reason",
+        "selected_atomic_descendants",
+        "set_packing_status",
+        "set_packing_global_status",
+        "set_packing_component_id",
+        "set_packing_solver",
+        "set_packing_solver_status",
+        "set_packing_reason",
+        "atomic_coverage_source",
+        "atomic_coverage_validation_status",
+        "conflict_segment_ids",
+        "conflict_segment_keys",
     ]
     for column in string_columns:
         diagnostics[column] = ""
+
     diagnostics["is_eligible"] = False
-    diagnostics["selection_score"] = pd.to_numeric(diagnostics["anomaly_score"], errors="coerce").fillna(0.0)
-    diagnostics["covered_atomic_count"] = diagnostics["segment_id"].map(lambda segment_id: len(coverage.get(str(segment_id), frozenset())))
-    diagnostics["technical_child_count"] = 0
-    diagnostics["active_child_count"] = 0
+    # FIXED: Не подменяем нечисловой score нулём; прошедший первичный фильтр кандидат
+    # с некорректным score должен остановить расчёт, а не исчезнуть из оптимизации.
+    diagnostics["selection_score"] = pd.to_numeric(diagnostics["anomaly_score"], errors="coerce")
+    diagnostics["covered_atomic_count"] = diagnostics["segment_id"].map(lambda sid: len(normalized_coverage.get(str(sid), frozenset())))
     diagnostics["original_atomic_count"] = 0
-    diagnostics["active_atomic_count"] = 0
-    diagnostics["residual_atomic_count"] = 0
-    diagnostics["residual_gross_movement"] = 0.0
-    diagnostics["single_child_gross_share"] = math.nan
-    diagnostics["anomaly_gross_move"] = math.nan
-    diagnostics["active_parent_z"] = math.nan
-    diagnostics["active_child_z"] = math.nan
-    diagnostics["parent_child_absorption_k"] = math.nan
-    diagnostics["active_decision_iteration"] = pd.Series(pd.NA, index=diagnostics.index, dtype="Int64")
-    diagnostics["connection_break_flag"] = False
-    diagnostics["is_active"] = False
+    diagnostics["selected_atomic_count"] = 0
     diagnostics["is_resolved"] = False
-    diagnostics["is_natural_terminal"] = False
-    diagnostics["is_terminal_current"] = False
     diagnostics["selected"] = False
     diagnostics["selection_exclusion_reason"] = ""
-
-    anomaly_mask = diagnostics["slice_depth"].gt(0) & diagnostics["passes_initial_anomaly_filter"].astype(bool)
-    parseable_mask = diagnostics["segment_id"].map(lambda segment_id: bool(feature_sets.get(str(segment_id), frozenset())))
-    anomaly_df = diagnostics[anomaly_mask & parseable_mask].copy()
-
-    for index, row in diagnostics.iterrows():
-        if int(row["slice_depth"]) == 0:
-            diagnostics.at[index, "action"] = "исключён"
-            diagnostics.at[index, "output_block"] = "исключён"
-            diagnostics.at[index, "reason"] = "total не выбирается как аномальный сегмент"
-            diagnostics.at[index, "active_graph_status"] = "NOT_IN_ANOMALY_GRAPH"
-            continue
-        if not bool(row.get("passes_initial_anomaly_filter", False)):
-            diagnostics.at[index, "action"] = "исключён"
-            diagnostics.at[index, "output_block"] = "исключён"
-            diagnostics.at[index, "reason"] = "сегмент не прошёл предварительный фильтр аномальности"
-            diagnostics.at[index, "active_graph_status"] = "NOT_IN_ANOMALY_GRAPH"
-            continue
-        if not bool(feature_sets.get(str(row["segment_id"]), frozenset())):
-            diagnostics.at[index, "action"] = "исключён"
-            diagnostics.at[index, "output_block"] = "исключён"
-            diagnostics.at[index, "reason"] = "не удалось восстановить признаки сегмента из segment_key"
-            diagnostics.at[index, "active_graph_status"] = "UNPARSEABLE_SEGMENT_KEY"
-            diagnostics.at[index, "selection_exclusion_reason"] = diagnostics.at[index, "reason"]
-            continue
-        diagnostics.at[index, "action"] = "кандидат_active-разбиения"
-        diagnostics.at[index, "output_block"] = "кандидат active-разбиения"
-        diagnostics.at[index, "reason"] = "сегмент прошёл первичный фильтр и участвует в active-разбиении"
-        diagnostics.at[index, "is_eligible"] = True
-
-    if anomaly_df.empty:
-        diagnostics.loc[diagnostics["selection_exclusion_reason"].eq(""), "selection_exclusion_reason"] = diagnostics["reason"]
-        return diagnostics.iloc[0:0].copy(), diagnostics, pd.DataFrame()
+    diagnostics["conflict_count"] = 0
+    diagnostics["set_packing_objective_value"] = math.nan
+    diagnostics["set_packing_best_bound"] = math.nan
+    diagnostics["set_packing_abs_gap"] = math.nan
+    diagnostics["set_packing_rel_gap"] = math.nan
+    diagnostics["set_packing_solve_time_sec"] = math.nan
+    diagnostics["set_packing_variable_count"] = 0
+    diagnostics["set_packing_constraint_count"] = 0
+    diagnostics["set_packing_component_segment_count"] = 0
+    diagnostics["set_packing_component_atom_count"] = 0
+    diagnostics["set_packing_component_conflict_pair_count"] = 0
+    diagnostics["set_packing_component_score_sum"] = 0.0
 
     lookup = {
         str(row["segment_id"]): row.copy()
-        for _, row in anomaly_df.iterrows()
+        for _, row in diagnostics.iterrows()
     }
-    anomaly_ids = sorted(lookup)
-    original_child_map = _nearest_active_child_map(anomaly_ids, feature_sets)
-    original_parent_map = _nearest_parent_map(original_child_map)
-    natural_terminals = {
-        segment_id for segment_id in anomaly_ids if not original_child_map.get(segment_id, [])
-    }
-
-    active_ids = set(anomaly_ids)
-    selected_ids: set[str] = set()
-    removed_ids: set[str] = set()
-    graph_status = {segment_id: "ACTIVE_PENDING" for segment_id in anomaly_ids}
-    status_reason = {segment_id: "ожидает решения active-разбиения" for segment_id in anomaly_ids}
-    last_children: Dict[str, List[str]] = {segment_id: [] for segment_id in anomaly_ids}
-    last_parents: Dict[str, List[str]] = {segment_id: [] for segment_id in anomaly_ids}
-    last_decision: Dict[str, str] = {segment_id: "" for segment_id in anomaly_ids}
-    last_reason: Dict[str, str] = {segment_id: "" for segment_id in anomaly_ids}
-    last_iteration: Dict[str, Optional[int]] = {segment_id: None for segment_id in anomaly_ids}
-    last_k: Dict[str, float] = {segment_id: math.nan for segment_id in anomaly_ids}
-    last_parent_z: Dict[str, float] = {segment_id: math.nan for segment_id in anomaly_ids}
-    last_child_z: Dict[str, float] = {segment_id: math.nan for segment_id in anomaly_ids}
-    last_relationship_type: Dict[str, str] = {segment_id: "" for segment_id in anomaly_ids}
-    absorbed_by_role: Dict[str, str] = {segment_id: "" for segment_id in anomaly_ids}
-    absorbed_by_segment_key: Dict[str, str] = {segment_id: "" for segment_id in anomaly_ids}
-    absorption_reason: Dict[str, str] = {segment_id: "" for segment_id in anomaly_ids}
-    conflict_parents: Dict[str, List[str]] = {segment_id: [] for segment_id in anomaly_ids}
-    connection_break_flag = {segment_id: False for segment_id in anomaly_ids}
-    connection_break_reason = {segment_id: "" for segment_id in anomaly_ids}
-    covered_by: Dict[str, str] = {}
-    absorbed_lineage: Dict[str, List[str]] = {segment_id: [] for segment_id in anomaly_ids}
-    decision_history: Dict[str, List[str]] = {segment_id: [] for segment_id in anomaly_ids}
-    selection_scores = {
-        segment_id: _safe_float(lookup[segment_id].get("selection_score"))
-        for segment_id in anomaly_ids
-    }
-    decision_log_rows: List[Dict[str, object]] = []
-
-    def log_decision(
-        iteration: int,
-        event_type: str,
-        parent_id: str,
-        child_id: str,
-        relationship_type: str,
-        decision_code: str,
-        applied: bool,
-        reason: str,
-        k_value: float = math.nan,
-        winner_parent_id: str = "",
-    ) -> None:
-        """ADDED: Записать решение active-разбиения в журнал."""
-
-        parent_row = lookup.get(parent_id)
-        child_row = lookup.get(child_id)
-        decision_log_rows.append(
-            {
-                "iteration": iteration,
-                "event_type": event_type,
-                "relationship_type": relationship_type,
-                "parent_id": parent_id,
-                "parent_key": "" if parent_row is None else str(parent_row["segment_key"]),
-                "parent_depth": pd.NA if parent_row is None else int(parent_row["slice_depth"]),
-                "child_id": child_id,
-                "child_key": "" if child_row is None else str(child_row["segment_key"]),
-                "child_depth": pd.NA if child_row is None else int(child_row["slice_depth"]),
-                "parent_abs_z": math.nan if parent_row is None else abs(_safe_float(parent_row.get("robust_z_capped"))),
-                "child_abs_z": math.nan if child_row is None else abs(_safe_float(child_row.get("robust_z_capped"))),
-                "parent_delta_gmv": math.nan if parent_row is None else _safe_float(parent_row.get("wow_delta_gmv")),
-                "child_delta_gmv": math.nan if child_row is None else _safe_float(child_row.get("wow_delta_gmv")),
-                "k_value": k_value,
-                "k_threshold": thresholds.parent_child_absorption_k_threshold,
-                "pair_decision": decision_code,
-                "conflict_code": decision_code,
-                "winner_parent_id": winner_parent_id,
-                "winner_parent_key": "" if not winner_parent_id else str(lookup[winner_parent_id]["segment_key"]),
-                "applied": applied,
-                "reason": reason,
-            }
-        )
-
-    def mark_removed(segment_id: str, status: str, reason: str, covered_by_id: str = "") -> None:
-        """REMOVED: Вывести сегмент из активного графа."""
-
-        active_ids.discard(segment_id)
-        removed_ids.add(segment_id)
-        graph_status[segment_id] = status
-        status_reason[segment_id] = reason
-        last_decision[segment_id] = status
-        last_reason[segment_id] = reason
-        if covered_by_id:
-            covered_by[segment_id] = covered_by_id
-            absorbed_by_segment_key[segment_id] = str(lookup[covered_by_id]["segment_key"]) if covered_by_id in lookup else ""
-            absorption_reason[segment_id] = reason
-
-    max_iterations = max(2, len(anomaly_ids) * 4 + 4)
-    for iteration in range(1, max_iterations + 1):
-        if not active_ids:
-            break
-
-        child_map = _nearest_active_child_map(sorted(active_ids), feature_sets)
-        parent_map = _nearest_parent_map(child_map)
-        for segment_id in anomaly_ids:
-            last_children[segment_id] = child_map.get(segment_id, last_children[segment_id])
-            last_parents[segment_id] = parent_map.get(segment_id, [])
-
-        current_depth = max(int(lookup[segment_id]["slice_depth"]) for segment_id in active_ids)
-        deepest_ids = sorted(
-            segment_id
-            for segment_id in active_ids
-            if int(lookup[segment_id]["slice_depth"]) == current_depth
-        )
-        if not deepest_ids:
-            break
-
-        deepest_parent_ids = sorted(
-            {
-                parent_id
-                for child_id in deepest_ids
-                for parent_id in parent_map.get(child_id, [])
-                if parent_id in active_ids
-            }
-        )
-        if not deepest_parent_ids:
-            for segment_id in deepest_ids:
-                active_ids.discard(segment_id)
-                selected_ids.add(segment_id)
-                if graph_status[segment_id] != "ACTIVE_PENDING":
-                    status_reason[segment_id] = status_reason[segment_id]
-                elif original_parent_map.get(segment_id):
-                    graph_status[segment_id] = "ORPHAN_AFTER_REWIRE"
-                    status_reason[segment_id] = "сегмент остался без активных родителей после перестроения связей"
-                    connection_break_flag[segment_id] = True
-                    connection_break_reason[segment_id] = status_reason[segment_id]
-                else:
-                    graph_status[segment_id] = "INITIALLY_UNLINKED_TERMINAL"
-                    status_reason[segment_id] = "сегмент изначально не имел аномальных родителей в active-графе"
-                last_decision[segment_id] = graph_status[segment_id]
-                last_reason[segment_id] = status_reason[segment_id]
-                last_iteration[segment_id] = iteration
-                decision_history[segment_id].append(f"iteration={iteration}: {graph_status[segment_id]}")
-            continue
-
-        changed = False
-        processed_children: set[str] = set()
-        processed_parents: set[str] = set()
-
-        parent_children = {
-            parent_id: [child_id for child_id in child_map.get(parent_id, []) if child_id in active_ids]
-            for parent_id in deepest_parent_ids
-        }
-        child_parents = {
-            child_id: [parent_id for parent_id in parent_map.get(child_id, []) if parent_id in active_ids]
-            for child_id in deepest_ids
-        }
-
-        mn_children = sorted(
-            child_id
-            for child_id, parent_ids in child_parents.items()
-            if len(parent_ids) > 1 and any(len(parent_children.get(parent_id, [])) > 1 for parent_id in parent_ids)
-        )
-        if mn_children:
-            mn_parents = sorted({parent_id for child_id in mn_children for parent_id in child_parents[child_id]})
-            reason = "M:N связь временно не разрешается; родители удалены, наиболее глубокие дочерние сегменты оставлены активными"
-            for parent_id in mn_parents:
-                mark_removed(parent_id, "DEFER_M_N_STUB_PARENT_REMOVED", reason)
-                last_relationship_type[parent_id] = "M:N"
-                conflict_parents[parent_id] = mn_parents
-                decision_history[parent_id].append(f"iteration={iteration}: DEFER_M_N_STUB")
-                processed_parents.add(parent_id)
-            for child_id in mn_children:
-                graph_status[child_id] = "DEFER_M_N_STUB"
-                status_reason[child_id] = reason
-                last_decision[child_id] = "DEFER_M_N_STUB"
-                last_reason[child_id] = reason
-                last_iteration[child_id] = iteration
-                last_relationship_type[child_id] = "M:N"
-                conflict_parents[child_id] = mn_parents
-                decision_history[child_id].append(f"iteration={iteration}: DEFER_M_N_STUB")
-                processed_children.add(child_id)
-                for parent_id in child_parents[child_id]:
-                    log_decision(iteration, "RELATIONSHIP_STUB", parent_id, child_id, "M:N", "DEFER_M_N_STUB", True, reason)
-            changed = True
-
-        for child_id in deepest_ids:
-            if child_id not in active_ids or child_id in processed_children:
-                continue
-            parent_ids = [parent_id for parent_id in child_parents.get(child_id, []) if parent_id in active_ids]
-            if not parent_ids:
-                continue
-            if not all(len(parent_children.get(parent_id, [])) == 1 for parent_id in parent_ids):
-                continue
-
-            child_row = lookup[child_id]
-            child_delta = _safe_float(child_row.get("wow_delta_gmv"))
-            evaluations: List[Dict[str, object]] = []
-            for parent_id in parent_ids:
-                parent_row = lookup[parent_id]
-                parent_delta = _safe_float(parent_row.get("wow_delta_gmv"))
-                k_value = _parent_child_absorption_k(parent_row, child_row)
-                same_direction = _same_nonzero_direction(parent_delta, child_delta)
-                can_absorb = (
-                    same_direction
-                    and not math.isnan(k_value)
-                    and k_value >= thresholds.parent_child_absorption_k_threshold
-                )
-                evaluations.append(
-                    {
-                        "parent_id": parent_id,
-                        "k": k_value,
-                        "can_absorb": can_absorb,
-                        "same_direction": same_direction,
-                    }
-                )
-
-            winners = [evaluation for evaluation in evaluations if bool(evaluation["can_absorb"])]
-            relationship_type = "N:1" if len(parent_ids) > 1 else "1:1"
-            if winners:
-                winner = sorted(
-                    winners,
-                    key=lambda evaluation: (
-                        _safe_float(evaluation.get("k"), math.nan),
-                        abs(_safe_float(lookup[str(evaluation["parent_id"])].get("robust_z_capped"))),
-                        str(evaluation["parent_id"]),
-                    ),
-                    reverse=True,
-                )[0]
-                winner_parent_id = str(winner["parent_id"])
-                reason = (
-                    f"родитель поглотил ребёнка по k={float(winner['k']):.6f} "
-                    f">= {thresholds.parent_child_absorption_k_threshold:.2f}"
-                )
-                mark_removed(child_id, "ABSORBED_BY_PARENT_K", reason, winner_parent_id)
-                last_relationship_type[child_id] = relationship_type
-                absorbed_by_role[child_id] = "родитель"
-                absorbed_lineage[winner_parent_id] = list(
-                    dict.fromkeys([*absorbed_lineage.get(winner_parent_id, []), child_id, *absorbed_lineage.get(child_id, [])])
-                )
-                selection_scores[winner_parent_id] = max(selection_scores[winner_parent_id], selection_scores.get(child_id, 0.0))
-                graph_status[winner_parent_id] = "PARENT_ABSORBS_CHILD_BY_K"
-                status_reason[winner_parent_id] = reason
-                last_decision[winner_parent_id] = "PARENT_ABSORBS_CHILD_BY_K"
-                last_reason[winner_parent_id] = reason
-                last_iteration[winner_parent_id] = iteration
-                last_relationship_type[winner_parent_id] = relationship_type
-                last_k[winner_parent_id] = float(winner["k"])
-                last_parent_z[winner_parent_id] = abs(_safe_float(lookup[winner_parent_id].get("robust_z_capped")))
-                last_child_z[winner_parent_id] = abs(_safe_float(child_row.get("robust_z_capped")))
-                for evaluation in evaluations:
-                    parent_id = str(evaluation["parent_id"])
-                    k_value = _safe_float(evaluation.get("k"), math.nan)
-                    if parent_id != winner_parent_id:
-                        mark_removed(parent_id, "REMOVED_BY_STRONGER_PARENT_K", f"уступил родителю {lookup[winner_parent_id]['segment_key']} с максимальным k", winner_parent_id)
-                        absorbed_by_role[parent_id] = "родитель-конкурент"
-                    last_relationship_type[parent_id] = relationship_type
-                    last_k[parent_id] = k_value
-                    log_decision(
-                        iteration,
-                        "RULE_PARENT_CHILD_K",
-                        parent_id,
-                        child_id,
-                        "N_PARENTS_TO_1_CHILD" if len(parent_ids) > 1 else "1_PARENT_TO_1_CHILD",
-                        "PARENT_ABSORBS_CHILD_BY_K" if parent_id == winner_parent_id else "REMOVED_BY_STRONGER_PARENT_K",
-                        parent_id == winner_parent_id,
-                        reason if parent_id == winner_parent_id else status_reason[parent_id],
-                        k_value,
-                        winner_parent_id,
-                    )
-                processed_children.add(child_id)
-                processed_parents.update(parent_ids)
-                changed = True
-                continue
-
-            reason = (
-                f"ни один родитель не достиг k >= {thresholds.parent_child_absorption_k_threshold:.2f} "
-                "при одинаковом направлении Delta GMV; ребёнок оставлен активным"
-            )
-            for evaluation in evaluations:
-                parent_id = str(evaluation["parent_id"])
-                k_value = _safe_float(evaluation.get("k"), math.nan)
-                mark_removed(parent_id, "CHILD_KEPT_PARENTS_REMOVED", reason, child_id)
-                last_relationship_type[parent_id] = relationship_type
-                absorbed_by_role[parent_id] = "ребёнок"
-                last_k[parent_id] = k_value
-                log_decision(
-                    iteration,
-                    "RULE_PARENT_CHILD_K",
-                    parent_id,
-                    child_id,
-                    "N_PARENTS_TO_1_CHILD" if len(parent_ids) > 1 else "1_PARENT_TO_1_CHILD",
-                    "CHILD_KEPT_PARENTS_REMOVED",
-                    True,
-                    reason,
-                    k_value,
-                    "",
-                )
-            processed_children.add(child_id)
-            processed_parents.update(parent_ids)
-            changed = True
-
-        for parent_id in deepest_parent_ids:
-            if parent_id not in active_ids or parent_id in processed_parents:
-                continue
-            active_children = [child_id for child_id in child_map.get(parent_id, []) if child_id in active_ids]
-            if len(active_children) <= 1:
-                continue
-            if not all(len([active_parent for active_parent in parent_map.get(child_id, []) if active_parent in active_ids]) == 1 for child_id in active_children):
-                continue
-
-            reason = "временное правило: родитель явно поглощает несколько дочерних сегментов"
-            graph_status[parent_id] = "TEMP_PARENT_ABSORBS_CHILDREN"
-            status_reason[parent_id] = reason
-            last_decision[parent_id] = "TEMP_PARENT_ABSORBS_CHILDREN"
-            last_reason[parent_id] = reason
-            last_iteration[parent_id] = iteration
-            last_relationship_type[parent_id] = "1:N"
-            for child_id in active_children:
-                mark_removed(child_id, "ABSORBED_BY_TEMP_PARENT", reason, parent_id)
-                last_relationship_type[child_id] = "1:N"
-                absorbed_by_role[child_id] = "родитель"
-                absorbed_lineage[parent_id] = list(
-                    dict.fromkeys([*absorbed_lineage.get(parent_id, []), child_id, *absorbed_lineage.get(child_id, [])])
-                )
-                selection_scores[parent_id] = max(selection_scores[parent_id], selection_scores.get(child_id, 0.0))
-                log_decision(iteration, "TEMP_RULE", parent_id, child_id, "1_PARENT_TO_N_CHILDREN", "TEMP_PARENT_ABSORBS_CHILDREN", True, reason, math.nan, parent_id)
-                processed_children.add(child_id)
-            decision_history[parent_id].append(f"iteration={iteration}: TEMP_PARENT_ABSORBS_CHILDREN {len(active_children)} children")
-            processed_parents.add(parent_id)
-            changed = True
-
-        if changed:
-            continue
-
-        reason = "сложная связь не попала под правила k или временного поглощения; применена M:N заглушка"
-        fallback_parents = sorted({parent_id for child_id in deepest_ids for parent_id in child_parents.get(child_id, []) if parent_id in active_ids})
-        if fallback_parents:
-            for parent_id in fallback_parents:
-                mark_removed(parent_id, "DEFER_M_N_STUB_PARENT_REMOVED", reason)
-                last_relationship_type[parent_id] = "M:N"
-                decision_history[parent_id].append(f"iteration={iteration}: DEFER_M_N_STUB_FALLBACK")
-            for child_id in deepest_ids:
-                if child_id not in active_ids:
-                    continue
-                graph_status[child_id] = "DEFER_M_N_STUB"
-                status_reason[child_id] = reason
-                last_decision[child_id] = "DEFER_M_N_STUB"
-                last_reason[child_id] = reason
-                last_iteration[child_id] = iteration
-                last_relationship_type[child_id] = "M:N"
-                for parent_id in child_parents.get(child_id, []):
-                    log_decision(iteration, "RELATIONSHIP_STUB", parent_id, child_id, "M:N_FALLBACK", "DEFER_M_N_STUB", True, reason)
-            continue
-
-        for segment_id in deepest_ids:
-            active_ids.discard(segment_id)
-            selected_ids.add(segment_id)
-            graph_status[segment_id] = "UNRESOLVED_TERMINAL_FALLBACK"
-            status_reason[segment_id] = "сегмент выбран как терминальный fallback без активных применимых правил"
-
-    if active_ids:
-        for segment_id in sorted(active_ids):
-            selected_ids.add(segment_id)
-            graph_status[segment_id] = "ITERATION_LIMIT_TERMINAL"
-            status_reason[segment_id] = "достигнут безопасный лимит итераций; сегмент оставлен активным для диагностики"
-            last_decision[segment_id] = graph_status[segment_id]
-            last_reason[segment_id] = status_reason[segment_id]
-
-    ordered_selected = sorted(
-        selected_ids,
-        key=lambda segment_id: (
-            int(lookup[segment_id]["slice_depth"]),
-            selection_scores.get(segment_id, 0.0),
-            abs(_safe_float(lookup[segment_id].get("robust_z_capped"))),
-            abs(_safe_float(lookup[segment_id].get("wow_delta_gmv"))),
-            str(lookup[segment_id]["segment_key"]),
-        ),
-        reverse=True,
-    )
-    final_selected_ids: set[str] = set()
-    used_atoms: set[str] = set()
-    for segment_id in ordered_selected:
-        atoms = set(coverage.get(segment_id, frozenset()))
-        if not atoms:
-            graph_status[segment_id] = "FINAL_NO_ATOMIC_COVERAGE_SUPPRESSED"
-            status_reason[segment_id] = "нет атомарного покрытия для итогового выбора"
-            continue
-        if used_atoms & atoms:
-            graph_status[segment_id] = "FINAL_ATOMIC_OVERLAP_SUPPRESSED"
-            status_reason[segment_id] = "исключён на финальной проверке непересечения атомарного покрытия"
-            continue
-        final_selected_ids.add(segment_id)
-        used_atoms.update(atoms)
-
-    final_child_map = _nearest_active_child_map(sorted(final_selected_ids), feature_sets) if final_selected_ids else {}
-    final_parent_map = _nearest_parent_map(final_child_map)
     index_by_id = {
         str(segment_id): index
         for index, segment_id in diagnostics["segment_id"].items()
     }
 
-    for segment_id in anomaly_ids:
-        index = index_by_id[segment_id]
-        children = final_child_map.get(segment_id, [])
-        parents = final_parent_map.get(segment_id, [])
-        covered_by_id = covered_by.get(segment_id, "")
-        original_atom_ids = sorted(coverage.get(segment_id, frozenset()))
-        active_atom_ids = original_atom_ids if segment_id in final_selected_ids else []
-        lineage = absorbed_lineage.get(segment_id, [])
-        lineage_keys = [str(lookup[child_id]["segment_key"]) for child_id in lineage if child_id in lookup]
-        lineage_labels = [
-            _relative_child_segment_name(lookup[segment_id]["segment_key"], lookup[child_id]["segment_key"])
-            for child_id in lineage
-            if child_id in lookup
-        ]
-        conflict_ids = conflict_parents.get(segment_id, [])
-
-        diagnostics.at[index, "active_child_ids"] = " || ".join(children)
-        diagnostics.at[index, "active_child_keys"] = " || ".join(str(lookup[child_id]["segment_key"]) for child_id in children)
-        diagnostics.at[index, "active_parent_ids"] = " || ".join(parents)
-        diagnostics.at[index, "active_parent_keys"] = " || ".join(str(lookup[parent_id]["segment_key"]) for parent_id in parents)
-        diagnostics.at[index, "technical_child_count"] = len(children)
-        diagnostics.at[index, "active_child_count"] = len(children)
-        diagnostics.at[index, "active_partition_action"] = last_decision[segment_id] or graph_status[segment_id]
-        diagnostics.at[index, "active_partition_reason"] = last_reason[segment_id] or status_reason[segment_id]
-        diagnostics.at[index, "active_partition_status"] = graph_status[segment_id]
-        diagnostics.at[index, "active_partition_status_reason"] = status_reason[segment_id]
-        diagnostics.at[index, "active_graph_status"] = graph_status[segment_id]
-        diagnostics.at[index, "active_decision_code"] = last_decision[segment_id] or graph_status[segment_id]
-        diagnostics.at[index, "active_decision_reason"] = last_reason[segment_id] or status_reason[segment_id]
-        diagnostics.at[index, "active_decision_history"] = " || ".join(decision_history[segment_id])
-        diagnostics.at[index, "active_decision_iteration"] = last_iteration[segment_id]
-        diagnostics.at[index, "active_relationship_type"] = last_relationship_type[segment_id]
-        diagnostics.at[index, "absorbed_by_role"] = absorbed_by_role[segment_id]
-        diagnostics.at[index, "absorbed_by_segment_key"] = absorbed_by_segment_key[segment_id]
-        diagnostics.at[index, "absorption_reason"] = absorption_reason[segment_id]
-        diagnostics.at[index, "parent_child_absorption_k"] = last_k[segment_id]
-        diagnostics.at[index, "active_parent_z"] = last_parent_z[segment_id]
-        diagnostics.at[index, "active_child_z"] = last_child_z[segment_id]
-        diagnostics.at[index, "conflict_parent_ids"] = " || ".join(conflict_ids)
-        diagnostics.at[index, "conflict_parent_keys"] = " || ".join(str(lookup[parent_id]["segment_key"]) for parent_id in conflict_ids if parent_id in lookup)
-        diagnostics.at[index, "covered_by_segment"] = covered_by_id
-        diagnostics.at[index, "covered_by_segment_key"] = str(lookup[covered_by_id]["segment_key"]) if covered_by_id in lookup else ""
-        diagnostics.at[index, "absorbed_child_ids"] = " || ".join(lineage)
-        diagnostics.at[index, "absorbed_child_keys"] = " || ".join(lineage_keys)
-        diagnostics.at[index, "absorbed_child_labels"] = "; ".join(lineage_labels)
-        diagnostics.at[index, "absorbed_by_parent_ids"] = covered_by_id
-        diagnostics.at[index, "absorbed_by_parent_keys"] = str(lookup[covered_by_id]["segment_key"]) if covered_by_id in lookup else ""
-        diagnostics.at[index, "original_atomic_descendants"] = " || ".join(original_atom_ids)
-        diagnostics.at[index, "active_atomic_descendants"] = " || ".join(active_atom_ids)
-        diagnostics.at[index, "residual_atomic_descendants"] = " || ".join(active_atom_ids)
-        diagnostics.at[index, "original_atomic_count"] = len(original_atom_ids)
-        diagnostics.at[index, "active_atomic_count"] = len(active_atom_ids)
-        diagnostics.at[index, "residual_atomic_count"] = len(active_atom_ids)
-        diagnostics.at[index, "residual_gross_movement"] = _sum_abs_delta(active_atom_ids, {str(row["segment_id"]): row for _, row in diagnostics.iterrows()}) if active_atom_ids else 0.0
-        diagnostics.at[index, "connection_break_flag"] = connection_break_flag[segment_id]
-        diagnostics.at[index, "connection_break_reason"] = connection_break_reason[segment_id]
-        diagnostics.at[index, "is_active"] = segment_id in final_selected_ids
-        diagnostics.at[index, "is_resolved"] = segment_id in final_selected_ids
-        diagnostics.at[index, "is_natural_terminal"] = segment_id in natural_terminals
-        diagnostics.at[index, "is_terminal_current"] = segment_id in final_selected_ids and not children
-        diagnostics.at[index, "selection_score"] = selection_scores.get(segment_id, diagnostics.at[index, "selection_score"])
-
-        if segment_id in final_selected_ids:
-            if graph_status[segment_id] == "DEFER_M_N_STUB":
-                diagnostics.at[index, "action"] = "DEFER_M_N_STUB"
-                diagnostics.at[index, "output_block"] = "M:N заглушка"
-            elif graph_status[segment_id] in {"PARENT_ABSORBS_CHILD_BY_K", "TEMP_PARENT_ABSORBS_CHILDREN"}:
-                diagnostics.at[index, "action"] = graph_status[segment_id]
-                diagnostics.at[index, "output_block"] = "поглощение родителем"
-            else:
-                diagnostics.at[index, "action"] = graph_status[segment_id]
-                diagnostics.at[index, "output_block"] = "терминальная аномалия"
-            diagnostics.at[index, "reason"] = status_reason[segment_id]
-
-    diagnostics["selected"] = diagnostics["segment_id"].astype(str).isin(final_selected_ids)
-    for index, row in diagnostics.iterrows():
+    eligible_ids: List[str] = []
+    fatal_input_issues: List[str] = []
+    for _, row in diagnostics.iterrows():
         segment_id = str(row["segment_id"])
-        if segment_id in final_selected_ids:
-            diagnostics.at[index, "selection_exclusion_reason"] = ""
-        elif segment_id in lookup:
-            diagnostics.at[index, "selection_exclusion_reason"] = (
-                f"не выбран search_anomal: {graph_status[segment_id]} - {status_reason[segment_id]}"
-            )
-        elif not str(row.get("selection_exclusion_reason", "")).strip():
-            diagnostics.at[index, "selection_exclusion_reason"] = str(row.get("reason", ""))
-
-    final_df = diagnostics[diagnostics["selected"]].copy()
-    final_df = final_df.sort_values(
-        by=[
-            "selection_score",
-            "abs_z_capped",
-            "materiality_share",
-            "abs_abnormal_gmv",
-            "reliability_factor",
-            "segment_key",
-        ],
-        ascending=[False, False, False, False, False, True],
-    ).reset_index(drop=True)
-    final_df.insert(0, "rank", range(1, len(final_df) + 1))
-
-    decision_log = pd.DataFrame(decision_log_rows)
-    if not decision_log.empty:
-        decision_log = decision_log.sort_values(
-            ["iteration", "event_type", "parent_key", "child_key"],
-            kind="stable",
-        ).reset_index(drop=True)
-    return final_df, diagnostics, decision_log
-
-
-def _evaluate_1n_group(
-    parent_id: str,
-    group_child_ids: Sequence[str],
-    direct_all_children: Dict[str, List[str]],
-    feature_sets: Dict[str, frozenset[Tuple[str, str]]],
-    lookup: Dict[str, pd.Series],
-    all_lookup: Dict[str, pd.Series],
-    thresholds: AnomalyThresholds,
-) -> Dict[str, object]:
-    """Применить правило 1:N к одной непересекающейся родственной группе.
-
-    Args:
-        parent_id: Идентификатор родителя.
-        group_child_ids: Дети активной родственной группы.
-        direct_all_children: Ближайшие дети по всем входным сегментам.
-        feature_sets: Наборы признаков сегментов.
-        lookup: Аномальные сегменты активного графа.
-        all_lookup: Все сегменты из результата build_anomaly_candidates.
-        thresholds: Пороги `agm`, `gm`, `z_c_greater`.
-
-    Returns:
-        Словарь с решением `PARENT_ABSORBS` или `CHILD_DOMINATES`.
-
-    Raises:
-        KeyError: Если сегмент отсутствует в lookup.
-
-    Examples:
-        >>> # decision = _evaluate_1n_group('p', ['c'], {}, {}, {}, {}, AnomalyThresholds())
-    """
-
-    ordered_children = sorted(str(child_id) for child_id in group_child_ids)
-    active_gross = _sum_abs_delta(ordered_children, lookup)
-    parent_features = feature_sets[parent_id]
-    group_keys = {
-        _active_child_group_key(parent_features, feature_sets[child_id])
-        for child_id in ordered_children
-    }
-    all_group_children = [
-        child_id
-        for child_id in direct_all_children.get(parent_id, [])
-        if child_id in all_lookup
-        and _active_child_group_key(parent_features, feature_sets[child_id]) in group_keys
-    ]
-    all_gross = _sum_abs_delta(all_group_children, all_lookup) if all_group_children else active_gross
-    anomaly_gross_move = 0.0 if all_gross == 0.0 else active_gross / all_gross
-    parent_abs_z = abs(_safe_float(lookup[parent_id].get("robust_z_capped")))
-
-    child_rows: List[Dict[str, object]] = []
-    for child_id in ordered_children:
-        gross_move = 0.0 if active_gross == 0.0 else abs(_safe_float(lookup[child_id].get("wow_delta_gmv"))) / active_gross
-        child_abs_z = abs(_safe_float(lookup[child_id].get("robust_z_capped")))
-        child_rows.append(
-            {
-                "child_id": child_id,
-                "gross_move": gross_move,
-                "child_abs_z": child_abs_z,
-                "dominates": (
-                    child_abs_z >= parent_abs_z * thresholds.single_child_z_multiplier
-                    and gross_move > thresholds.single_child_gross_share_threshold
-                ),
-            }
-        )
-
-    if anomaly_gross_move < thresholds.anomaly_gross_move_threshold:
-        return {
-            "decision": "PARENT_ABSORBS",
-            "dominant_child_id": "",
-            "anomaly_gross_move": anomaly_gross_move,
-            "gross_move": math.nan,
-            "child_abs_z": math.nan,
-            "parent_abs_z": parent_abs_z,
-            "reason": (
-                f"anomaly_gross_move={anomaly_gross_move:.6f} < "
-                f"agm={thresholds.anomaly_gross_move_threshold:.2f}"
-            ),
-        }
-
-    dominant_rows = [row for row in child_rows if bool(row["dominates"])]
-    if dominant_rows:
-        dominant = sorted(
-            dominant_rows,
-            key=lambda row: (
-                float(row["gross_move"]),
-                float(row["child_abs_z"]),
-                _safe_float(lookup[str(row["child_id"])].get("selection_score")),
-                str(row["child_id"]),
-            ),
-            reverse=True,
-        )[0]
-        return {
-            "decision": "CHILD_DOMINATES",
-            "dominant_child_id": str(dominant["child_id"]),
-            "anomaly_gross_move": anomaly_gross_move,
-            "gross_move": float(dominant["gross_move"]),
-            "child_abs_z": float(dominant["child_abs_z"]),
-            "parent_abs_z": parent_abs_z,
-            "reason": (
-                f"child dominates: anomaly_gross_move={anomaly_gross_move:.6f}; "
-                f"gross_move={float(dominant['gross_move']):.6f}; "
-                f"|z_child|={float(dominant['child_abs_z']):.6f}; "
-                f"|z_parent|={parent_abs_z:.6f}"
-            ),
-        }
-
-    return {
-        "decision": "PARENT_ABSORBS",
-        "dominant_child_id": "",
-        "anomaly_gross_move": anomaly_gross_move,
-        "gross_move": max((float(row["gross_move"]) for row in child_rows), default=math.nan),
-        "child_abs_z": max((float(row["child_abs_z"]) for row in child_rows), default=math.nan),
-        "parent_abs_z": parent_abs_z,
-        "reason": (
-            f"no dominant child: anomaly_gross_move={anomaly_gross_move:.6f}; "
-            f"required gross_move>{thresholds.single_child_gross_share_threshold:.2f} "
-            f"and |z_child|>=|z_parent|*{thresholds.single_child_z_multiplier:.2f}"
-        ),
-    }
-
-
-def _select_active_partition_anomalies_v2(
-    candidates: pd.DataFrame,
-    coverage: Dict[str, frozenset[str]],
-    thresholds: AnomalyThresholds,
-    dim_cols: Sequence[str],
-) -> Tuple[pd.DataFrame, pd.DataFrame, pd.DataFrame]:
-    """Выбрать аномалии по новому алгоритму active-разбиения снизу вверх.
-
-    Args:
-        candidates: Кандидаты после build_anomaly_candidates и классификации.
-        coverage: Атомарное покрытие сегментов.
-        thresholds: Пороги `agm`, `gm`, `z_c_greater`.
-        dim_cols: Измерения сегментации.
-
-    Returns:
-        Итоговые аномалии, диагностика кандидатов и журнал решений.
-
-    Raises:
-        ValueError: Если отсутствуют измерения или атомарный слой.
-        RuntimeError: Если итерационный проход не сходится.
-
-    Examples:
-        >>> # final_df, diagnostics, log = _select_active_partition_anomalies_v2(candidates, coverage, AnomalyThresholds(), dims)
-    """
-
-    diagnostics = candidates.copy()
-    if diagnostics.empty:
-        return diagnostics.copy(), diagnostics, pd.DataFrame()
-    if not dim_cols:
-        raise ValueError("Для active-разбиения нужен хотя бы один признак")
-
-    max_physical_depth = int(diagnostics["slice_depth"].astype(int).max())
-    atomic_df = diagnostics[diagnostics["slice_depth"].astype(int) == max_physical_depth].copy()
-    if atomic_df.empty:
-        raise ValueError("Физический атомарный слой active-разбиения пуст")
-
-    anomaly_mask = (
-        diagnostics["slice_depth"].astype(int).gt(0)
-        & diagnostics["passes_initial_anomaly_filter"].astype(bool)
-    )
-    anomaly_df = diagnostics[anomaly_mask].copy()
-
-    string_columns = [
-        "active_child_ids",
-        "active_child_keys",
-        "active_parent_ids",
-        "active_parent_keys",
-        "active_partition_action",
-        "active_partition_reason",
-        "active_partition_status",
-        "active_partition_status_reason",
-        "active_graph_status",
-        "active_decision_code",
-        "active_decision_reason",
-        "active_decision_history",
-        "conflict_parent_ids",
-        "conflict_parent_keys",
-        "covered_by_segment",
-        "covered_by_segment_key",
-        "absorbed_child_ids",
-        "absorbed_child_keys",
-        "absorbed_child_labels",
-        "absorbed_by_parent_ids",
-        "absorbed_by_parent_keys",
-        "original_atomic_descendants",
-        "active_atomic_descendants",
-        "residual_atomic_descendants",
-        "connection_break_reason",
-    ]
-    for column in string_columns:
-        diagnostics[column] = ""
-    diagnostics["technical_child_count"] = 0
-    diagnostics["active_child_count"] = 0
-    diagnostics["original_atomic_count"] = 0
-    diagnostics["active_atomic_count"] = 0
-    diagnostics["residual_atomic_count"] = 0
-    diagnostics["residual_gross_movement"] = 0.0
-    diagnostics["single_child_gross_share"] = math.nan
-    diagnostics["anomaly_gross_move"] = math.nan
-    diagnostics["active_parent_z"] = math.nan
-    diagnostics["active_child_z"] = math.nan
-    diagnostics["active_decision_iteration"] = pd.Series(pd.NA, index=diagnostics.index, dtype="Int64")
-    diagnostics["connection_break_flag"] = False
-    diagnostics["is_active"] = False
-    diagnostics["is_resolved"] = False
-    diagnostics["is_natural_terminal"] = False
-    diagnostics["is_terminal_current"] = False
-    diagnostics["covered_atomic_count"] = diagnostics["segment_id"].map(
-        lambda segment_id: len(coverage.get(str(segment_id), frozenset()))
-    )
-    diagnostics["selected"] = False
-    diagnostics["selection_exclusion_reason"] = ""
-
-    if anomaly_df.empty:
-        diagnostics["active_graph_status"] = "NOT_IN_ANOMALY_GRAPH"
-        diagnostics["selection_exclusion_reason"] = diagnostics["reason"].astype(str)
-        return diagnostics.iloc[0:0].copy(), diagnostics, pd.DataFrame()
-
-    all_lookup = {
-        str(row["segment_id"]): row.copy()
-        for _, row in diagnostics[diagnostics["slice_depth"].astype(int).gt(0)].iterrows()
-    }
-    lookup = {
-        str(row["segment_id"]): row.copy()
-        for _, row in anomaly_df.iterrows()
-    }
-    anomaly_ids = sorted(lookup)
-    all_ids = sorted(all_lookup)
-    feature_sets = {
-        segment_id: _segment_feature_set(row, dim_cols)
-        for segment_id, row in {**all_lookup, **lookup}.items()
-    }
-    direct_all_children = _nearest_active_child_map(all_ids, feature_sets)
-    original_anomaly_children = _nearest_active_child_map(anomaly_ids, feature_sets)
-    original_anomaly_parents = _nearest_parent_map(original_anomaly_children)
-    natural_terminals = {
-        segment_id for segment_id in anomaly_ids if not original_anomaly_children.get(segment_id, [])
-    }
-
-    active_ids = set(anomaly_ids)
-    selected_ids: set[str] = set()
-    removed_ids: set[str] = set()
-    graph_status = {segment_id: "ACTIVE_PENDING" for segment_id in anomaly_ids}
-    status_reason = {segment_id: "waiting for bottom-up active partition decision" for segment_id in anomaly_ids}
-    last_children: Dict[str, List[str]] = {segment_id: [] for segment_id in anomaly_ids}
-    last_parents: Dict[str, List[str]] = {segment_id: [] for segment_id in anomaly_ids}
-    last_decision: Dict[str, str] = {segment_id: "" for segment_id in anomaly_ids}
-    last_reason: Dict[str, str] = {segment_id: "" for segment_id in anomaly_ids}
-    last_iteration: Dict[str, Optional[int]] = {segment_id: None for segment_id in anomaly_ids}
-    last_gross_share: Dict[str, float] = {segment_id: math.nan for segment_id in anomaly_ids}
-    last_anomaly_gross_move: Dict[str, float] = {segment_id: math.nan for segment_id in anomaly_ids}
-    last_parent_z: Dict[str, float] = {segment_id: math.nan for segment_id in anomaly_ids}
-    last_child_z: Dict[str, float] = {segment_id: math.nan for segment_id in anomaly_ids}
-    connection_break_flag = {segment_id: False for segment_id in anomaly_ids}
-    connection_break_reason = {segment_id: "" for segment_id in anomaly_ids}
-    covered_by: Dict[str, str] = {}
-    absorbed_lineage: Dict[str, List[str]] = {segment_id: [] for segment_id in anomaly_ids}
-    absorbed_all: Dict[str, List[str]] = {segment_id: [] for segment_id in anomaly_ids}
-    decision_history: Dict[str, List[str]] = {segment_id: [] for segment_id in anomaly_ids}
-    selection_scores = {
-        segment_id: _safe_float(lookup[segment_id].get("selection_score"))
-        for segment_id in anomaly_ids
-    }
-    decision_log_rows: List[Dict[str, object]] = []
-
-    def mark_removed(segment_id: str, status: str, reason: str, covered_by_id: str = "") -> None:
-        """REMOVED: вывести сегмент из активного графа с диагностикой."""
-
-        active_ids.discard(segment_id)
-        removed_ids.add(segment_id)
-        graph_status[segment_id] = status
-        status_reason[segment_id] = reason
-        last_decision[segment_id] = status
-        last_reason[segment_id] = reason
-        if covered_by_id:
-            covered_by[segment_id] = covered_by_id
-
-    max_iterations = max(2, len(anomaly_ids) * 3 + 3)
-    for iteration in range(1, max_iterations + 1):
-        if not active_ids:
-            break
-
-        child_map = _nearest_active_child_map(sorted(active_ids), feature_sets)
-        parent_map = _nearest_parent_map(child_map)
-        for segment_id in anomaly_ids:
-            last_children[segment_id] = child_map.get(segment_id, last_children[segment_id])
-            last_parents[segment_id] = parent_map.get(segment_id, [])
-
-        current_depth = max(int(lookup[segment_id]["slice_depth"]) for segment_id in active_ids)
-        deepest_ids = sorted(
-            segment_id
-            for segment_id in active_ids
-            if int(lookup[segment_id]["slice_depth"]) == current_depth
-        )
-        actionable_parents = sorted(
-            {
-                parent_id
-                for child_id in deepest_ids
-                for parent_id in parent_map.get(child_id, [])
-                if parent_id in active_ids
-            }
-        )
-
-        if not actionable_parents:
-            for segment_id in deepest_ids:
-                active_ids.remove(segment_id)
-                selected_ids.add(segment_id)
-                if original_anomaly_parents.get(segment_id):
-                    graph_status[segment_id] = "ORPHAN_AFTER_REWIRE"
-                    status_reason[segment_id] = "segment lost active parents after absorption/removal decisions"
-                    connection_break_flag[segment_id] = True
-                    connection_break_reason[segment_id] = status_reason[segment_id]
-                else:
-                    graph_status[segment_id] = "INITIALLY_UNLINKED_TERMINAL"
-                    status_reason[segment_id] = "segment initially had no anomalous parent in active graph"
-                last_decision[segment_id] = graph_status[segment_id]
-                last_reason[segment_id] = status_reason[segment_id]
-                last_iteration[segment_id] = iteration
-            continue
-
-        changed = False
-        for parent_id in actionable_parents:
-            if parent_id not in active_ids:
-                continue
-            active_children = sorted(child_map.get(parent_id, []))
-            if not active_children:
-                continue
-
-            child_parent_counts = {child_id: len(parent_map.get(child_id, [])) for child_id in active_children}
-            if len(active_children) == 1 and child_parent_counts[active_children[0]] == 1:
-                child_id = active_children[0]
-                reason = "1:1 relationship stub; lower-level child is kept, parent is excluded"
-                mark_removed(parent_id, "STUB_1_1_PARENT_SUPPRESSED", reason)
-                decision_history[parent_id].append(f"iteration={iteration}: STUB_1_1 -> keep {child_id}")
-                decision_log_rows.append(
-                    {
-                        "iteration": iteration,
-                        "event_type": "RELATIONSHIP_STUB",
-                        "parent_id": parent_id,
-                        "parent_key": str(lookup[parent_id]["segment_key"]),
-                        "parent_depth": int(lookup[parent_id]["slice_depth"]),
-                        "child_id": child_id,
-                        "child_key": str(lookup[child_id]["segment_key"]),
-                        "child_depth": int(lookup[child_id]["slice_depth"]),
-                        "active_child_count": 1,
-                        "parent_abs_z": abs(_safe_float(lookup[parent_id].get("robust_z_capped"))),
-                        "child_abs_z": abs(_safe_float(lookup[child_id].get("robust_z_capped"))),
-                        "gross_share": math.nan,
-                        "pair_decision": "STUB_1_1",
-                        "conflict_code": "STUB_1_1",
-                        "winner_parent_id": "",
-                        "winner_parent_key": "",
-                        "applied": True,
-                        "reason": reason,
-                    }
-                )
-                changed = True
-                continue
-
-            multi_parent_children = [child_id for child_id, count in child_parent_counts.items() if count > 1]
-            if multi_parent_children:
-                relationship = "STUB_N_N" if len(active_children) > 1 else "STUB_N_1"
-                reason = f"{relationship} relationship stub; parent is excluded and child level is kept"
-                mark_removed(parent_id, f"{relationship}_PARENT_SUPPRESSED", reason)
-                decision_history[parent_id].append(f"iteration={iteration}: {relationship}")
-                for child_id in active_children:
-                    decision_log_rows.append(
-                        {
-                            "iteration": iteration,
-                            "event_type": "RELATIONSHIP_STUB",
-                            "parent_id": parent_id,
-                            "parent_key": str(lookup[parent_id]["segment_key"]),
-                            "parent_depth": int(lookup[parent_id]["slice_depth"]),
-                            "child_id": child_id,
-                            "child_key": str(lookup[child_id]["segment_key"]),
-                            "child_depth": int(lookup[child_id]["slice_depth"]),
-                            "active_child_count": len(active_children),
-                            "parent_abs_z": abs(_safe_float(lookup[parent_id].get("robust_z_capped"))),
-                            "child_abs_z": abs(_safe_float(lookup[child_id].get("robust_z_capped"))),
-                            "gross_share": math.nan,
-                            "pair_decision": relationship,
-                            "conflict_code": relationship,
-                            "winner_parent_id": "",
-                            "winner_parent_key": "",
-                            "applied": True,
-                            "reason": reason,
-                        }
-                    )
-                changed = True
-                continue
-
-            # FIXED: Новое правило 1:N работает с группами непересекающихся детей и приоритетом доминирующего ребёнка.
-            sibling_groups = _split_sibling_groups(parent_id, active_children, feature_sets, coverage)
-            group_decisions = [
-                _evaluate_1n_group(
-                    parent_id,
-                    group_ids,
-                    direct_all_children,
-                    feature_sets,
-                    lookup,
-                    all_lookup,
-                    thresholds,
-                )
-                for group_ids in sibling_groups
-            ]
-            dominant_decisions = [
-                decision for decision in group_decisions if decision["decision"] == "CHILD_DOMINATES"
-            ]
-
-            if dominant_decisions:
-                winner_decision = sorted(
-                    dominant_decisions,
-                    key=lambda decision: (
-                        _safe_float(decision.get("gross_move")),
-                        _safe_float(decision.get("child_abs_z")),
-                        str(decision.get("dominant_child_id", "")),
-                    ),
-                    reverse=True,
-                )[0]
-                winner_child_id = str(winner_decision["dominant_child_id"])
-                reason = (
-                    "dominant child has priority over parent and sibling groups; "
-                    f"{winner_decision['reason']}"
-                )
-                mark_removed(parent_id, "CHILD_DOMINATES_PARENT_REMOVED", reason, winner_child_id)
-                for child_id in active_children:
-                    if child_id == winner_child_id:
-                        continue
-                    mark_removed(
-                        child_id,
-                        "REMOVED_BY_DOMINANT_SIBLING",
-                        f"removed because sibling {lookup[winner_child_id]['segment_key']} dominated parent",
-                        winner_child_id,
-                    )
-                last_gross_share[parent_id] = _safe_float(winner_decision.get("gross_move"), math.nan)
-                last_anomaly_gross_move[parent_id] = _safe_float(winner_decision.get("anomaly_gross_move"), math.nan)
-                last_parent_z[parent_id] = _safe_float(winner_decision.get("parent_abs_z"), math.nan)
-                last_child_z[parent_id] = _safe_float(winner_decision.get("child_abs_z"), math.nan)
-                decision_history[parent_id].append(f"iteration={iteration}: CHILD_DOMINATES -> {winner_child_id}")
-                for child_id in active_children:
-                    decision_log_rows.append(
-                        {
-                            "iteration": iteration,
-                            "event_type": "RULE_1_N",
-                            "parent_id": parent_id,
-                            "parent_key": str(lookup[parent_id]["segment_key"]),
-                            "parent_depth": int(lookup[parent_id]["slice_depth"]),
-                            "child_id": child_id,
-                            "child_key": str(lookup[child_id]["segment_key"]),
-                            "child_depth": int(lookup[child_id]["slice_depth"]),
-                            "active_child_count": len(active_children),
-                            "parent_abs_z": _safe_float(winner_decision.get("parent_abs_z"), math.nan),
-                            "child_abs_z": abs(_safe_float(lookup[child_id].get("robust_z_capped"))),
-                            "gross_share": (
-                                abs(_safe_float(lookup[child_id].get("wow_delta_gmv"))) / _sum_abs_delta(active_children, lookup)
-                                if _sum_abs_delta(active_children, lookup) != 0.0
-                                else math.nan
-                            ),
-                            "pair_decision": "CHILD_DOMINATES" if child_id == winner_child_id else "REMOVED_BY_DOMINANT_SIBLING",
-                            "conflict_code": "RULE_1_N_DOMINANT_CHILD_PRIORITY",
-                            "winner_parent_id": "",
-                            "winner_parent_key": "",
-                            "applied": child_id == winner_child_id,
-                            "reason": reason,
-                        }
-                    )
-                changed = True
-                continue
-
-            reason = "parent absorbs active child groups; " + " | ".join(str(decision["reason"]) for decision in group_decisions)
-            graph_status[parent_id] = "PARENT_ABSORBS_CHILDREN"
-            status_reason[parent_id] = reason
-            last_decision[parent_id] = "PARENT_ABSORBS_CHILDREN"
-            last_reason[parent_id] = reason
-            last_iteration[parent_id] = iteration
-            last_anomaly_gross_move[parent_id] = max(
-                (_safe_float(decision.get("anomaly_gross_move"), math.nan) for decision in group_decisions),
-                default=math.nan,
-            )
-            last_parent_z[parent_id] = abs(_safe_float(lookup[parent_id].get("robust_z_capped")))
-            parent_abs_z = abs(_safe_float(lookup[parent_id].get("robust_z_capped")))
-            for child_id in active_children:
-                active_ids.discard(child_id)
-                removed_ids.add(child_id)
-                covered_by[child_id] = parent_id
-                graph_status[child_id] = "ABSORBED_BY_PARENT"
-                status_reason[child_id] = f"absorbed by parent {lookup[parent_id]['segment_key']}"
-                last_decision[child_id] = "ABSORBED_BY_PARENT"
-                last_reason[child_id] = status_reason[child_id]
-                last_iteration[child_id] = iteration
-                absorbed_all[parent_id] = list(dict.fromkeys([*absorbed_all.get(parent_id, []), child_id]))
-                if abs(_safe_float(lookup[child_id].get("robust_z_capped"))) > parent_abs_z:
-                    absorbed_lineage[parent_id] = list(dict.fromkeys([*absorbed_lineage.get(parent_id, []), child_id]))
-                selection_scores[parent_id] = max(selection_scores[parent_id], selection_scores.get(child_id, 0.0))
-                decision_log_rows.append(
-                    {
-                        "iteration": iteration,
-                        "event_type": "RULE_1_N",
-                        "parent_id": parent_id,
-                        "parent_key": str(lookup[parent_id]["segment_key"]),
-                        "parent_depth": int(lookup[parent_id]["slice_depth"]),
-                        "child_id": child_id,
-                        "child_key": str(lookup[child_id]["segment_key"]),
-                        "child_depth": int(lookup[child_id]["slice_depth"]),
-                        "active_child_count": len(active_children),
-                        "parent_abs_z": parent_abs_z,
-                        "child_abs_z": abs(_safe_float(lookup[child_id].get("robust_z_capped"))),
-                        "gross_share": (
-                            abs(_safe_float(lookup[child_id].get("wow_delta_gmv"))) / _sum_abs_delta(active_children, lookup)
-                            if _sum_abs_delta(active_children, lookup) != 0.0
-                            else math.nan
-                        ),
-                        "pair_decision": "PARENT_ABSORBS_CHILDREN",
-                        "conflict_code": "RULE_1_N_PARENT_ABSORBS",
-                        "winner_parent_id": parent_id,
-                        "winner_parent_key": str(lookup[parent_id]["segment_key"]),
-                        "applied": True,
-                        "reason": reason,
-                    }
-                )
-            decision_history[parent_id].append(f"iteration={iteration}: PARENT_ABSORBS {len(active_children)} children")
-            changed = True
-
-        if not changed:
-            raise RuntimeError("Active partition did not progress; relationship graph is unresolved")
-
-    else:
-        raise RuntimeError("Active partition did not converge within safe iteration limit")
-
-    selected_ids.update(active_ids)
-    final_graph_ids = set(selected_ids)
-    final_child_map = _nearest_active_child_map(sorted(final_graph_ids), feature_sets) if final_graph_ids else {}
-    final_parent_map = _nearest_parent_map(final_child_map)
-    index_by_id = {
-        str(segment_id): index
-        for index, segment_id in diagnostics["segment_id"].items()
-    }
-
-    for segment_id in anomaly_ids:
         index = index_by_id[segment_id]
-        children = final_child_map.get(segment_id, [])
-        parents = final_parent_map.get(segment_id, [])
-        original_atom_ids = sorted(coverage.get(segment_id, frozenset()))
-        current_atom_ids = original_atom_ids if segment_id in selected_ids else []
-        residual_atom_ids = current_atom_ids
-        lineage = absorbed_lineage.get(segment_id, [])
-        lineage_keys = [str(lookup[child_id]["segment_key"]) for child_id in lineage]
-        lineage_labels = [
-            _relative_child_segment_name(lookup[segment_id]["segment_key"], lookup[child_id]["segment_key"])
-            for child_id in lineage
-        ]
-        covered_by_id = covered_by.get(segment_id, "")
+        depth = int(row["slice_depth"])
+        passed_initial_filter = bool(row.get("passes_initial_anomaly_filter", False))
+        atoms = sorted(normalized_coverage.get(segment_id, frozenset()))
+        key_is_valid, key_reason = key_validation.get(segment_id, (False, "segment_key validation missing"))
+        coverage_issue = coverage_issues.get(segment_id, "")
+        score_value = _safe_float(row.get("selection_score"), math.nan)
+        diagnostics.at[index, "atomic_coverage_source"] = coverage_source
+        diagnostics.at[index, "atomic_coverage_validation_status"] = coverage_issue or "OK"
+        diagnostics.at[index, "original_atomic_descendants"] = " || ".join(atoms)
+        diagnostics.at[index, "original_atomic_count"] = len(atoms)
+        diagnostics.at[index, "covered_atomic_count"] = len(atoms)
 
-        diagnostics.at[index, "active_child_ids"] = " || ".join(children)
-        diagnostics.at[index, "active_child_keys"] = " || ".join(str(lookup[child_id]["segment_key"]) for child_id in children)
-        diagnostics.at[index, "active_parent_ids"] = " || ".join(parents)
-        diagnostics.at[index, "active_parent_keys"] = " || ".join(str(lookup[parent_id]["segment_key"]) for parent_id in parents)
-        diagnostics.at[index, "technical_child_count"] = len(children)
-        diagnostics.at[index, "active_child_count"] = len(children)
-        diagnostics.at[index, "active_partition_action"] = last_decision[segment_id] or graph_status[segment_id]
-        diagnostics.at[index, "active_partition_reason"] = last_reason[segment_id] or status_reason[segment_id]
-        diagnostics.at[index, "active_partition_status"] = graph_status[segment_id]
-        diagnostics.at[index, "active_partition_status_reason"] = status_reason[segment_id]
-        diagnostics.at[index, "active_graph_status"] = graph_status[segment_id]
-        diagnostics.at[index, "active_decision_code"] = last_decision[segment_id] or graph_status[segment_id]
-        diagnostics.at[index, "active_decision_reason"] = last_reason[segment_id] or status_reason[segment_id]
-        diagnostics.at[index, "active_decision_history"] = " || ".join(decision_history[segment_id])
-        diagnostics.at[index, "active_decision_iteration"] = last_iteration[segment_id]
-        diagnostics.at[index, "single_child_gross_share"] = last_gross_share[segment_id]
-        diagnostics.at[index, "anomaly_gross_move"] = last_anomaly_gross_move[segment_id]
-        diagnostics.at[index, "active_parent_z"] = last_parent_z[segment_id]
-        diagnostics.at[index, "active_child_z"] = last_child_z[segment_id]
-        diagnostics.at[index, "covered_by_segment"] = covered_by_id
-        diagnostics.at[index, "covered_by_segment_key"] = str(lookup[covered_by_id]["segment_key"]) if covered_by_id else ""
-        diagnostics.at[index, "absorbed_child_ids"] = " || ".join(lineage)
-        diagnostics.at[index, "absorbed_child_keys"] = " || ".join(lineage_keys)
-        diagnostics.at[index, "absorbed_child_labels"] = "; ".join(lineage_labels)
-        diagnostics.at[index, "absorbed_by_parent_ids"] = covered_by_id
-        diagnostics.at[index, "absorbed_by_parent_keys"] = str(lookup[covered_by_id]["segment_key"]) if covered_by_id else ""
-        diagnostics.at[index, "original_atomic_descendants"] = " || ".join(original_atom_ids)
-        diagnostics.at[index, "active_atomic_descendants"] = " || ".join(current_atom_ids)
-        diagnostics.at[index, "residual_atomic_descendants"] = " || ".join(residual_atom_ids)
-        diagnostics.at[index, "original_atomic_count"] = len(original_atom_ids)
-        diagnostics.at[index, "active_atomic_count"] = len(current_atom_ids)
-        diagnostics.at[index, "residual_atomic_count"] = len(residual_atom_ids)
-        diagnostics.at[index, "residual_gross_movement"] = _sum_abs_delta(residual_atom_ids, all_lookup) if residual_atom_ids else 0.0
-        diagnostics.at[index, "connection_break_flag"] = connection_break_flag[segment_id]
-        diagnostics.at[index, "connection_break_reason"] = connection_break_reason[segment_id]
-        diagnostics.at[index, "is_active"] = segment_id in selected_ids
-        diagnostics.at[index, "is_resolved"] = segment_id in selected_ids
-        diagnostics.at[index, "is_natural_terminal"] = segment_id in natural_terminals
-        diagnostics.at[index, "is_terminal_current"] = segment_id in selected_ids and not children
-        diagnostics.at[index, "selection_score"] = selection_scores[segment_id]
-
-        if segment_id in selected_ids:
-            if connection_break_flag[segment_id]:
-                diagnostics.at[index, "action"] = "CONNECTION_BREAK_TERMINAL"
-                diagnostics.at[index, "output_block"] = "аномалия с флагом обрыва связи"
-                diagnostics.at[index, "reason"] = status_reason[segment_id]
-            elif graph_status[segment_id] == "PARENT_ABSORBS_CHILDREN":
-                diagnostics.at[index, "action"] = "PARENT_ABSORBS_CHILDREN"
-                diagnostics.at[index, "output_block"] = "поглощение родителем"
-                diagnostics.at[index, "reason"] = status_reason[segment_id]
-            elif graph_status[segment_id] == "INITIALLY_UNLINKED_TERMINAL":
-                diagnostics.at[index, "action"] = "INITIALLY_UNLINKED_TERMINAL"
-                diagnostics.at[index, "output_block"] = "изначально несвязанный аномальный сегмент"
-                diagnostics.at[index, "reason"] = status_reason[segment_id]
-            elif segment_id in natural_terminals:
-                diagnostics.at[index, "action"] = "NATURAL_TERMINAL"
-                diagnostics.at[index, "output_block"] = "терминальная аномалия"
-                diagnostics.at[index, "reason"] = "natural terminal segment of active graph"
-
-    diagnostics["selected"] = diagnostics["segment_id"].astype(str).isin(selected_ids)
-    for index, row in diagnostics.iterrows():
-        segment_id = str(row["segment_id"])
-        if segment_id in selected_ids:
-            diagnostics.at[index, "selection_exclusion_reason"] = ""
-        elif segment_id in lookup:
-            diagnostics.at[index, "selection_exclusion_reason"] = (
-                f"не выбран active-разбиением: {graph_status[segment_id]} - {status_reason[segment_id]}"
-            )
+        if depth == 0:
+            reason = "total-слой исключён из оптимизационного отбора аномалий"
+            status = "NOT_IN_SET_PACKING_GRAPH"
+        elif not passed_initial_filter:
+            reason = "сегмент не прошёл первичный фильтр аномальности"
+            status = "NOT_IN_SET_PACKING_GRAPH"
+        elif not key_is_valid:
+            reason = key_reason
+            status = "INVALID_SEGMENT_KEY"
+        elif coverage_issue:
+            reason = coverage_issue
+            status = "INVALID_ATOMIC_COVERAGE"
+        elif not atoms:
+            reason = "у сегмента пустое фактическое атомарное покрытие"
+            status = "EMPTY_ATOMIC_COVERAGE"
+        elif not math.isfinite(score_value):
+            reason = "anomaly_score не является конечным числом"
+            status = "INVALID_SCORE"
+        elif score_value <= 0.0:
+            reason = "anomaly_score неположительный"
+            status = "NONPOSITIVE_SCORE"
         else:
-            diagnostics.at[index, "active_graph_status"] = "NOT_IN_ANOMALY_GRAPH"
-            diagnostics.at[index, "selection_exclusion_reason"] = str(row.get("reason", ""))
+            reason = "сегмент участвует в точной задаче Maximum Weighted Set Packing"
+            status = "SET_PACKING_CANDIDATE"
+            eligible_ids.append(segment_id)
+            diagnostics.at[index, "is_eligible"] = True
 
-    final_df = diagnostics[diagnostics["selected"]].copy()
-    final_df = final_df.sort_values(
-        by=[
-            "selection_score",
-            "abs_z_capped",
-            "materiality_share",
-            "abs_abnormal_gmv",
-            "reliability_factor",
-            "segment_key",
-        ],
-        ascending=[False, False, False, False, False, True],
-    ).reset_index(drop=True)
-    final_df.insert(0, "rank", range(1, len(final_df) + 1))
+        diagnostics.at[index, "action"] = status
+        diagnostics.at[index, "output_block"] = "кандидат Set Packing" if status == "SET_PACKING_CANDIDATE" else "исключён"
+        diagnostics.at[index, "reason"] = reason
+        diagnostics.at[index, "set_packing_status"] = status
+        diagnostics.at[index, "set_packing_reason"] = reason
+        diagnostics.at[index, "selection_exclusion_reason"] = "" if status == "SET_PACKING_CANDIDATE" else reason
+        if passed_initial_filter and depth > 0 and status != "SET_PACKING_CANDIDATE":
+            fatal_input_issues.append(
+                f"{segment_id} ({row.get('segment_key', '')}): {status}: {reason}"
+            )
 
-    decision_log_columns = [
-        "iteration",
-        "event_type",
-        "parent_id",
-        "parent_key",
-        "parent_depth",
-        "child_id",
-        "child_key",
-        "child_depth",
-        "active_child_count",
-        "parent_abs_z",
-        "child_abs_z",
-        "gross_share",
-        "pair_decision",
-        "conflict_code",
-        "winner_parent_id",
-        "winner_parent_key",
-        "applied",
-        "reason",
+    if fatal_input_issues:
+        raise ValueError(
+            "Нельзя доказать глобальный optimum: часть сегментов, прошедших первичный фильтр, "
+            "не может быть корректно включена в Set Packing. "
+            + "; ".join(fatal_input_issues[:10])
+        )
+
+    if not eligible_ids:
+        diagnostics["set_packing_global_status"] = "EMPTY"
+        decision_log = _build_set_packing_decision_log([], {}, {}, lookup, {}, "EMPTY")
+        return diagnostics.iloc[0:0].copy(), diagnostics, decision_log
+
+    scores = {
+        segment_id: float(diagnostics.at[index_by_id[segment_id], "selection_score"])
+        for segment_id in eligible_ids
+    }
+    atom_to_segments, conflict_pair_atoms, conflict_count_by_segment = _build_set_packing_conflicts(
+        eligible_ids,
+        normalized_coverage,
+        lookup,
+    )
+    components = _build_set_packing_components(
+        eligible_ids,
+        conflict_pair_atoms,
+        normalized_coverage,
+        lookup,
+        scores,
+    )
+    gap_tolerance = float(getattr(thresholds, "set_packing_gap_tolerance", 1e-9))
+    max_exact_fallback_size = int(getattr(thresholds, "max_exact_fallback_size", 25))
+    component_results = [
+        _solve_set_packing_component(component, normalized_coverage, lookup, scores, gap_tolerance, max_exact_fallback_size)
+        for component in components
     ]
-    decision_log = pd.DataFrame(decision_log_rows, columns=decision_log_columns)
-    if not decision_log.empty:
-        decision_log = decision_log.sort_values(
-            ["iteration", "event_type", "parent_key", "child_key"],
-            kind="stable",
-        ).reset_index(drop=True)
-    return final_df, diagnostics, decision_log
-
-
-def select_active_partition_anomalies(
-    candidates: pd.DataFrame,
-    coverage: Dict[str, frozenset[str]],
-    thresholds: AnomalyThresholds,
-    dim_cols: Sequence[str],
-) -> Tuple[pd.DataFrame, pd.DataFrame, pd.DataFrame]:
-    """Построить fixed-point active-граф с локальными терминальными ветками.
-
-    Граф содержит только сегменты, прошедшие первичный anomaly-фильтр.
-    Терминальный фронт определяется локально по отсутствию более глубокого
-    аномального потомка. Все решения одной итерации вычисляются по снимку,
-    разрешаются по ребёнку и применяются одним пакетом.
-
-    Args:
-        candidates: Классифицированные кандидаты со статистиками аномальности.
-        coverage: Исходное атомарное покрытие каждого кандидата.
-        thresholds: Порог gross_share и множитель сравнения Z.
-        dim_cols: Измерения, задающие строгие связи предок — потомок.
-
-    Returns:
-        Кортеж из итоговых разрешённых аномалий, полной диагностики и журнала решений.
-
-    Raises:
-        ValueError: Если отсутствует физический атомарный слой или измерения.
-        RuntimeError: Если монотонный fixed-point цикл не сошёлся.
-
-    Examples:
-        >>> # final_df, diagnostics, log = select_active_partition_anomalies(candidates, coverage, AnomalyThresholds(), dims)
-    """
-
-    # FIXED: Финальный active-граф теперь строится по алгоритму agm/gm/z_c_greater
-    # после результата build_anomaly_candidates.
-    return _select_active_partition_anomalies_v2(candidates, coverage, thresholds, dim_cols)
-
-    diagnostics = candidates.copy()
-    if diagnostics.empty:
-        return diagnostics.copy(), diagnostics, pd.DataFrame()
-    if not dim_cols:
-        raise ValueError("Для active-графа нужен хотя бы один признак")
-
-    max_physical_depth = int(diagnostics["slice_depth"].astype(int).max())
-    atomic_df = diagnostics[
-        diagnostics["slice_depth"].astype(int) == max_physical_depth
-    ].copy()
-    if atomic_df.empty:
-        raise ValueError("Физический атомарный слой active-разбиения пуст")
-    atomic_deltas = {
-        str(row["segment_id"]): float(row["wow_delta_gmv"])
-        for _, row in atomic_df.iterrows()
-    }
-
-    anomaly_mask = (
-        diagnostics["slice_depth"].astype(int).gt(0)
-        & diagnostics["passes_initial_anomaly_filter"].astype(bool)
+    global_status = (
+        "OPTIMAL"
+        if all(_set_packing_result_is_proven_optimal(result, gap_tolerance) for result in component_results)
+        else "NOT_OPTIMAL"
     )
-    anomaly_df = diagnostics[anomaly_mask].copy()
-
-    string_columns = [
-        "active_child_ids",
-        "active_child_keys",
-        "active_parent_ids",
-        "active_parent_keys",
-        "active_partition_action",
-        "active_partition_reason",
-        "active_partition_status",
-        "active_partition_status_reason",
-        "active_graph_status",
-        "active_decision_code",
-        "active_decision_reason",
-        "active_decision_history",
-        "conflict_parent_ids",
-        "conflict_parent_keys",
-        "covered_by_segment",
-        "covered_by_segment_key",
-        "absorbed_child_ids",
-        "absorbed_child_keys",
-        "absorbed_child_labels",
-        "absorbed_by_parent_ids",
-        "absorbed_by_parent_keys",
-        "original_atomic_descendants",
-        "active_atomic_descendants",
-        "residual_atomic_descendants",
-    ]
-    for column in string_columns:
-        diagnostics[column] = ""
-    diagnostics["technical_child_count"] = 0
-    diagnostics["active_child_count"] = 0
-    diagnostics["original_atomic_count"] = 0
-    diagnostics["active_atomic_count"] = 0
-    diagnostics["residual_atomic_count"] = 0
-    diagnostics["residual_gross_movement"] = 0.0
-    diagnostics["single_child_gross_share"] = math.nan
-    diagnostics["active_parent_z"] = math.nan
-    diagnostics["active_child_z"] = math.nan
-    diagnostics["active_decision_iteration"] = pd.Series(pd.NA, index=diagnostics.index, dtype="Int64")
-    diagnostics["is_active"] = False
-    diagnostics["is_resolved"] = False
-    diagnostics["is_natural_terminal"] = False
-    diagnostics["is_terminal_current"] = False
-    diagnostics["covered_atomic_count"] = diagnostics["segment_id"].map(
-        lambda segment_id: len(coverage.get(str(segment_id), frozenset()))
-    )
-    diagnostics["selected"] = False
-    diagnostics["selection_exclusion_reason"] = ""
-
-    if anomaly_df.empty:
-        diagnostics["active_graph_status"] = "NOT_IN_ANOMALY_GRAPH"
-        diagnostics["selection_exclusion_reason"] = diagnostics["reason"].astype(str)
-        return diagnostics.iloc[0:0].copy(), diagnostics, pd.DataFrame()
-
-    lookup = {
-        str(row["segment_id"]): row.copy()
-        for _, row in anomaly_df.iterrows()
-    }
-    anomaly_ids = sorted(lookup)
-    feature_sets = {
-        segment_id: _segment_feature_set(row, dim_cols)
-        for segment_id, row in lookup.items()
-    }
-    original_atoms = {
-        segment_id: frozenset(coverage.get(segment_id, frozenset()))
-        for segment_id in anomaly_ids
-    }
-    coverage_is_known = {
-        segment_id: bool(original_atoms[segment_id])
-        and original_atoms[segment_id].issubset(atomic_deltas)
-        for segment_id in anomaly_ids
-    }
-    original_descendants = {
-        parent_id: {
-            child_id
-            for child_id in anomaly_ids
-            if feature_sets[parent_id] < feature_sets[child_id]
-        }
-        for parent_id in anomaly_ids
-    }
-    original_parents = {
-        child_id: {
-            parent_id
-            for parent_id in anomaly_ids
-            if feature_sets[parent_id] < feature_sets[child_id]
-        }
-        for child_id in anomaly_ids
-    }
-    natural_terminals = {
-        segment_id
-        for segment_id in anomaly_ids
-        if not original_descendants[segment_id]
-    }
-
-    active_ids = set(anomaly_ids)
-    is_resolved = {
-        segment_id: segment_id in natural_terminals
-        for segment_id in anomaly_ids
-    }
-    graph_status = {
-        segment_id: (
-            "NATURAL_TERMINAL"
-            if segment_id in natural_terminals
-            else "ACTIVE_PENDING"
-        )
-        for segment_id in anomaly_ids
-    }
-    status_reason = {
-        segment_id: (
-            "изначально отсутствуют более глубокие аномальные потомки"
-            if segment_id in natural_terminals
-            else "ожидает разрешения нижней ветки"
-        )
-        for segment_id in anomaly_ids
-    }
-    active_atoms = {
-        segment_id: set(original_atoms[segment_id])
-        for segment_id in anomaly_ids
-    }
-    residual_atoms_for_diagnostics = {
-        segment_id: set(original_atoms[segment_id])
-        for segment_id in anomaly_ids
-    }
-    covered_by: Dict[str, str] = {}
-    absorbed_lineage: Dict[str, List[str]] = {
-        segment_id: [] for segment_id in anomaly_ids
-    }
-    decision_history: Dict[str, List[str]] = {
-        segment_id: [] for segment_id in anomaly_ids
-    }
-    selection_scores = {
-        segment_id: float(lookup[segment_id].get("selection_score", 0.0))
-        for segment_id in anomaly_ids
-    }
-    last_children: Dict[str, List[str]] = {segment_id: [] for segment_id in anomaly_ids}
-    last_decision: Dict[str, str] = {segment_id: "" for segment_id in anomaly_ids}
-    last_reason: Dict[str, str] = dict(status_reason)
-    last_iteration: Dict[str, Optional[int]] = {segment_id: None for segment_id in anomaly_ids}
-    last_gross_share: Dict[str, float] = {segment_id: math.nan for segment_id in anomaly_ids}
-    last_parent_z: Dict[str, float] = {segment_id: math.nan for segment_id in anomaly_ids}
-    last_child_z: Dict[str, float] = {segment_id: math.nan for segment_id in anomaly_ids}
-    last_conflict_parents: Dict[str, List[str]] = {segment_id: [] for segment_id in anomaly_ids}
-    decision_log_rows: List[Dict[str, object]] = []
-
-    def gross_movement(atom_ids: Sequence[str]) -> float:
-        """Посчитать gross movement набора физических атомов.
-
-        Args:
-            atom_ids: Идентификаторы физических атомов.
-
-        Returns:
-            Сумма модулей изменений GMV.
-
-        Raises:
-            KeyError: Если атом отсутствует в физическом слое.
-
-        Examples:
-            >>> # gross_movement(['atom_1'])
-        """
-
-        return float(sum(abs(float(atomic_deltas[atom_id])) for atom_id in atom_ids))
-
-    converged = False
-    max_iterations = max(2, len(anomaly_ids) * 2 + 2)
-    for iteration in range(1, max_iterations + 1):
-        snapshot_active = set(active_ids)
-        snapshot_resolved = dict(is_resolved)
-        snapshot_status = dict(graph_status)
-        snapshot_atoms = {
-            segment_id: set(active_atoms[segment_id])
-            for segment_id in anomaly_ids
-        }
-        nearest_children = _nearest_active_child_map(
-            sorted(snapshot_active), feature_sets
-        )
-        last_children.update(nearest_children)
-
-        next_status = dict(graph_status)
-        next_reason = dict(status_reason)
-        next_resolved = dict(is_resolved)
-        empty_after_transfer: set[str] = set()
-        proposals: List[Dict[str, object]] = []
-
-        for parent_id in sorted(
-            snapshot_active,
-            key=lambda segment_id: (
-                int(lookup[segment_id]["slice_depth"]),
-                str(lookup[segment_id]["segment_key"]),
-            ),
-        ):
-            children = nearest_children[parent_id]
-            if not coverage_is_known[parent_id]:
-                next_status[parent_id] = "DEFER_UNKNOWN_COVERAGE"
-                next_reason[parent_id] = "исходное атомарное покрытие отсутствует или неполно"
-                next_resolved[parent_id] = False
-                last_decision[parent_id] = "DEFER_UNKNOWN_COVERAGE"
-                last_reason[parent_id] = next_reason[parent_id]
-                last_iteration[parent_id] = iteration
-                continue
-
-            if snapshot_status[parent_id] in {
-                "DEFER_RESIDUAL_COVERAGE",
-                "DEFER_COMPLEX_ATOMIC_CONFLICT",
-                "DEFER_EQUAL_Z_CONFLICT",
-            }:
-                next_resolved[parent_id] = False
-                continue
-
-            if not children:
-                if parent_id in natural_terminals:
-                    next_status[parent_id] = "NATURAL_TERMINAL"
-                    next_reason[parent_id] = "изначально отсутствуют более глубокие аномальные потомки"
-                    next_resolved[parent_id] = True
-                elif snapshot_resolved[parent_id]:
-                    next_status[parent_id] = (
-                        snapshot_status[parent_id]
-                        if snapshot_status[parent_id] == "PARENT_WINS"
-                        else "RESOLVED_TERMINAL"
-                    )
-                    next_reason[parent_id] = "нижняя ветка разрешена; сегмент доступен верхнему уровню"
-                    next_resolved[parent_id] = True
-                elif gross_movement(snapshot_atoms[parent_id]) == 0.0:
-                    next_status[parent_id] = "EMPTY_AFTER_TRANSFER"
-                    next_reason[parent_id] = "после передачи покрытия не осталось самостоятельного движения"
-                    next_resolved[parent_id] = False
-                    empty_after_transfer.add(parent_id)
-                elif snapshot_atoms[parent_id] != set(original_atoms[parent_id]):
-                    next_status[parent_id] = "DEFER_RESIDUAL_COVERAGE"
-                    next_reason[parent_id] = "осталось частичное покрытие; исходный Z нельзя применять к остатку"
-                    next_resolved[parent_id] = False
-                else:
-                    next_status[parent_id] = "DEFER_NO_ACTIVE_CHILD"
-                    next_reason[parent_id] = "аномальные потомки существовали, но остаточное покрытие не разрешено"
-                    next_resolved[parent_id] = False
-                last_decision[parent_id] = next_status[parent_id]
-                last_reason[parent_id] = next_reason[parent_id]
-                last_iteration[parent_id] = iteration
-                continue
-
-            if len(children) > 1:
-                next_status[parent_id] = "DEFER_MULTIPLE_CHILDREN"
-                next_reason[parent_id] = "у родителя более одного ближайшего активного ребёнка"
-                next_resolved[parent_id] = False
-                last_decision[parent_id] = "DEFER_MULTIPLE_CHILDREN"
-                last_reason[parent_id] = next_reason[parent_id]
-                last_iteration[parent_id] = iteration
-                decision_history[parent_id].append(
-                    f"iteration={iteration}: DEFER_MULTIPLE_CHILDREN ({len(children)})"
-                )
-                decision_log_rows.append(
-                    {
-                        "iteration": iteration,
-                        "event_type": "CLASSIFICATION",
-                        "parent_id": parent_id,
-                        "parent_key": str(lookup[parent_id]["segment_key"]),
-                        "parent_depth": int(lookup[parent_id]["slice_depth"]),
-                        "child_id": "",
-                        "child_key": "",
-                        "child_depth": pd.NA,
-                        "active_child_count": len(children),
-                        "parent_abs_z": abs(float(lookup[parent_id]["robust_z_capped"])),
-                        "child_abs_z": math.nan,
-                        "gross_share": math.nan,
-                        "pair_decision": "DEFER_MULTIPLE_CHILDREN",
-                        "conflict_code": "",
-                        "winner_parent_id": "",
-                        "winner_parent_key": "",
-                        "applied": False,
-                        "reason": next_reason[parent_id],
-                    }
-                )
-                continue
-
-            child_id = children[0]
-            if not snapshot_resolved[child_id]:
-                next_status[parent_id] = "BLOCKED_BY_UNRESOLVED_DESCENDANT"
-                next_reason[parent_id] = "ближайший активный ребёнок ещё не разрешён"
-                next_resolved[parent_id] = False
-                last_decision[parent_id] = "BLOCKED_BY_UNRESOLVED_DESCENDANT"
-                last_reason[parent_id] = next_reason[parent_id]
-                last_iteration[parent_id] = iteration
-                continue
-
-            parent_abs_z = abs(float(lookup[parent_id]["robust_z_capped"]))
-            child_abs_z = abs(float(lookup[child_id]["robust_z_capped"]))
-            parent_residual_atoms = frozenset(snapshot_atoms[parent_id])
-            if gross_movement(parent_residual_atoms) == 0.0:
-                next_status[parent_id] = "DEFER_ZERO_GROSS"
-                next_reason[parent_id] = "residual gross movement родителя равен нулю"
-                next_resolved[parent_id] = False
-                last_decision[parent_id] = "DEFER_ZERO_GROSS"
-                last_reason[parent_id] = next_reason[parent_id]
-                last_iteration[parent_id] = iteration
-                continue
-            gross_share = _single_child_gross_share(
-                float(lookup[child_id]["wow_delta_gmv"]),
-                parent_residual_atoms,
-                atomic_deltas,
-            )
-            pair_decision = _single_child_decision(
-                parent_abs_z,
-                child_abs_z,
-                gross_share,
-                thresholds,
-            )
-            comparison = (
-                f"gross_share={gross_share:.6f}; |Z_parent|={parent_abs_z:.6f}; "
-                f"|Z_child|={child_abs_z:.6f}; пороги: gross_share > "
-                f"{thresholds.single_child_gross_share_threshold:.2f} и |Z_parent| < "
-                f"{thresholds.single_child_z_multiplier:.2f} × |Z_child|"
-            )
-            reason = f"{pair_decision}: {comparison}"
-            proposals.append(
-                {
-                    "parent_id": parent_id,
-                    "child_id": child_id,
-                    "parent_abs_z": parent_abs_z,
-                    "child_abs_z": child_abs_z,
-                    "gross_share": gross_share,
-                    "pair_decision": pair_decision,
-                    "reason": reason,
-                }
-            )
-            next_status[parent_id] = "PAIR_DECISION_PENDING"
-            next_reason[parent_id] = reason
-            next_resolved[parent_id] = False
-            last_decision[parent_id] = pair_decision
-            last_reason[parent_id] = reason
-            last_iteration[parent_id] = iteration
-            last_gross_share[parent_id] = gross_share
-            last_parent_z[parent_id] = parent_abs_z
-            last_child_z[parent_id] = child_abs_z
-
-        proposals_by_child: Dict[str, List[Dict[str, object]]] = {}
-        for proposal in proposals:
-            proposals_by_child.setdefault(str(proposal["child_id"]), []).append(proposal)
-
-        to_remove: set[str] = set(empty_after_transfer)
-        next_atoms = {
-            segment_id: set(snapshot_atoms[segment_id])
-            for segment_id in anomaly_ids
-        }
-        loss_atoms: Dict[str, set[str]] = {}
-        winners_this_iteration: set[str] = set()
-        structural_events = bool(empty_after_transfer)
-
-        for child_id in sorted(proposals_by_child):
-            child_proposals = proposals_by_child[child_id]
-            conflict_parent_ids = sorted(
-                str(proposal["parent_id"])
-                for proposal in child_proposals
-            )
-            for parent_id in conflict_parent_ids:
-                last_conflict_parents[parent_id] = conflict_parent_ids
-            parent_win_proposals = [
-                proposal
-                for proposal in child_proposals
-                if proposal["pair_decision"] == "PARENT_WINS"
-            ]
-
-            if not parent_win_proposals:
-                for proposal in child_proposals:
-                    parent_id = str(proposal["parent_id"])
-                    to_remove.add(parent_id)
-                    next_status[parent_id] = "CHILD_WINS_PARENT_REMOVED"
-                    next_reason[parent_id] = "все конкурирующие родители получили CHILD_WINS"
-                    next_resolved[parent_id] = False
-                    residual_atoms_for_diagnostics[parent_id] = (
-                        set(snapshot_atoms[parent_id]) - set(snapshot_atoms[child_id])
-                    )
-                    decision_history[parent_id].append(
-                        f"iteration={iteration}: CHILD_WINS -> {child_id}"
-                    )
-                    decision_log_rows.append(
-                        {
-                            "iteration": iteration,
-                            "event_type": "PAIR_DECISION",
-                            "parent_id": parent_id,
-                            "parent_key": str(lookup[parent_id]["segment_key"]),
-                            "parent_depth": int(lookup[parent_id]["slice_depth"]),
-                            "child_id": child_id,
-                            "child_key": str(lookup[child_id]["segment_key"]),
-                            "child_depth": int(lookup[child_id]["slice_depth"]),
-                            "active_child_count": 1,
-                            "parent_abs_z": float(proposal["parent_abs_z"]),
-                            "child_abs_z": float(proposal["child_abs_z"]),
-                            "gross_share": float(proposal["gross_share"]),
-                            "pair_decision": "CHILD_WINS",
-                            "conflict_code": "ALL_PARENTS_CHILD_WINS",
-                            "winner_parent_id": "",
-                            "winner_parent_key": "",
-                            "applied": True,
-                            "reason": next_reason[parent_id],
-                        }
-                    )
-                structural_events = True
-                continue
-
-            max_parent_z = max(
-                float(proposal["parent_abs_z"])
-                for proposal in parent_win_proposals
-            )
-            strongest_parent_proposals = [
-                proposal
-                for proposal in parent_win_proposals
-                if math.isclose(
-                    float(proposal["parent_abs_z"]),
-                    max_parent_z,
-                    rel_tol=1e-12,
-                    abs_tol=1e-12,
-                )
-            ]
-            if len(strongest_parent_proposals) > 1:
-                for proposal in child_proposals:
-                    parent_id = str(proposal["parent_id"])
-                    next_status[parent_id] = "DEFER_EQUAL_Z_CONFLICT"
-                    next_reason[parent_id] = "несколько PARENT_WINS имеют одинаковый максимальный |Z|"
-                    next_resolved[parent_id] = False
-                    decision_history[parent_id].append(
-                        f"iteration={iteration}: DEFER_EQUAL_Z_CONFLICT"
-                    )
-                    decision_log_rows.append(
-                        {
-                            "iteration": iteration,
-                            "event_type": "PAIR_DECISION",
-                            "parent_id": parent_id,
-                            "parent_key": str(lookup[parent_id]["segment_key"]),
-                            "parent_depth": int(lookup[parent_id]["slice_depth"]),
-                            "child_id": child_id,
-                            "child_key": str(lookup[child_id]["segment_key"]),
-                            "child_depth": int(lookup[child_id]["slice_depth"]),
-                            "active_child_count": 1,
-                            "parent_abs_z": float(proposal["parent_abs_z"]),
-                            "child_abs_z": float(proposal["child_abs_z"]),
-                            "gross_share": float(proposal["gross_share"]),
-                            "pair_decision": str(proposal["pair_decision"]),
-                            "conflict_code": "DEFER_EQUAL_Z_CONFLICT",
-                            "winner_parent_id": "",
-                            "winner_parent_key": "",
-                            "applied": False,
-                            "reason": next_reason[parent_id],
-                        }
-                    )
-                continue
-
-            winner_proposal = strongest_parent_proposals[0]
-            winner_id = str(winner_proposal["parent_id"])
-            external_atomic_conflicts = sorted(
-                other_id
-                for other_id in snapshot_active
-                if other_id not in {*conflict_parent_ids, child_id}
-                and snapshot_resolved[other_id]
-                and bool(snapshot_atoms[winner_id] & snapshot_atoms[other_id])
-                and not (
-                    feature_sets[winner_id] < feature_sets[other_id]
-                    or feature_sets[other_id] < feature_sets[winner_id]
-                )
-            )
-            if external_atomic_conflicts:
-                conflict_keys = [
-                    str(lookup[segment_id]["segment_key"])
-                    for segment_id in external_atomic_conflicts
-                ]
-                for proposal in child_proposals:
-                    parent_id = str(proposal["parent_id"])
-                    next_status[parent_id] = "DEFER_COMPLEX_ATOMIC_CONFLICT"
-                    next_reason[parent_id] = (
-                        "потенциальный победитель пересекается по атомам с разрешённым "
-                        f"несопоставимым сегментом: {'; '.join(conflict_keys)}"
-                    )
-                    next_resolved[parent_id] = False
-                    last_conflict_parents[parent_id] = sorted(
-                        {*conflict_parent_ids, *external_atomic_conflicts}
-                    )
-                    decision_history[parent_id].append(
-                        f"iteration={iteration}: DEFER_COMPLEX_ATOMIC_CONFLICT"
-                    )
-                    decision_log_rows.append(
-                        {
-                            "iteration": iteration,
-                            "event_type": "PAIR_DECISION",
-                            "parent_id": parent_id,
-                            "parent_key": str(lookup[parent_id]["segment_key"]),
-                            "parent_depth": int(lookup[parent_id]["slice_depth"]),
-                            "child_id": child_id,
-                            "child_key": str(lookup[child_id]["segment_key"]),
-                            "child_depth": int(lookup[child_id]["slice_depth"]),
-                            "active_child_count": 1,
-                            "parent_abs_z": float(proposal["parent_abs_z"]),
-                            "child_abs_z": float(proposal["child_abs_z"]),
-                            "gross_share": float(proposal["gross_share"]),
-                            "pair_decision": str(proposal["pair_decision"]),
-                            "conflict_code": "DEFER_COMPLEX_ATOMIC_CONFLICT",
-                            "winner_parent_id": "",
-                            "winner_parent_key": "",
-                            "applied": False,
-                            "reason": next_reason[parent_id],
-                        }
-                    )
-                continue
-            winners_this_iteration.add(winner_id)
-            to_remove.add(child_id)
-            next_status[winner_id] = "PARENT_WINS"
-            next_reason[winner_id] = f"родитель поглотил единственного ребёнка {lookup[child_id]['segment_key']}"
-            next_resolved[winner_id] = True
-            next_status[child_id] = "ABSORBED_BY_PARENT"
-            next_reason[child_id] = f"поглощён родителем {lookup[winner_id]['segment_key']}"
-            next_resolved[child_id] = False
-            selection_scores[winner_id] = max(
-                selection_scores[winner_id],
-                selection_scores[child_id],
-            )
-            lineage = [child_id, *absorbed_lineage.get(child_id, [])]
-            absorbed_lineage[winner_id] = list(
-                dict.fromkeys([*absorbed_lineage.get(winner_id, []), *lineage])
-            )
-            for absorbed_id in lineage:
-                covered_by[absorbed_id] = winner_id
-                residual_atoms_for_diagnostics[absorbed_id] = set()
-            decision_history[winner_id].append(
-                f"iteration={iteration}: PARENT_WINS -> {child_id}"
-            )
-
-            transferred_atoms = set(snapshot_atoms[child_id])
-            for other_id in snapshot_active:
-                if other_id in {winner_id, child_id}:
-                    continue
-                if not feature_sets[other_id] < feature_sets[child_id]:
-                    continue
-                winner_is_descendant = feature_sets[other_id] < feature_sets[winner_id]
-                if not winner_is_descendant:
-                    loss_atoms.setdefault(other_id, set()).update(transferred_atoms)
-
-            for proposal in child_proposals:
-                parent_id = str(proposal["parent_id"])
-                is_winner = parent_id == winner_id
-                decision_log_rows.append(
-                    {
-                        "iteration": iteration,
-                        "event_type": "PAIR_DECISION",
-                        "parent_id": parent_id,
-                        "parent_key": str(lookup[parent_id]["segment_key"]),
-                        "parent_depth": int(lookup[parent_id]["slice_depth"]),
-                        "child_id": child_id,
-                        "child_key": str(lookup[child_id]["segment_key"]),
-                        "child_depth": int(lookup[child_id]["slice_depth"]),
-                        "active_child_count": 1,
-                        "parent_abs_z": float(proposal["parent_abs_z"]),
-                        "child_abs_z": float(proposal["child_abs_z"]),
-                        "gross_share": float(proposal["gross_share"]),
-                        "pair_decision": str(proposal["pair_decision"]),
-                        "conflict_code": "PARENT_WINS_PRIORITY",
-                        "winner_parent_id": winner_id,
-                        "winner_parent_key": str(lookup[winner_id]["segment_key"]),
-                        "applied": is_winner,
-                        "reason": (
-                            next_reason[winner_id]
-                            if is_winner
-                            else "уступил родителю с максимальным |Z| или приоритету PARENT_WINS"
-                        ),
-                    }
-                )
-            structural_events = True
-
-        for segment_id, atoms_to_remove in loss_atoms.items():
-            if segment_id in to_remove or segment_id in winners_this_iteration:
-                continue
-            residual_atoms = set(snapshot_atoms[segment_id]) - atoms_to_remove
-            next_atoms[segment_id] = residual_atoms
-            residual_atoms_for_diagnostics[segment_id] = set(residual_atoms)
-            if not residual_atoms or gross_movement(residual_atoms) == 0.0:
-                to_remove.add(segment_id)
-                next_status[segment_id] = "EMPTY_AFTER_TRANSFER"
-                next_reason[segment_id] = "всё самостоятельное покрытие передано внешнему победителю"
-                next_resolved[segment_id] = False
-            else:
-                next_status[segment_id] = "DEFER_RESIDUAL_COVERAGE"
-                next_reason[segment_id] = "частичный остаток требует отдельного пересчёта Z"
-                next_resolved[segment_id] = False
-            structural_events = True
-
-        for segment_id in empty_after_transfer:
-            residual_atoms_for_diagnostics[segment_id] = set()
-        for segment_id in to_remove:
-            next_atoms[segment_id] = set()
-            next_resolved[segment_id] = False
-
-        active_ids = snapshot_active - to_remove
-        active_atoms = next_atoms
-        graph_status = next_status
-        status_reason = next_reason
-        is_resolved = next_resolved
-
-        state_changed = (
-            active_ids != snapshot_active
-            or any(
-                active_atoms[segment_id] != snapshot_atoms[segment_id]
-                for segment_id in anomaly_ids
-            )
-            or any(
-                is_resolved[segment_id] != snapshot_resolved[segment_id]
-                for segment_id in anomaly_ids
-            )
-        )
-        if not state_changed and not structural_events:
-            converged = True
-            break
-        if not state_changed:
-            converged = True
-            break
-
-    if not converged:
-        raise RuntimeError("Fixed-point active-граф не сошёлся за безопасное число итераций")
-
-    final_nearest_children = _nearest_active_child_map(
-        sorted(active_ids), feature_sets
-    )
-    final_parent_map: Dict[str, List[str]] = {segment_id: [] for segment_id in anomaly_ids}
-    for parent_id, children in final_nearest_children.items():
-        for child_id in children:
-            final_parent_map[child_id].append(parent_id)
-
-    index_by_id = {
-        str(segment_id): index
-        for index, segment_id in diagnostics["segment_id"].items()
-    }
-    for segment_id in anomaly_ids:
-        index = index_by_id[segment_id]
-        children = final_nearest_children.get(segment_id, [])
-        parents = sorted(final_parent_map.get(segment_id, []))
-        original_atom_ids = sorted(original_atoms[segment_id])
-        current_atom_ids = sorted(active_atoms[segment_id]) if segment_id in active_ids else []
-        residual_atom_ids = sorted(residual_atoms_for_diagnostics[segment_id])
-        lineage = absorbed_lineage.get(segment_id, [])
-        lineage_keys = [str(lookup[child_id]["segment_key"]) for child_id in lineage]
-        lineage_labels = [
-            _relative_child_segment_name(
-                lookup[segment_id]["segment_key"],
-                lookup[child_id]["segment_key"],
-            )
-            for child_id in lineage
-        ]
-        covered_by_id = covered_by.get(segment_id, "")
-        diagnostics.at[index, "active_child_ids"] = " || ".join(children)
-        diagnostics.at[index, "active_child_keys"] = " || ".join(
-            str(lookup[child_id]["segment_key"]) for child_id in children
-        )
-        diagnostics.at[index, "active_parent_ids"] = " || ".join(parents)
-        diagnostics.at[index, "active_parent_keys"] = " || ".join(
-            str(lookup[parent_id]["segment_key"]) for parent_id in parents
-        )
-        diagnostics.at[index, "technical_child_count"] = len(children)
-        diagnostics.at[index, "active_child_count"] = len(children)
-        diagnostics.at[index, "active_partition_action"] = last_decision[segment_id] or graph_status[segment_id]
-        diagnostics.at[index, "active_partition_reason"] = last_reason[segment_id]
-        diagnostics.at[index, "active_partition_status"] = graph_status[segment_id]
-        diagnostics.at[index, "active_partition_status_reason"] = status_reason[segment_id]
-        diagnostics.at[index, "active_graph_status"] = graph_status[segment_id]
-        diagnostics.at[index, "active_decision_code"] = last_decision[segment_id] or graph_status[segment_id]
-        diagnostics.at[index, "active_decision_reason"] = last_reason[segment_id]
-        diagnostics.at[index, "active_decision_history"] = " || ".join(decision_history[segment_id])
-        diagnostics.at[index, "active_decision_iteration"] = last_iteration[segment_id]
-        diagnostics.at[index, "single_child_gross_share"] = last_gross_share[segment_id]
-        diagnostics.at[index, "active_parent_z"] = last_parent_z[segment_id]
-        diagnostics.at[index, "active_child_z"] = last_child_z[segment_id]
-        diagnostics.at[index, "conflict_parent_ids"] = " || ".join(last_conflict_parents[segment_id])
-        diagnostics.at[index, "conflict_parent_keys"] = " || ".join(
-            str(lookup[parent_id]["segment_key"])
-            for parent_id in last_conflict_parents[segment_id]
-        )
-        diagnostics.at[index, "covered_by_segment"] = covered_by_id
-        diagnostics.at[index, "covered_by_segment_key"] = (
-            str(lookup[covered_by_id]["segment_key"]) if covered_by_id else ""
-        )
-        diagnostics.at[index, "absorbed_child_ids"] = " || ".join(lineage)
-        diagnostics.at[index, "absorbed_child_keys"] = " || ".join(lineage_keys)
-        diagnostics.at[index, "absorbed_child_labels"] = "; ".join(lineage_labels)
-        diagnostics.at[index, "absorbed_by_parent_ids"] = covered_by_id
-        diagnostics.at[index, "absorbed_by_parent_keys"] = (
-            str(lookup[covered_by_id]["segment_key"]) if covered_by_id else ""
-        )
-        diagnostics.at[index, "original_atomic_descendants"] = " || ".join(original_atom_ids)
-        diagnostics.at[index, "active_atomic_descendants"] = " || ".join(current_atom_ids)
-        diagnostics.at[index, "residual_atomic_descendants"] = " || ".join(residual_atom_ids)
-        diagnostics.at[index, "original_atomic_count"] = len(original_atom_ids)
-        diagnostics.at[index, "active_atomic_count"] = len(current_atom_ids)
-        diagnostics.at[index, "residual_atomic_count"] = len(residual_atom_ids)
-        diagnostics.at[index, "residual_gross_movement"] = gross_movement(residual_atom_ids)
-        diagnostics.at[index, "is_active"] = segment_id in active_ids
-        diagnostics.at[index, "is_resolved"] = bool(is_resolved[segment_id])
-        diagnostics.at[index, "is_natural_terminal"] = segment_id in natural_terminals
-        diagnostics.at[index, "is_terminal_current"] = segment_id in active_ids and not children
-        diagnostics.at[index, "selection_score"] = selection_scores[segment_id]
-
-        if segment_id in natural_terminals and segment_id in active_ids:
-            diagnostics.at[index, "action"] = "NATURAL_TERMINAL"
-            diagnostics.at[index, "output_block"] = "терминальная аномалия"
-            diagnostics.at[index, "reason"] = "естественный терминальный сегмент локальной ветки"
-        elif graph_status[segment_id] == "PARENT_WINS" and segment_id in active_ids:
-            diagnostics.at[index, "action"] = "PARENT_WINS"
-            diagnostics.at[index, "output_block"] = "поглощение родителем"
-            diagnostics.at[index, "reason"] = status_reason[segment_id]
-
     selected_ids = {
         segment_id
-        for segment_id in active_ids
-        if bool(is_resolved[segment_id])
+        for result in component_results
+        for segment_id in result.get("selected_ids", [])
     }
-    diagnostics["selected"] = diagnostics["segment_id"].astype(str).isin(selected_ids)
-    for index, row in diagnostics.iterrows():
-        segment_id = str(row["segment_id"])
-        if segment_id in selected_ids:
-            diagnostics.at[index, "selection_exclusion_reason"] = ""
-        elif segment_id in lookup:
-            diagnostics.at[index, "selection_exclusion_reason"] = (
-                f"не выбран active-графом: {graph_status[segment_id]} — {status_reason[segment_id]}"
+    result_by_segment: Dict[str, Dict[str, object]] = {}
+    for result in component_results:
+        for segment_id in result["segment_ids"]:
+            result_by_segment[segment_id] = result
+
+    conflict_neighbors: Dict[str, set[str]] = {segment_id: set() for segment_id in eligible_ids}
+    for left_id, right_id in conflict_pair_atoms:
+        conflict_neighbors[left_id].add(right_id)
+        conflict_neighbors[right_id].add(left_id)
+
+    for segment_id in eligible_ids:
+        index = index_by_id[segment_id]
+        result = result_by_segment[segment_id]
+        component_id = str(result["component_id"])
+        atoms = sorted(normalized_coverage.get(segment_id, frozenset()))
+        selected = segment_id in selected_ids
+        segment_conflicts = sorted(conflict_neighbors.get(segment_id, set()), key=lambda sid: _set_packing_canonical_key(sid, lookup))
+        conflict_keys = [str(lookup[conflict_id]["segment_key"]) for conflict_id in segment_conflicts]
+        if selected:
+            status = "SET_PACKING_SELECTED"
+            reason = (
+                f"выбран точной оптимизацией Maximum Weighted Set Packing; component={component_id}; "
+                f"solver={result['solver_name']}; status={result['solver_status']}"
+            )
+        elif result["solver_status"] == "OPTIMAL":
+            status = "SET_PACKING_NOT_SELECTED"
+            reason = (
+                f"не выбран глобальным оптимумом компоненты {component_id}; "
+                "выбранный непересекающийся набор даёт большую или равную сумму anomaly_score"
             )
         else:
-            diagnostics.at[index, "active_graph_status"] = "NOT_IN_ANOMALY_GRAPH"
-            diagnostics.at[index, "selection_exclusion_reason"] = str(row.get("reason", ""))
+            status = "SET_PACKING_NOT_PROVEN"
+            reason = f"компонента {component_id} не вернула доказанный статус OPTIMAL"
 
-    final_df = diagnostics[diagnostics["selected"]].copy()
+        diagnostics.at[index, "selected"] = selected
+        diagnostics.at[index, "is_resolved"] = result["solver_status"] == "OPTIMAL"
+        diagnostics.at[index, "action"] = status
+        diagnostics.at[index, "output_block"] = "оптимальная аномалия Set Packing" if selected else "исключён Set Packing"
+        diagnostics.at[index, "reason"] = reason
+        diagnostics.at[index, "set_packing_status"] = status
+        diagnostics.at[index, "conflict_count"] = int(conflict_count_by_segment.get(segment_id, 0))
+        diagnostics.at[index, "conflict_segment_ids"] = " || ".join(segment_conflicts)
+        diagnostics.at[index, "conflict_segment_keys"] = " || ".join(conflict_keys)
+        diagnostics.at[index, "set_packing_global_status"] = global_status
+        diagnostics.at[index, "set_packing_component_id"] = component_id
+        diagnostics.at[index, "set_packing_solver"] = str(result["solver_name"])
+        diagnostics.at[index, "set_packing_solver_status"] = str(result["solver_status"])
+        diagnostics.at[index, "set_packing_reason"] = reason
+        diagnostics.at[index, "set_packing_objective_value"] = float(result["objective_value"])
+        diagnostics.at[index, "set_packing_best_bound"] = float(result["best_bound"])
+        diagnostics.at[index, "set_packing_abs_gap"] = float(result["absolute_gap"])
+        diagnostics.at[index, "set_packing_rel_gap"] = float(result["relative_gap"])
+        diagnostics.at[index, "set_packing_solve_time_sec"] = float(result["solve_time_sec"])
+        diagnostics.at[index, "set_packing_variable_count"] = int(result["variable_count"])
+        diagnostics.at[index, "set_packing_constraint_count"] = int(result["constraint_count"])
+        diagnostics.at[index, "set_packing_component_segment_count"] = int(result["segment_count"])
+        diagnostics.at[index, "set_packing_component_atom_count"] = int(result["atom_count"])
+        diagnostics.at[index, "set_packing_component_conflict_pair_count"] = int(result["conflict_pair_count"])
+        diagnostics.at[index, "set_packing_component_score_sum"] = float(result["score_sum"])
+        diagnostics.at[index, "selected_atomic_descendants"] = " || ".join(atoms) if selected else ""
+        diagnostics.at[index, "selected_atomic_count"] = len(atoms) if selected else 0
+        diagnostics.at[index, "selection_exclusion_reason"] = "" if selected else reason
+
+    diagnostics.loc[diagnostics["set_packing_global_status"].eq(""), "set_packing_global_status"] = global_status
+    final_df = diagnostics[diagnostics["selected"].astype(bool)].copy()
     final_df = final_df.sort_values(
         by=[
             "selection_score",
@@ -3407,36 +2006,29 @@ def select_active_partition_anomalies(
             "segment_key",
         ],
         ascending=[False, False, False, False, False, True],
+        kind="stable",
     ).reset_index(drop=True)
     final_df.insert(0, "rank", range(1, len(final_df) + 1))
-
-    decision_log_columns = [
-        "iteration",
-        "event_type",
-        "parent_id",
-        "parent_key",
-        "parent_depth",
-        "child_id",
-        "child_key",
-        "child_depth",
-        "active_child_count",
-        "parent_abs_z",
-        "child_abs_z",
-        "gross_share",
-        "pair_decision",
-        "conflict_code",
-        "winner_parent_id",
-        "winner_parent_key",
-        "applied",
-        "reason",
-    ]
-    decision_log = pd.DataFrame(decision_log_rows, columns=decision_log_columns)
-    if not decision_log.empty:
-        decision_log = decision_log.sort_values(
-            ["iteration", "event_type", "parent_key", "child_key"],
-            kind="stable",
-        ).reset_index(drop=True)
+    validate_set_packing_solution(
+        final_df,
+        diagnostics,
+        normalized_coverage,
+        component_results,
+        scores,
+        global_status,
+        gap_tolerance,
+    )
+    decision_log = _build_set_packing_decision_log(
+        component_results,
+        atom_to_segments,
+        conflict_pair_atoms,
+        lookup,
+        scores,
+        global_status,
+    )
     return final_df, diagnostics, decision_log
+
+
 
 
 def build_manager_summary(final_df: pd.DataFrame, thresholds: AnomalyThresholds, current_total_gmv: float) -> pd.DataFrame:
@@ -3513,37 +2105,25 @@ def build_manager_summary(final_df: pd.DataFrame, thresholds: AnomalyThresholds,
         {
             "раздел": "Краткий вывод",
             "тип": str(main["output_block"]),
-            "сегмент": _manager_segment_name(main),
+            "сегмент": str(main["segment_key"]),
             "Delta GMV": _format_rub(float(main["wow_delta_gmv"])),
             **metric_pct_output(main),
             "z_score": round(float(main["robust_z"]), 2),
-            "интерпретация": "Самый сильный выбранный блок по score; для компенсационных блоков score определяется внутренним движением детей.",
+            "интерпретация": "Самый сильный выбранный сегмент из глобально оптимального непересекающегося набора по anomaly_score.",
         }
     )
 
     for _, row in top.iterrows():
         direction = "выше" if float(row["abnormal_gmv"]) > 0 else "ниже"
-        absorbed_labels = str(row.get("absorbed_child_labels", "")).strip()
-        absorption_text = (
-            f" Поглощён дочерний сегмент: {absorbed_labels}."
-            if absorbed_labels and absorbed_labels.lower() != "nan"
-            else ""
+        interpretation = (
+            f"Фактический GMV сегмента {direction} ожидаемого уровня. "
+            f"Причина отбора: {row['reason']}."
         )
-        if str(row["output_block"]) == "блок аномальной компенсации":
-            interpretation = (
-                "Net-эффект родителя может быть небольшим, но внутри детей есть крупные встречные аномальные движения. "
-                f"Причина отбора: {row['reason']}.{absorption_text}"
-            )
-        else:
-            interpretation = (
-                f"Фактический GMV сегмента {direction} ожидаемого уровня. "
-                f"Причина отбора: {row['reason']}.{absorption_text}"
-            )
         rows.append(
             {
                 "раздел": "Таблица факторов",
                 "тип": str(row["output_block"]),
-                "сегмент": _manager_segment_name(row),
+                "сегмент": str(row["segment_key"]),
                 "Delta GMV": _format_rub(float(row["wow_delta_gmv"])),
                 **metric_pct_output(row),
                 "z_score": round(float(row["robust_z"]), 2),
@@ -3662,8 +2242,8 @@ def build_control_table(
     """
 
     selected_atoms: List[str] = []
-    if not final_df.empty and "active_atomic_descendants" in final_df.columns:
-        for value in final_df["active_atomic_descendants"].fillna("").astype(str):
+    if not final_df.empty and "selected_atomic_descendants" in final_df.columns:
+        for value in final_df["selected_atomic_descendants"].fillna("").astype(str):
             selected_atoms.extend(
                 atom_id.strip()
                 for atom_id in value.split(" || ")
@@ -3688,30 +2268,52 @@ def build_control_table(
         ("eligible_candidate_count", int(candidates["is_eligible"].astype(bool).sum()) if "is_eligible" in candidates else 0),
         ("selected_count", len(final_df)),
         (
-            "active_unresolved_count",
-            int((candidates.get("is_active", False) & ~candidates.get("is_resolved", False)).sum())
-            if "is_active" in candidates and "is_resolved" in candidates
+            "set_packing_unresolved_count",
+            int((candidates["is_eligible"].astype(bool) & ~candidates["is_resolved"].astype(bool)).sum())
+            if {"is_eligible", "is_resolved"}.issubset(candidates.columns)
             else 0,
         ),
         (
-            "natural_terminal_count",
-            int(candidates.get("is_natural_terminal", pd.Series(False, index=candidates.index)).astype(bool).sum()),
-        ),
-        (
-            "defer_multiple_children_count",
-            int(candidates.get("active_graph_status", pd.Series("", index=candidates.index)).eq("DEFER_MULTIPLE_CHILDREN").sum()),
-        ),
-        (
-            "defer_equal_z_conflict_count",
-            int(candidates.get("active_graph_status", pd.Series("", index=candidates.index)).eq("DEFER_EQUAL_Z_CONFLICT").sum()),
-        ),
-        (
-            "empty_after_transfer_count",
-            int(candidates.get("active_graph_status", pd.Series("", index=candidates.index)).eq("EMPTY_AFTER_TRANSFER").sum()),
+            "set_packing_not_proven_count",
+            int(candidates.get("set_packing_status", pd.Series("", index=candidates.index)).astype(str).eq("SET_PACKING_NOT_PROVEN").sum())
+            if not candidates.empty and "set_packing_status" in candidates
+            else 0,
         ),
         ("atomic_count", atomic_count),
         ("selected_atomic_unique_count", selected_atom_unique_count),
         ("double_count_violation_count", double_count_violation_count),
+        (
+            "set_packing_global_status",
+            str(candidates.get("set_packing_global_status", pd.Series([""], index=[0])).dropna().astype(str).replace("", pd.NA).dropna().iloc[0])
+            if "set_packing_global_status" in candidates and not candidates["set_packing_global_status"].dropna().astype(str).replace("", pd.NA).dropna().empty
+            else "",
+        ),
+        (
+            "set_packing_component_count",
+            int(candidates.get("set_packing_component_id", pd.Series("", index=candidates.index)).astype(str).replace("", pd.NA).dropna().nunique())
+            if not candidates.empty and "set_packing_component_id" in candidates
+            else 0,
+        ),
+        (
+            "set_packing_non_optimal_component_count",
+            int(
+                candidates.loc[
+                    candidates.get("set_packing_component_id", pd.Series("", index=candidates.index)).astype(str).ne("")
+                    & candidates.get("set_packing_solver_status", pd.Series("", index=candidates.index)).astype(str).ne("OPTIMAL"),
+                    "set_packing_component_id",
+                ].astype(str).nunique()
+            )
+            if not candidates.empty and {"set_packing_component_id", "set_packing_solver_status"}.issubset(candidates.columns)
+            else 0,
+        ),
+        (
+            "set_packing_objective_value",
+            float(final_df["selection_score"].astype(float).sum()) if not final_df.empty and "selection_score" in final_df else 0.0,
+        ),
+        (
+            "set_packing_conflict_pair_count",
+            int(candidates["conflict_count"].astype(int).sum() // 2) if "conflict_count" in candidates else 0,
+        ),
         ("filled_missing_rows", int(panel_df["row_missing_in_source"].sum())),
     ]
     return pd.DataFrame(rows, columns=["показатель", "значение"])
@@ -3721,7 +2323,7 @@ def build_anomaly_analysis_sheet(candidates: pd.DataFrame, final_df: pd.DataFram
     """Сформировать лист анализа аномалий, прошедших первичный фильтр.
 
     Args:
-        candidates: Диагностика кандидатов после классификации и отбора.
+        candidates: Диагностика кандидатов после оптимизационного отбора.
         final_df: Итоговые выбранные аномалии.
         thresholds: Пороги алгоритма, включая лимит фактов менеджерского вывода.
 
@@ -3740,20 +2342,19 @@ def build_anomaly_analysis_sheet(candidates: pd.DataFrame, final_df: pd.DataFram
         "глубина",
         "z_scope",
         "anomaly_score",
-        "решение active-разбиения",
-        "статус решения active-разбиения",
-        "активен",
+        "выбран",
         "разрешён",
-        "естественный терминальный",
-        "число ближайших активных детей",
-        "gross_share единственного ребёнка",
-        "residual gross movement",
-        "тип связи",
-        "поглощён кем",
-        "поглощён сегментом",
-        "причина поглощения",
-        "покрыт сегментом",
-        "поглощённые сегменты",
+        "set_packing_status",
+        "set_packing_reason",
+        "set_packing_global_status",
+        "set_packing_component_id",
+        "set_packing_solver",
+        "set_packing_solver_status",
+        "set_packing_abs_gap",
+        "set_packing_rel_gap",
+        "conflict_count",
+        "conflict_segment_keys",
+        "selected_atomic_count",
         "номер добавления в менеджерский вывод",
         "причина не попадания в менеджерский вывод",
         "Delta GMV",
@@ -3765,12 +2366,7 @@ def build_anomaly_analysis_sheet(candidates: pd.DataFrame, final_df: pd.DataFram
         candidates["passes_initial_anomaly_filter"].eq(True)
         & candidates["abs_abnormal_gmv"].astype(float).ge(thresholds.min_anomaly_abs)
     )
-    active_decision_mask = (
-        candidates["active_partition_action"].astype(str).ne("")
-        if "active_partition_action" in candidates.columns
-        else False
-    )
-    analysis_mask = initial_anomaly_mask | active_decision_mask
+    analysis_mask = initial_anomaly_mask
     analysis = candidates[analysis_mask].copy()
     if analysis.empty:
         return pd.DataFrame(columns=columns)
@@ -3828,51 +2424,49 @@ def build_anomaly_analysis_sheet(candidates: pd.DataFrame, final_df: pd.DataFram
             "глубина": analysis["slice_depth"].astype(int),
             "z_scope": analysis["robust_z_capped"].astype(float).round(2),
             "anomaly_score": analysis["anomaly_score"].astype(float),
-            "решение active-разбиения": analysis.get(
-                "active_partition_action", pd.Series("", index=analysis.index)
-            ).astype(str),
-            "статус решения active-разбиения": analysis.get(
-                "active_partition_status", pd.Series("", index=analysis.index)
-            ).astype(str),
-            "активен": analysis.get(
-                "is_active", pd.Series(False, index=analysis.index)
+            "выбран": analysis.get(
+                "selected", pd.Series(False, index=analysis.index)
             ).astype(bool),
             "разрешён": analysis.get(
                 "is_resolved", pd.Series(False, index=analysis.index)
             ).astype(bool),
-            "естественный терминальный": analysis.get(
-                "is_natural_terminal", pd.Series(False, index=analysis.index)
-            ).astype(bool),
-            "число ближайших активных детей": pd.to_numeric(
-                analysis.get("active_child_count", pd.Series(0, index=analysis.index)),
+            "set_packing_status": analysis.get(
+                "set_packing_status", pd.Series("", index=analysis.index)
+            ).astype(str),
+            "set_packing_reason": analysis.get(
+                "set_packing_reason", pd.Series("", index=analysis.index)
+            ).astype(str),
+            "set_packing_global_status": analysis.get(
+                "set_packing_global_status", pd.Series("", index=analysis.index)
+            ).astype(str),
+            "set_packing_component_id": analysis.get(
+                "set_packing_component_id", pd.Series("", index=analysis.index)
+            ).astype(str),
+            "set_packing_solver": analysis.get(
+                "set_packing_solver", pd.Series("", index=analysis.index)
+            ).astype(str),
+            "set_packing_solver_status": analysis.get(
+                "set_packing_solver_status", pd.Series("", index=analysis.index)
+            ).astype(str),
+            "set_packing_abs_gap": pd.to_numeric(
+                analysis.get("set_packing_abs_gap", pd.Series(math.nan, index=analysis.index)),
+                errors="coerce",
+            ),
+            "set_packing_rel_gap": pd.to_numeric(
+                analysis.get("set_packing_rel_gap", pd.Series(math.nan, index=analysis.index)),
+                errors="coerce",
+            ),
+            "conflict_count": pd.to_numeric(
+                analysis.get("conflict_count", pd.Series(0, index=analysis.index)),
                 errors="coerce",
             ).fillna(0).astype(int),
-            "gross_share единственного ребёнка": pd.to_numeric(
-                analysis.get("single_child_gross_share", pd.Series(math.nan, index=analysis.index)),
+            "conflict_segment_keys": analysis.get(
+                "conflict_segment_keys", pd.Series("", index=analysis.index)
+            ).astype(str),
+            "selected_atomic_count": pd.to_numeric(
+                analysis.get("selected_atomic_count", pd.Series(0, index=analysis.index)),
                 errors="coerce",
-            ),
-            "residual gross movement": pd.to_numeric(
-                analysis.get("residual_gross_movement", pd.Series(0.0, index=analysis.index)),
-                errors="coerce",
-            ),
-            "тип связи": analysis.get(
-                "active_relationship_type", pd.Series("", index=analysis.index)
-            ).astype(str),
-            "поглощён кем": analysis.get(
-                "absorbed_by_role", pd.Series("", index=analysis.index)
-            ).astype(str),
-            "поглощён сегментом": analysis.get(
-                "absorbed_by_segment_key", pd.Series("", index=analysis.index)
-            ).astype(str),
-            "причина поглощения": analysis.get(
-                "absorption_reason", pd.Series("", index=analysis.index)
-            ).astype(str),
-            "покрыт сегментом": analysis.get(
-                "covered_by_segment_key", pd.Series("", index=analysis.index)
-            ).astype(str),
-            "поглощённые сегменты": analysis.get(
-                "absorbed_child_labels", pd.Series("", index=analysis.index)
-            ).astype(str),
+            ).fillna(0).astype(int),
             "номер добавления в менеджерский вывод": analysis["segment_id"].astype(str).map(manager_order_by_id).astype("Int64"),
             "причина не попадания в менеджерский вывод": analysis["причина не попадания в менеджерский вывод"],
             "Delta GMV": analysis["wow_delta_gmv"].astype(float).round(0).astype("Int64"),
@@ -4333,10 +2927,11 @@ def build_anomaly_tree_from_excel(
 
     nodes = analysis.copy()
     optional_tree_columns = [
-        "тип связи",
-        "поглощён кем",
-        "поглощён сегментом",
-        "причина поглощения",
+        "set_packing_status",
+        "set_packing_reason",
+        "set_packing_component_id",
+        "set_packing_solver_status",
+        "conflict_count",
         "номер добавления в менеджерский вывод",
     ]
     for column in optional_tree_columns:
@@ -4351,6 +2946,7 @@ def build_anomaly_tree_from_excel(
         nodes["номер добавления в менеджерский вывод"],
         errors="coerce",
     )
+    nodes["conflict_count"] = pd.to_numeric(nodes["conflict_count"], errors="coerce").fillna(0).astype(int)
     nodes = nodes[
         nodes["глубина"].notna()
         & nodes["глубина"].gt(0)
@@ -4392,130 +2988,6 @@ def build_anomaly_tree_from_excel(
         text = str(value).strip()
         return "" if text.lower() in {"", "nan", "<na>", "none"} else text
 
-    def short_part_value(part: Tuple[str, str]) -> str:
-        """Вернуть короткое значение отличающейся части сегмента.
-
-        Args:
-            part: Пара `(dimension, value)`.
-
-        Returns:
-            Значение признака без имени измерения.
-
-        Raises:
-            ValueError: Не выбрасывается.
-
-        Examples:
-            >>> short_part_value(('geo', 'РФ'))
-            'РФ'
-        """
-
-        return str(part[1]).strip()
-
-    def relative_absorber_delta_lines(row: pd.Series, absorbed_role: str) -> List[str]:
-        """Показать только отличие текущего сегмента от сегмента-поглотителя.
-
-        Args:
-            row: Строка узла дерева.
-            absorbed_role: Роль поглотителя: родитель, ребёнок или конкурент.
-
-        Returns:
-            Строки вида `+РФ` или `-РФ`.
-
-        Raises:
-            ValueError: Не выбрасывается.
-
-        Examples:
-            >>> relative_absorber_delta_lines(
-            ...     pd.Series({'сегмент': 'a=1 × b=2', 'поглощён сегментом': 'a=1'}),
-            ...     'родитель',
-            ... )
-            ['-2']
-        """
-
-        current_parts = set(_segment_key_parts(row.get("сегмент", "")))
-        absorber_parts = set(_segment_key_parts(row.get("поглощён сегментом", "")))
-        if not current_parts or not absorber_parts:
-            return []
-
-        if absorbed_role == "родитель":
-            return [
-                f"-{short_part_value(part)}"
-                for part in sorted(current_parts - absorber_parts)
-            ]
-        if absorbed_role == "ребёнок":
-            return [
-                f"+{short_part_value(part)}"
-                for part in sorted(absorber_parts - current_parts)
-            ]
-
-        removed = [f"-{short_part_value(part)}" for part in sorted(current_parts - absorber_parts)]
-        added = [f"+{short_part_value(part)}" for part in sorted(absorber_parts - current_parts)]
-        return [*removed, *added]
-
-    def compact_absorption_reason(row: pd.Series) -> str:
-        """Сжать техническую причину поглощения до короткой строки дерева.
-
-        Args:
-            row: Строка узла дерева.
-
-        Returns:
-            Короткая причина для подписи узла.
-
-        Raises:
-            ValueError: Не выбрасывается.
-
-        Examples:
-            >>> compact_absorption_reason(pd.Series({'причина поглощения': 'родитель поглотил ребёнка по k=2.0 >= 1.35'}))
-            'k родителя>=1.35'
-        """
-
-        reason = clean_tree_value(row.get("причина поглощения"))
-        relationship_type = clean_tree_value(row.get("тип связи"))
-        absorbed_role = clean_tree_value(row.get("поглощён кем"))
-        k_threshold = ""
-        if ">=" in reason:
-            k_threshold = reason.split(">=", 1)[1].strip().split()[0].rstrip(";,.")
-        if not reason:
-            return ""
-        if "k=" in reason and ">=" in reason:
-            return f"k родителя>={k_threshold}" if k_threshold else "k родителя>=порог"
-        if "ни один родитель не достиг k" in reason:
-            return f"k родителя<{k_threshold}" if k_threshold else "k родителя<порог"
-        if absorbed_role == "родитель-конкурент":
-            return "k конкурента выше"
-        if "временное правило" in reason:
-            return "временное правило"
-        if relationship_type == "M:N" or "M:N" in reason:
-            return "заглушка M:N"
-        if "одинаковом направлении Delta GMV" in reason:
-            return "направление/порог k"
-        return reason[:45].rstrip() + ("…" if len(reason) > 45 else "")
-
-    def display_absorbed_role(absorbed_role: str) -> str:
-        """Преобразовать техническую роль в форму для карточки дерева.
-
-        Args:
-            absorbed_role: Техническое значение роли поглотителя.
-
-        Returns:
-            Человекочитаемая форма в творительном падеже.
-
-        Raises:
-            ValueError: Не выбрасывается.
-
-        Examples:
-            >>> display_absorbed_role('родитель')
-            'родителем'
-        """
-
-        role_map = {
-            "родитель": "родителем",
-            "ребёнок": "ребенком",
-            "ребенок": "ребенком",
-            "родитель-конкурент": "родителем-конкурентом",
-        }
-        return role_map.get(absorbed_role, absorbed_role)
-
     def build_tree_detail_lines(row: pd.Series) -> List[str]:
         """Собрать дополнительные строки для не-менеджерского узла.
 
@@ -4523,7 +2995,7 @@ def build_anomaly_tree_from_excel(
             row: Строка узла из листа анализа аномалий.
 
         Returns:
-            Список строк: связь, кем поглощён, причина.
+            Список строк со статусом оптимизационного выбора.
 
         Raises:
             ValueError: Не выбрасывается.
@@ -4536,18 +3008,21 @@ def build_anomaly_tree_from_excel(
         if not pd.isna(row.get("номер добавления в менеджерский вывод")):
             return []
         lines: List[str] = []
-        relationship_type = clean_tree_value(row.get("тип связи"))
-        absorbed_role = clean_tree_value(row.get("поглощён кем"))
-        absorption_reason = compact_absorption_reason(row)
-        if absorbed_role:
-            lines.append(f"Поглощен {display_absorbed_role(absorbed_role)}")
-            lines.extend(relative_absorber_delta_lines(row, absorbed_role))
-        if relationship_type:
-            lines.append(relationship_type)
-        if absorption_reason:
-            lines.append(absorption_reason)
-        if not absorbed_role and not absorption_reason and relationship_type == "M:N":
-            lines.append("заглушка M:N")
+        status = clean_tree_value(row.get("set_packing_status"))
+        reason = clean_tree_value(row.get("set_packing_reason"))
+        component_id = clean_tree_value(row.get("set_packing_component_id"))
+        solver_status = clean_tree_value(row.get("set_packing_solver_status"))
+        conflict_count = int(row.get("conflict_count", 0) or 0)
+        if status:
+            lines.append(status)
+        if component_id:
+            lines.append(f"component={component_id}")
+        if solver_status:
+            lines.append(f"solver={solver_status}")
+        if conflict_count:
+            lines.append(f"conflicts={conflict_count}")
+        if reason:
+            lines.append(reason[:60].rstrip() + ("…" if len(reason) > 60 else ""))
         return lines[:5]
 
     nodes["is_manager_output"] = nodes["номер добавления в менеджерский вывод"].notna()
@@ -4967,7 +3442,7 @@ def write_anomaly_excel(
     dates: Sequence[int],
     current_cal_date: int,
     coverage: Dict[str, frozenset[str]],
-    active_decision_log: pd.DataFrame,
+    optimization_decision_log: pd.DataFrame,
 ) -> None:
     """Записать результат поиска аномалий в Excel.
 
@@ -4983,7 +3458,7 @@ def write_anomaly_excel(
         dates: Список недель.
         current_cal_date: Текущая неделя.
         coverage: Покрытие кандидатов атомами.
-        active_decision_log: Итерационный журнал решений active-графа.
+        optimization_decision_log: Журнал построения и решения Set Packing.
 
     Returns:
         None.
@@ -5004,12 +3479,8 @@ def write_anomaly_excel(
             ("min_materiality_share", thresholds.min_materiality_share),
             ("sigma_floor", thresholds.sigma_floor),
             ("z_cap", thresholds.z_cap),
-            ("dominance_threshold", thresholds.dominance_threshold),
-            ("compensation_threshold", thresholds.compensation_threshold),
-            ("anomaly_gross_move_threshold", thresholds.anomaly_gross_move_threshold),
-            ("single_child_z_multiplier", thresholds.single_child_z_multiplier),
-            ("single_child_gross_share_threshold", thresholds.single_child_gross_share_threshold),
-            ("parent_child_absorption_k_threshold", thresholds.parent_child_absorption_k_threshold),
+            ("set_packing_gap_tolerance", thresholds.set_packing_gap_tolerance),
+            ("max_exact_fallback_size", thresholds.max_exact_fallback_size),
             ("current_cal_date", int(current_cal_date)),
         ],
         columns=["показатель", "значение"],
@@ -5044,42 +3515,33 @@ def write_anomaly_excel(
         "abs_abnormal_gmv",
         "selection_score",
         "reliability_factor",
-        "child_gross_abnormal",
-        "child_cancellation_ratio",
-        "child_dominance_share",
         "history_nonzero_weeks",
         "state",
         "reason",
         "covered_atomic_count",
-        "dominant_child_key",
-        "technical_child_count",
-        "active_child_count",
-        "single_child_gross_share",
-        "anomaly_gross_move",
-        "parent_child_absorption_k",
-        "active_parent_z",
-        "active_child_z",
-        "active_partition_action",
-        "active_partition_reason",
-        "active_partition_status",
-        "active_partition_status_reason",
-        "active_graph_status",
-        "is_active",
+        "selected",
+        "set_packing_global_status",
+        "set_packing_component_id",
+        "set_packing_solver",
+        "set_packing_solver_status",
+        "set_packing_reason",
+        "set_packing_objective_value",
+        "set_packing_best_bound",
+        "set_packing_abs_gap",
+        "set_packing_rel_gap",
+        "set_packing_solve_time_sec",
+        "set_packing_variable_count",
+        "set_packing_constraint_count",
+        "conflict_count",
+        "conflict_segment_ids",
+        "conflict_segment_keys",
+        "atomic_coverage_source",
+        "atomic_coverage_validation_status",
         "is_resolved",
-        "is_natural_terminal",
-        "is_terminal_current",
         "original_atomic_count",
-        "active_atomic_count",
-        "residual_atomic_count",
+        "selected_atomic_count",
         "original_atomic_descendants",
-        "active_atomic_descendants",
-        "residual_atomic_descendants",
-        "residual_gross_movement",
-        "connection_break_flag",
-        "connection_break_reason",
-        "covered_by_segment_key",
-        "absorbed_child_keys",
-        "absorbed_child_labels",
+        "selected_atomic_descendants",
     ]
     final_export = final_df[[col for col in final_cols if col in final_df.columns]].copy()
 
@@ -5092,7 +3554,7 @@ def write_anomaly_excel(
         candidates.to_excel(writer, sheet_name="04_Диагностика_кандидатов", index=False)
         missing_zero.to_excel(writer, sheet_name="05_Пропуски_и_нули", index=False)
         control.to_excel(writer, sheet_name="06_Контроль", index=False)
-        active_decision_log.to_excel(writer, sheet_name="07_Журнал_active_решений", index=False)
+        optimization_decision_log.to_excel(writer, sheet_name="07_Журнал_set_packing", index=False)
 
         highlight_manager_rows_on_anomaly_analysis(writer.sheets["Анализ аномалий"])
 
@@ -5149,8 +3611,7 @@ def run_anomaly_analysis(
     panel_df = build_full_week_grid(history_df, dims, dates)
     candidates, total_by_date = build_anomaly_candidates(panel_df, dims, dates, thresholds, current)
     coverage = build_atomic_coverage(candidates, dims)
-    candidates = add_child_context(candidates, coverage)
-    final_df, diagnostics, active_decision_log = search_anomal(candidates, thresholds)
+    final_df, diagnostics, optimization_decision_log = search_anomal(candidates, thresholds, coverage=coverage, dim_cols=dims)
     write_anomaly_excel(
         output_path,
         thresholds,
@@ -5163,7 +3624,7 @@ def run_anomaly_analysis(
         dates,
         current,
         coverage,
-        active_decision_log,
+        optimization_decision_log,
     )
     if tree_output_path is not None:
         build_anomaly_tree_from_excel(output_path, tree_output_path)
@@ -5173,7 +3634,7 @@ def run_anomaly_analysis(
         "panel": panel_df,
         "candidates": diagnostics,
         "final": final_df,
-        "active_decision_log": active_decision_log,
+        "optimization_decision_log": optimization_decision_log,
         "control": build_control_table(history_df, panel_df, diagnostics, final_df, coverage, dates, current, total_by_date),
     }
 
@@ -5211,39 +3672,17 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--min-materiality-share", type=float, default=AnomalyThresholds.min_materiality_share)
     parser.add_argument("--sigma-floor", type=float, default=AnomalyThresholds.sigma_floor)
     parser.add_argument("--z-cap", type=float, default=AnomalyThresholds.z_cap)
-    parser.add_argument("--dominance-threshold", type=float, default=AnomalyThresholds.dominance_threshold)
-    parser.add_argument("--compensation-threshold", type=float, default=AnomalyThresholds.compensation_threshold)
     parser.add_argument(
-        "--anomaly-gross-move-threshold",
-        "--agm",
-        dest="anomaly_gross_move_threshold",
+        "--set-packing-gap-tolerance",
         type=float,
-        default=AnomalyThresholds.anomaly_gross_move_threshold,
-        help="Threshold agm for anomalous gross movement share in a child group.",
+        default=AnomalyThresholds.set_packing_gap_tolerance,
+        help="Relative MIP gap tolerance required to mark set-packing optimization as OPTIMAL.",
     )
     parser.add_argument(
-        "--single-child-z-multiplier",
-        "--z-c-greater",
-        type=float,
-        default=AnomalyThresholds.single_child_z_multiplier,
-        help="Множитель Z ребёнка в правиле active-разбиения.",
-    )
-    parser.add_argument(
-        "--single-child-gross-share-threshold",
-        "--single-child-gross-move-threshold",
-        "--gm",
-        dest="single_child_gross_share_threshold",
-        type=float,
-        default=AnomalyThresholds.single_child_gross_share_threshold,
-        help="Порог неотрицательной gross_share единственного активного ребёнка.",
-    )
-    parser.add_argument(
-        "--parent-child-absorption-k-threshold",
-        "--k-threshold",
-        dest="parent_child_absorption_k_threshold",
-        type=float,
-        default=AnomalyThresholds.parent_child_absorption_k_threshold,
-        help="Порог k для поглощения дочернего сегмента родителем в search_anomal.",
+        "--max-exact-fallback-size",
+        type=int,
+        default=AnomalyThresholds.max_exact_fallback_size,
+        help="Maximum conflicting component size allowed for internal exact branch-and-bound fallback.",
     )
     parser.add_argument("--max-manager-facts", type=int, default=AnomalyThresholds.max_manager_facts)
     return parser.parse_args()
@@ -5277,12 +3716,8 @@ def main() -> None:
         min_materiality_share=args.min_materiality_share,
         sigma_floor=args.sigma_floor,
         z_cap=args.z_cap,
-        dominance_threshold=args.dominance_threshold,
-        compensation_threshold=args.compensation_threshold,
-        anomaly_gross_move_threshold=args.anomaly_gross_move_threshold,
-        single_child_z_multiplier=args.single_child_z_multiplier,
-        single_child_gross_share_threshold=args.single_child_gross_share_threshold,
-        parent_child_absorption_k_threshold=args.parent_child_absorption_k_threshold,
+        set_packing_gap_tolerance=args.set_packing_gap_tolerance,
+        max_exact_fallback_size=args.max_exact_fallback_size,
         max_manager_facts=args.max_manager_facts,
     )
     result = run_anomaly_analysis(
