@@ -14,6 +14,7 @@
 from __future__ import annotations
 
 import argparse
+from datetime import datetime
 from itertools import combinations
 import math
 import re
@@ -26,9 +27,12 @@ import pandas as pd
 from openpyxl.styles import PatternFill
 
 
-DEFAULT_INPUT_PATH = Path(__file__).with_name("payoffline_pulse_hier_22_07.xlsx")
-DEFAULT_OUTPUT_PATH = Path(__file__).with_name("gmv_Insight_2207_test.xlsx")
-DEFAULT_TREE_OUTPUT_PATH = Path(__file__).with_name("Граф_Insight_2207_test.png")
+# ADDED: Current date suffix for daily input/output filenames.
+today_dt = datetime.now().strftime("%d_%m")
+
+DEFAULT_INPUT_PATH = Path(__file__).with_name(f"payoffline_pulse_hier_{today_dt}.xlsx")
+DEFAULT_OUTPUT_PATH = Path(__file__).with_name(f"gmv_Insight_{today_dt}_test.xlsx")
+DEFAULT_TREE_OUTPUT_PATH = Path(__file__).with_name(f"Граф_Insight_{today_dt}_test.png")
 
 # ADDED: Для исторического файла исключаем все технические и метрические колонки.
 DRIVER_TECH_COLUMNS = {
