@@ -1,0 +1,239 @@
+-- GENERATED STATEMENTS
+-- YQL Nirvana Operation: https://nirvana.yandex-team.ru/process/7178553d-78e5-461f-941e-7c62b8545f14/graph/result/b82e81ab-0878-47aa-b1c3-ac9900a02c20
+PRAGMA yt.Annotations=@@{
+    "nv_block_code"="light_yql_1";
+    "nv_block_id"="94eafb0b-cbe1-447c-95e2-a275dc699924";
+    "nv_block_name"="[Light] YQL 1";
+    "nv_operation_code"="light_yql_1";
+    "nv_operation_name"="[Light] YQL 1";
+    "nv_operation_version"="1.1.0";
+    "nv_operation_version_id"="967b4709-9c74-4029-8c68-2c6de68bcb0f";
+    "nv_process_author"="robot-fdt-payoffline";
+    "nv_process_id"="7178553d-78e5-461f-941e-7c62b8545f14";
+    "nv_root_process_id"="b59af041-acc6-4803-a6b6-2240f2d50c14";
+    "nv_workflow_id"="8355f51e-576c-4638-8a9c-d71d19ed0fdd";
+    "nv_workflow_name"="master_yql_wf";
+}@@;
+Use hahn;
+
+-- USER STATEMENTS
+-- Скрипт формирует недельную иерархическую витрину GMV за историческое окно.
+-- Типы мерчантов разделяются на TOP-5 по captured-обороту предыдущих 12 недель
+-- без текущей недели и категорию «Прочее». Далее через GROUPING SETS строятся
+-- все уровни детализации по четырём измерениям и рассчитываются GMV, TX, AU, AM,
+-- AOV, TPM, Freq и доля сегмента в общем GMV.
+
+-- !!!!!! Важные моменты: !!!!!!
+-- 1. Состав TOP-5 меняется между запусками
+-- TOP-5 пересчитывается каждый раз по предыдущим 12 неделям ($top_merchants_history_days). Поэтому один merchant может сегодня быть отдельной категорией, а через неделю попасть в Прочее.
+
+-- 2. Пропущенные значения в $source_table заменяются на Unknown, в противном случае алгоритм сломается. Unknown может отражать проблему качества данных
+-- После замены NULL на Unknown структура срезов становится корректной, но рост сегмента:
+-- geo=Unknown
+-- может означать не бизнес-аномалию, а ухудшение заполненности источника.
+-- Такие сегменты желательно отдельно маркировать как data-quality anomalies.
+
+USE hahn;
+
+PRAGMA AnsiInForEmptyOrNullableItemsCollections;
+PRAGMA OrderedColumns;
+PRAGMA SimpleColumns;
+PRAGMA DqEngine = 'disable';
+PRAGMA GroupByLimit = '400';
+
+-- input
+$source_table = '//home/fdt/payoffline/projects/qr_yandex_pay/bi/payoffline_pulse_raw';
+$output_table = '//home/fdt/payoffline/projects/qr_yandex_pay/bi/payoffline_pulse_hier';
+$history_days = 7 * 13;
+$top_merchants_history_days = 7 * 12;
+
+$max_cal_date = (
+    SELECT
+        MAX(CAST(s.cal_date AS Date)) AS max_cal_date
+    FROM
+        $source_table AS s
+    WHERE
+        CAST(s.period AS String) == '1W'
+);
+
+$top_merchants = (
+    -- 1. Находим ТОП-5 типов мерчантов по сумме абсолютных captured amount за предыдущие 12 недель без текущей недели
+    SELECT
+        r.merchants_type AS merchants_type,
+        SUM(ABS(COALESCE(CAST(r.amount AS Int64), 0))) AS abs_sum_amount
+    FROM
+        $source_table AS r
+    CROSS JOIN
+        $max_cal_date AS m
+    WHERE
+        CAST(r.period AS String) == '1W'
+        AND CAST(r.status AS String) == 'captured'
+        AND r.merchants_type IS NOT NULL
+        AND CAST(r.cal_date AS Date) >= m.max_cal_date - DateTime::IntervalFromDays($top_merchants_history_days)
+        AND CAST(r.cal_date AS Date) < m.max_cal_date
+    GROUP BY
+        r.merchants_type
+    ORDER BY
+        abs_sum_amount DESC,
+        merchants_type
+    LIMIT 5
+);
+
+-- proc
+-- Нормализуем источник до недельных транзакций 1W и берём окно 13 недель.
+$source_1w = (
+    SELECT
+        CAST(r.period AS String) AS period,
+        CAST(r.cal_date AS Date) AS cal_date,
+        COALESCE(CAST(r.geo AS String), 'Unknown') AS geo,
+        COALESCE(CAST(r.products AS String), 'Unknown') AS products,
+
+        -- 2. Логика категоризации: если есть в списке ТОП-5 — оставляем, иначе — 'Прочее'
+        CASE
+            WHEN r.merchants_type IS NULL THEN 'Unknown'
+            WHEN r.merchants_type IN (
+                SELECT
+                    t.merchants_type
+                FROM
+                    $top_merchants AS t
+            ) THEN CAST(r.merchants_type AS String)
+            ELSE 'Прочее'
+        END AS merchants_type,
+        COALESCE(CAST(r.is_terminal_or_cpqr AS String), 'Unknown') AS is_terminal_or_cpqr,
+        CAST(r.users_newness AS String?) AS users_newness,
+        COALESCE(CAST(r.user_cohort AS String), 'Unknown') AS users_activity, -- user_cohort ПРИНИМАЕТ NULL, ЕСЛИ PHONE_TOKEN NULL
+        CAST(r.status AS String) AS status,
+        r.amount AS amount,
+        r.checkout_order_id AS checkout_order_id,
+        r.phone_token AS phone_token,
+        r.merchant_id AS merchant_id
+    FROM
+        $source_table AS r
+    WHERE
+        CAST(r.period AS String) == '1W'
+);
+
+$source_13w = (
+    SELECT
+        s.*
+    FROM
+        $source_1w AS s
+    CROSS JOIN
+        $max_cal_date AS m
+    WHERE
+        s.cal_date >= m.max_cal_date - DateTime::IntervalFromDays($history_days)
+);
+
+-- proc
+-- Все C(4,0)+C(4,1)+C(4,2)+C(4,3)+C(4,4)=16 срезов через GROUPING SETS — один проход по данным.
+-- Убраны users_newness и users_activity. Максимальная глубина теперь 4.
+$aggregated = (
+    SELECT
+        s.period AS period,
+        s.cal_date AS cal_date,
+        CAST(
+            (1 - GROUPING(s.geo))
+            + (1 - GROUPING(s.products))
+            + (1 - GROUPING(s.merchants_type))
+            + (1 - GROUPING(s.is_terminal_or_cpqr)) AS Uint8
+        ) AS slice_depth,
+        IF(GROUPING(s.geo) == 1, CAST(NULL AS String?), s.geo) AS geo,
+        IF(GROUPING(s.products) == 1, CAST(NULL AS String?), s.products) AS products,
+        IF(GROUPING(s.merchants_type) == 1, CAST(NULL AS String?), s.merchants_type) AS merchants_type,
+        IF(GROUPING(s.is_terminal_or_cpqr) == 1, CAST(NULL AS String?), s.is_terminal_or_cpqr) AS is_terminal_or_cpqr,
+        SUM(IF(s.status == 'captured', COALESCE(CAST(s.amount AS Int64), 0) / 100.0, 0)) AS gmv,
+        COUNT(IF(s.status == 'captured', s.checkout_order_id, NULL)) AS tx,
+        COUNT(DISTINCT IF(s.status == 'captured', s.phone_token, NULL)) AS au,
+        COUNT(DISTINCT IF(s.status == 'captured', s.merchant_id, NULL)) AS am
+    FROM
+        $source_13w AS s
+    GROUP BY
+        s.period AS period,
+        s.cal_date AS cal_date,
+        GROUPING SETS (
+            -- depth 0: total (1 срез)
+            (),
+
+            -- depth 1: одно измерение C(4,1)=4 среза
+            (s.geo),
+            (s.products),
+            (s.merchants_type),
+            (s.is_terminal_or_cpqr),
+
+            -- depth 2: два измерения C(4,2)=6 срезов
+            (s.geo, s.products),
+            (s.geo, s.merchants_type),
+            (s.geo, s.is_terminal_or_cpqr),
+            (s.products, s.merchants_type),
+            (s.products, s.is_terminal_or_cpqr),
+            (s.merchants_type, s.is_terminal_or_cpqr),
+
+            -- depth 3: три измерения C(4,3)=4 среза
+            (s.geo, s.products, s.merchants_type),
+            (s.geo, s.products, s.is_terminal_or_cpqr),
+            (s.geo, s.merchants_type, s.is_terminal_or_cpqr),
+            (s.products, s.merchants_type, s.is_terminal_or_cpqr),
+
+            -- depth 4: четыре измерения C(4,4)=1 срез
+            (s.geo, s.products, s.merchants_type, s.is_terminal_or_cpqr)
+        )
+);
+
+$total_by_date = (
+    SELECT
+        a.period AS period,
+        a.cal_date AS cal_date,
+        a.gmv AS total_gmv
+    FROM
+        $aggregated AS a
+    WHERE
+        a.slice_depth == 0
+);
+
+$new_rows = (
+    SELECT
+        a.period AS period,
+        a.cal_date AS cal_date,
+        a.slice_depth AS slice_depth,
+        a.geo AS geo,
+        a.products AS products,
+        a.merchants_type AS merchants_type,
+        a.is_terminal_or_cpqr AS is_terminal_or_cpqr,
+        a.gmv AS gmv,
+        a.tx AS tx,
+        a.au AS au,
+        a.am AS am,
+        IF(a.tx > 0, CAST(a.gmv AS Double) / CAST(a.tx AS Double), CAST(NULL AS Double?)) AS aov,
+        IF(a.am > 0, CAST(a.tx AS Double) / CAST(a.am AS Double), CAST(NULL AS Double?)) AS tpm,
+        IF(a.au > 0, CAST(a.tx AS Double) / CAST(a.au AS Double), CAST(NULL AS Double?)) AS freq,
+        IF(t.total_gmv != 0, CAST(a.gmv AS Double) / CAST(t.total_gmv AS Double), CAST(NULL AS Double?)) AS share_in_total_gmv
+    FROM
+        $aggregated AS a
+    LEFT JOIN
+        $total_by_date AS t
+    ON
+        a.period == t.period
+        AND a.cal_date == t.cal_date
+);
+
+-- result
+INSERT INTO $output_table WITH TRUNCATE
+SELECT
+    period,
+    cal_date,
+    slice_depth,
+    geo,
+    products,
+    merchants_type,
+    is_terminal_or_cpqr,
+    gmv,
+    tx,
+    au,
+    am,
+    aov,
+    tpm,
+    freq,
+    share_in_total_gmv
+FROM
+    $new_rows
+;
