@@ -1,0 +1,75 @@
+"""Поиск аномальных GMV-сегментов."""
+
+from .anomaly_scoring import (
+    apply_local_depth_penalty,
+    build_anomaly_candidates,
+    build_atomic_coverage,
+    calculate_segment_anomaly,
+)
+from .config import (
+    CURRENT_CAL_DATE,
+    DIM_COLUMNS,
+    INPUT_PATH,
+    OUTPUT_PATH,
+    PERIOD,
+    SHEET_NAME,
+    THRESHOLDS,
+    TREE_OUTPUT_PATH,
+    AnomalyThresholds,
+)
+from .data_preparation import (
+    build_full_week_grid,
+    build_segment_key_and_level,
+    candidate_covers_atomic,
+    infer_anomaly_dimension_columns,
+    load_history_table,
+    normalize_dim_value,
+    segment_id_from_row,
+)
+from .pipeline import run_anomaly_analysis, run_pipeline
+from .reporting import (
+    build_anomaly_analysis_sheet,
+    build_anomaly_tree_from_excel,
+    build_control_table,
+    build_history_for_selected,
+    build_manager_summary,
+    build_missing_zero_report,
+    highlight_manager_rows_on_anomaly_analysis,
+    write_anomaly_excel,
+)
+from .set_packing import search_anomal, validate_set_packing_solution
+
+__all__ = [
+    "AnomalyThresholds",
+    "CURRENT_CAL_DATE",
+    "DIM_COLUMNS",
+    "INPUT_PATH",
+    "OUTPUT_PATH",
+    "PERIOD",
+    "SHEET_NAME",
+    "THRESHOLDS",
+    "TREE_OUTPUT_PATH",
+    "apply_local_depth_penalty",
+    "build_anomaly_analysis_sheet",
+    "build_anomaly_candidates",
+    "build_anomaly_tree_from_excel",
+    "build_atomic_coverage",
+    "build_control_table",
+    "build_full_week_grid",
+    "build_history_for_selected",
+    "build_manager_summary",
+    "build_missing_zero_report",
+    "build_segment_key_and_level",
+    "calculate_segment_anomaly",
+    "candidate_covers_atomic",
+    "highlight_manager_rows_on_anomaly_analysis",
+    "infer_anomaly_dimension_columns",
+    "load_history_table",
+    "normalize_dim_value",
+    "run_anomaly_analysis",
+    "run_pipeline",
+    "search_anomal",
+    "segment_id_from_row",
+    "validate_set_packing_solution",
+    "write_anomaly_excel",
+]
