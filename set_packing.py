@@ -1,10 +1,20 @@
-"""Maximum Weighted Set Packing ??? ???????????????? GMV-?????????."""
+"""Точный отбор непересекающихся GMV-аномалий через Maximum Weighted Set Packing.
+
+Модуль решает задачу ``max Σ anomaly_score_i × x_i`` при ограничении «каждый
+атомарный сегмент покрыт не более одного раза». Граф конфликтов разбивается на
+независимые компоненты, каждая решается точно: Gurobi, затем SciPy/HiGHS, затем
+собственный branch and bound. Решение принимается только с доказанным статусом
+OPTIMAL в пределах ``set_packing_gap_tolerance``.
+
+Оптимум глобален в пределах множества кандидатов, прошедших первичный фильтр
+аномальности, и допуска solver-а.
+"""
 
 from __future__ import annotations
 
+from collections.abc import Collection, Mapping
 from itertools import combinations
 import math
-import re
 import time
 from typing import Dict, List, Optional, Sequence, Tuple
 
@@ -12,53 +22,8 @@ import pandas as pd
 
 from .anomaly_scoring import _safe_float
 from .config import AnomalyThresholds
-
-
-def _segment_key_parts(segment_key: object) -> List[Tuple[str, str]]:
-    """Разобрать ключ сегмента на пары «признак — значение».
-
-    Args:
-        segment_key: Человекочитаемый ключ сегмента.
-
-    Returns:
-        Список пар `(dimension, value)` в порядке исходного ключа.
-
-    Raises:
-        ValueError: Не выбрасывается.
-
-    Examples:
-        >>> _segment_key_parts("products=FULLPAYMENT × merchants_type=SMB")
-        [('products', 'FULLPAYMENT'), ('merchants_type', 'SMB')]
-    """
-
-    parts: List[Tuple[str, str]] = []
-    for raw_part in re.split(r"\s+(?:x|\u00d7|\u0413\u2014)\s+", str(segment_key)):
-        part = raw_part.strip()
-        if "=" not in part:
-            continue
-        dimension, value = part.split("=", 1)
-        parts.append((dimension.strip(), value.strip()))
-    return parts
-
-
-def _segment_feature_set_from_key(segment_key: object) -> frozenset[Tuple[str, str]]:
-    """ADDED: Восстановить набор признаков сегмента из человекочитаемого ключа.
-
-    Args:
-        segment_key: Значение колонки `segment_key`.
-
-    Returns:
-        Набор пар `(dimension, value)`.
-
-    Raises:
-        ValueError: Не выбрасывается.
-
-    Examples:
-        >>> _segment_feature_set_from_key('geo=RF × product=QR') == frozenset({('geo', 'RF'), ('product', 'QR')})
-        True
-    """
-
-    return frozenset(_segment_key_parts(segment_key))
+# FIXED: Единственный парсер ключа сегмента; локальная копия удалена.
+from .segment_keys import parse_segment_key_parts, segment_feature_set_from_key
 
 
 def _build_coverage_from_segment_keys(candidates: pd.DataFrame) -> Dict[str, frozenset[str]]:
@@ -89,10 +54,22 @@ def _build_coverage_from_segment_keys(candidates: pd.DataFrame) -> Dict[str, fro
     if atomic_df.empty:
         raise ValueError("Физический атомарный слой search_anomal пуст")
 
-    feature_sets = {
-        str(row["segment_id"]): _segment_feature_set_from_key(row.get("segment_key", ""))
-        for _, row in candidates.iterrows()
-    }
+    feature_sets: Dict[str, frozenset[Tuple[str, str]]] = {}
+    for _, row in candidates.iterrows():
+        segment_id = str(row["segment_id"])
+        depth = int(row["slice_depth"])
+        if depth == 0:
+            feature_sets[segment_id] = frozenset()
+            continue
+        parts = parse_segment_key_parts(row.get("segment_key", ""))
+        dimensions = [dimension for dimension, _ in parts]
+        if len(parts) != depth or len(dimensions) != len(set(dimensions)):
+            raise ValueError(
+                "Некорректный segment_key для fallback coverage: "
+                f"segment_id={segment_id}, slice_depth={depth}, "
+                f"parsed_parts={parts}"
+            )
+        feature_sets[segment_id] = frozenset(parts)
     atomic_features = {
         str(row["segment_id"]): feature_sets[str(row["segment_id"])]
         for _, row in atomic_df.iterrows()
@@ -165,43 +142,135 @@ def _validate_set_packing_duplicates(candidates: pd.DataFrame) -> None:
 
 def _prepare_set_packing_coverage(
     candidates: pd.DataFrame,
-    coverage: Optional[Dict[str, frozenset[str]]],
+    coverage: Optional[Mapping[str, Collection[str]]],
+    allow_segment_key_fallback: bool = False,
 ) -> Tuple[Dict[str, frozenset[str]], str, Dict[str, str]]:
     """ADDED: Prepare factual atomic coverage or explicitly marked segment-key fallback.
 
     Args:
         candidates: Candidate table.
         coverage: Optional factual mapping `segment_id -> atomic segment ids`.
+        allow_segment_key_fallback: Явное разрешение восстановить coverage из
+            человекочитаемого ``segment_key``.
 
     Returns:
         Tuple with normalized coverage, coverage source and per-segment validation issue.
 
     Raises:
-        ValueError: If fallback coverage cannot be built from segment keys.
+        ValueError: Если factual coverage не передано без явного fallback,
+            имеет неправильный тип или нарушает атомарные инварианты.
 
     Examples:
-        >>> df = pd.DataFrame([{'segment_id': 'a', 'segment_key': 'x=1', 'slice_depth': 1}])
-        >>> _prepare_set_packing_coverage(df, None)[1]
+        >>> df = pd.DataFrame([{
+        ...     'segment_id': 'a', 'segment_key': 'x=1', 'slice_depth': 1,
+        ...     'passes_initial_anomaly_filter': True,
+        ... }])
+        >>> _prepare_set_packing_coverage(df, None, allow_segment_key_fallback=True)[1]
         'SEGMENT_KEY_FALLBACK'
     """
 
     if coverage is None:
-        return _build_coverage_from_segment_keys(candidates), "SEGMENT_KEY_FALLBACK", {}
+        if not allow_segment_key_fallback:
+            raise ValueError(
+                "Для production-вызова search_anomal требуется factual coverage; "
+                "fallback по segment_key разрешается только через "
+                "allow_segment_key_fallback=True"
+            )
+        coverage = _build_coverage_from_segment_keys(candidates)
+        coverage_source = "SEGMENT_KEY_FALLBACK"
+    else:
+        coverage_source = "FACTUAL_ATOMIC_COVERAGE"
+    if not isinstance(coverage, Mapping):
+        raise ValueError("coverage должен быть mapping segment_id -> collection атомов")
 
     normalized: Dict[str, frozenset[str]] = {}
-    issues: Dict[str, str] = {}
+    validation_errors: List[str] = []
+    candidate_ids = set(candidates["segment_id"].astype(str))
+    extra_segment_ids = sorted(str(segment_id) for segment_id in coverage if str(segment_id) not in candidate_ids)
+    if extra_segment_ids:
+        validation_errors.append(
+            f"coverage содержит неизвестные segment_id: {extra_segment_ids[:10]}"
+        )
+
     for raw_segment_id, raw_atoms in coverage.items():
         segment_id = str(raw_segment_id)
-        atom_list = [str(atom_id).strip() for atom_id in list(raw_atoms or []) if str(atom_id).strip()]
+        if segment_id not in candidate_ids:
+            continue
+        if isinstance(raw_atoms, (str, bytes)) or isinstance(raw_atoms, Mapping):
+            validation_errors.append(
+                f"coverage[{segment_id!r}] должен быть коллекцией атомов, а не "
+                f"{type(raw_atoms).__name__}"
+            )
+            continue
+        if not isinstance(raw_atoms, Collection):
+            validation_errors.append(
+                f"coverage[{segment_id!r}] имеет некорректный тип "
+                f"{type(raw_atoms).__name__}"
+            )
+            continue
+        atom_list = [str(atom_id).strip() for atom_id in raw_atoms]
+        if any(not atom_id for atom_id in atom_list):
+            validation_errors.append(
+                f"coverage[{segment_id!r}] содержит пустой atomic id"
+            )
         if len(atom_list) != len(set(atom_list)):
-            issues[segment_id] = "duplicate atomic ids were removed from coverage"
+            validation_errors.append(
+                f"coverage[{segment_id!r}] содержит дубли atomic ids"
+            )
         normalized[segment_id] = frozenset(atom_list)
 
-    for segment_id in candidates["segment_id"].astype(str).tolist():
+    for segment_id in sorted(candidate_ids):
         if segment_id not in normalized:
+            validation_errors.append(
+                f"coverage отсутствует для segment_id={segment_id}"
+            )
             normalized[segment_id] = frozenset()
-            issues[segment_id] = "coverage is missing for segment_id"
-    return normalized, "FACTUAL_ATOMIC_COVERAGE", issues
+
+    max_depth = int(candidates["slice_depth"].astype(int).max())
+    atomic_ids = set(
+        candidates.loc[
+            candidates["slice_depth"].astype(int).eq(max_depth),
+            "segment_id",
+        ].astype(str)
+    )
+    for segment_id, atoms in normalized.items():
+        unknown_atomic_ids = sorted(atoms - atomic_ids)
+        if unknown_atomic_ids:
+            validation_errors.append(
+                f"coverage[{segment_id!r}] содержит неизвестные атомы: "
+                f"{unknown_atomic_ids[:10]}"
+            )
+    for atomic_id in sorted(atomic_ids):
+        if normalized.get(atomic_id) != frozenset({atomic_id}):
+            validation_errors.append(
+                "Нарушено self-coverage атома: "
+                f"coverage[{atomic_id!r}]={sorted(normalized.get(atomic_id, frozenset()))}"
+            )
+
+    eligible_ids = set(
+        candidates.loc[
+            candidates["passes_initial_anomaly_filter"].eq(True)
+            & candidates["slice_depth"].astype(int).gt(0),
+            "segment_id",
+        ].astype(str)
+    )
+    empty_eligible_ids = sorted(
+        segment_id
+        for segment_id in eligible_ids
+        if not normalized.get(segment_id, frozenset())
+    )
+    if empty_eligible_ids:
+        validation_errors.append(
+            "Eligible-сегменты имеют пустое coverage: "
+            f"{empty_eligible_ids[:10]}"
+        )
+
+    if validation_errors:
+        raise ValueError(
+            "Некорректное атомарное coverage: "
+            + "; ".join(validation_errors[:10])
+        )
+    return normalized, coverage_source, {}
 
 
 def _build_set_packing_conflicts(
@@ -321,6 +390,12 @@ def _build_set_packing_components(
             if left_id in component_segment_ids and right_id in component_segment_ids
         )
         depths = [int(lookup[segment_id]["slice_depth"]) for segment_id in component_segment_ids]
+        component_scores = [
+            float(scores.get(segment_id, 0.0))
+            for segment_id in component_segment_ids
+        ]
+        min_score = min(component_scores)
+        max_score = max(component_scores)
         components.append(
             {
                 "component_id": component_id,
@@ -331,7 +406,13 @@ def _build_set_packing_components(
                 "atom_count": len(component_atom_ids),
                 "min_depth": min(depths),
                 "max_depth": max(depths),
-                "score_sum": float(sum(scores.get(segment_id, 0.0) for segment_id in component_segment_ids)),
+                "score_sum": float(sum(component_scores)),
+                # ADDED: Диагностика численного масштаба objective MILP.
+                "score_min": min_score,
+                "score_max": max_score,
+                "score_dynamic_range": (
+                    max_score / min_score if min_score > 0.0 else math.inf
+                ),
             }
         )
     return components
@@ -425,7 +506,6 @@ def _set_packing_solver_result(
         "variable_count": int(variable_count),
         "constraint_count": int(constraint_count),
         "message": message,
-        "is_optimal": solver_status == "OPTIMAL" and abs(float(absolute_gap)) <= 1e-7,
     }
 
 
@@ -970,6 +1050,9 @@ def _build_set_packing_decision_log(
                 "min_depth": result["min_depth"],
                 "max_depth": result["max_depth"],
                 "score_sum": result["score_sum"],
+                "score_min": result["score_min"],
+                "score_max": result["score_max"],
+                "score_dynamic_range": result["score_dynamic_range"],
                 "selected_ids": " || ".join(sorted(selected_ids, key=lambda sid: _set_packing_canonical_key(sid, lookup))),
                 "message": result.get("message", ""),
             }
@@ -1117,14 +1200,17 @@ def validate_set_packing_solution(
 def search_anomal(
     candidates: pd.DataFrame,
     thresholds: AnomalyThresholds,
-    coverage: Optional[Dict[str, frozenset[str]]] = None,
+    coverage: Optional[Mapping[str, Collection[str]]] = None,
+    allow_segment_key_fallback: bool = False,
 ) -> Tuple[pd.DataFrame, pd.DataFrame, pd.DataFrame]:
     """FIXED: Select anomalies via exact Maximum Weighted Set Packing.
 
     Args:
         candidates: Candidate table after `build_anomaly_candidates`.
         thresholds: Algorithm thresholds; only anomaly filters and set-packing gap tolerance affect selection.
-        coverage: Preferred factual mapping `segment_id -> observed atomic segment ids`.
+        coverage: Factual mapping `segment_id -> observed atomic segment ids`.
+        allow_segment_key_fallback: Явно разрешить менее надёжное восстановление
+            coverage из ``segment_key``, если factual coverage не передано.
 
     Returns:
         Tuple with final selected anomalies, candidate diagnostics and optimization decision log.
@@ -1142,7 +1228,8 @@ def search_anomal(
         "segment_key",
         "slice_depth",
         "passes_initial_anomaly_filter",
-        "robust_z_capped",
+        "robust_z",
+        "abs_robust_z",
         "wow_delta_gmv",
         "anomaly_score",
     }
@@ -1152,13 +1239,36 @@ def search_anomal(
 
     diagnostics = candidates.copy()
     if diagnostics.empty:
+        # FIXED: Обязательность factual coverage действует и для пустого
+        # production-вызова; иначе контракт зависел бы от числа строк.
+        if coverage is None and not allow_segment_key_fallback:
+            raise ValueError(
+                "Для production-вызова search_anomal требуется factual coverage; "
+                "fallback по segment_key разрешается только через "
+                "allow_segment_key_fallback=True"
+            )
+        if coverage is not None:
+            if not isinstance(coverage, Mapping):
+                raise ValueError(
+                    "coverage должен быть mapping segment_id -> collection атомов"
+                )
+            if coverage:
+                raise ValueError(
+                    "Для пустой таблицы candidates factual coverage должен быть пустым"
+                )
         return diagnostics.copy(), diagnostics, _build_set_packing_decision_log([], {}, {}, {}, {}, "EMPTY")
 
     diagnostics["segment_id"] = diagnostics["segment_id"].astype(str)
     diagnostics["segment_key"] = diagnostics["segment_key"].astype(str)
     diagnostics["slice_depth"] = diagnostics["slice_depth"].astype(int)
     _validate_set_packing_duplicates(diagnostics)
-    normalized_coverage, coverage_source, coverage_issues = _prepare_set_packing_coverage(diagnostics, coverage)
+    normalized_coverage, coverage_source, coverage_issues = (
+        _prepare_set_packing_coverage(
+            diagnostics,
+            coverage,
+            allow_segment_key_fallback=allow_segment_key_fallback,
+        )
+    )
 
     string_columns = [
         "action",
@@ -1202,6 +1312,9 @@ def search_anomal(
     diagnostics["set_packing_component_atom_count"] = 0
     diagnostics["set_packing_component_conflict_pair_count"] = 0
     diagnostics["set_packing_component_score_sum"] = 0.0
+    diagnostics["set_packing_component_score_min"] = math.nan
+    diagnostics["set_packing_component_score_max"] = math.nan
+    diagnostics["set_packing_component_score_dynamic_range"] = math.nan
 
     lookup = {
         str(row["segment_id"]): row.copy()
@@ -1328,7 +1441,8 @@ def search_anomal(
         if selected:
             status = "SET_PACKING_SELECTED"
             reason = (
-                f"выбран точной оптимизацией Maximum Weighted Set Packing; component={component_id}; "
+                "выбран оптимизацией Maximum Weighted Set Packing в пределах "
+                f"gap_tolerance={gap_tolerance}; component={component_id}; "
                 f"solver={result['solver_name']}; status={result['solver_status']}"
             )
         elif result["solver_status"] == "OPTIMAL":
@@ -1366,24 +1480,33 @@ def search_anomal(
         diagnostics.at[index, "set_packing_component_atom_count"] = int(result["atom_count"])
         diagnostics.at[index, "set_packing_component_conflict_pair_count"] = int(result["conflict_pair_count"])
         diagnostics.at[index, "set_packing_component_score_sum"] = float(result["score_sum"])
+        diagnostics.at[index, "set_packing_component_score_min"] = float(result["score_min"])
+        diagnostics.at[index, "set_packing_component_score_max"] = float(result["score_max"])
+        diagnostics.at[index, "set_packing_component_score_dynamic_range"] = float(result["score_dynamic_range"])
         diagnostics.at[index, "selected_atomic_descendants"] = " || ".join(atoms) if selected else ""
         diagnostics.at[index, "selected_atomic_count"] = len(atoms) if selected else 0
         diagnostics.at[index, "selection_exclusion_reason"] = "" if selected else reason
 
     diagnostics.loc[diagnostics["set_packing_global_status"].eq(""), "set_packing_global_status"] = global_status
     final_df = diagnostics[diagnostics["selected"].astype(bool)].copy()
+    # FIXED: Сохраняем прежний tie-sort по абсолютному денежному движению без
+    # удалённых aliases abnormal_gmv/abs_abnormal_gmv.
+    final_df["_abs_wow_delta_gmv_sort"] = pd.to_numeric(
+        final_df["wow_delta_gmv"],
+        errors="coerce",
+    ).abs()
     final_df = final_df.sort_values(
         by=[
             "selection_score",
-            "abs_z_capped",
+            "abs_robust_z",
             "materiality_share",
-            "abs_abnormal_gmv",
+            "_abs_wow_delta_gmv_sort",
             "reliability_factor",
             "segment_key",
         ],
         ascending=[False, False, False, False, False, True],
         kind="stable",
-    ).reset_index(drop=True)
+    ).drop(columns=["_abs_wow_delta_gmv_sort"]).reset_index(drop=True)
     final_df.insert(0, "rank", range(1, len(final_df) + 1))
     validate_set_packing_solution(
         final_df,

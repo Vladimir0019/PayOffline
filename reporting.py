@@ -1,9 +1,17 @@
-"""??????????????? ? ???????????? ?????????? ?? GMV-?????????."""
+"""Формирование Excel-отчёта и визуализации по найденным GMV-аномалиям.
+
+Модуль не содержит бизнес-логики отбора аномалий: он только представляет уже
+рассчитанный результат. Excel-контракт состоит из девяти листов и защищён
+регрессионным тестом ``test_pipeline_excel_sheet_contract``. Дополнительно
+строится необязательный DAG-граф сегментов по листу «Анализ аномалий».
+"""
 
 from __future__ import annotations
 
+import json
 import math
 from pathlib import Path
+from textwrap import wrap
 from typing import Dict, List, Optional, Sequence, Tuple
 
 import pandas as pd
@@ -11,7 +19,8 @@ from openpyxl.styles import PatternFill
 
 from .anomaly_scoring import _safe_float
 from .config import AnomalyThresholds, MANAGER_METRIC_PCT_COLUMNS
-from .set_packing import _segment_key_parts
+# FIXED: Общий парсер ключа сегмента вместо приватного имени из set_packing.
+from .segment_keys import parse_segment_key_parts
 
 
 def _format_rub(value: float) -> str:
@@ -32,6 +41,62 @@ def _format_rub(value: float) -> str:
     """
 
     return f"{value:,.0f}".replace(",", " ")
+
+
+# ADDED: Компактная подпись ребёнка без уже показанных родительских срезов.
+def _dominant_child_slice_suffix(parent_segment: object, child_segment: object) -> str:
+    """Вернуть только срезы ребёнка, которых нет у родительского сегмента.
+
+    Args:
+        parent_segment: Человекочитаемый ключ родительского сегмента.
+        child_segment: Человекочитаемый ключ доминирующего ребёнка.
+
+    Returns:
+        Значения добавленных срезов через ``*`` либо пустую строку, если
+        дочерний сегмент не расширяет родительский.
+
+    Raises:
+        ValueError: Не выбрасывается.
+
+    Examples:
+        >>> _dominant_child_slice_suffix(
+        ...     'business=SMB × payment=QR',
+        ...     'business=SMB × payment=QR × country=РФ × product=FULLPAYMENT',
+        ... )
+        'РФ*FULLPAYMENT'
+    """
+
+    parent_parts = set(parse_segment_key_parts(parent_segment))
+    child_parts = parse_segment_key_parts(child_segment)
+    return "*".join(
+        value
+        for part, value in child_parts
+        if (part, value) not in parent_parts
+    )
+
+
+def _wrap_tree_detail_line(value: object, width: int = 34) -> List[str]:
+    """Разбить подпись узла на строки, помещающиеся в карточку графа.
+
+    Args:
+        value: Текст подписи.
+        width: Максимальное число символов в строке.
+
+    Returns:
+        Непустые строки текста, разбитые по заданной ширине.
+
+    Raises:
+        ValueError: Если ``width`` меньше единицы.
+
+    Examples:
+        >>> _wrap_tree_detail_line('РФ*FULLPAYMENT', width=8)
+        ['РФ*FULLP', 'AYMENT']
+    """
+
+    if width < 1:
+        raise ValueError("width должен быть не меньше единицы")
+    text = str(value).strip()
+    return wrap(text, width=width, break_long_words=True, break_on_hyphens=False)
 
 
 def _format_pct(value: object) -> object:
@@ -77,11 +142,15 @@ def build_manager_summary(
         Таблица менеджерского вывода.
 
     Raises:
-        ValueError: Не выбрасывается.
+        ValueError: Если ``max_manager_facts`` меньше единицы.
 
     Examples:
         >>> # manager_df = build_manager_summary(final_df, AnomalyThresholds(), 1000)
     """
+
+    # ADDED: Техническое предусловие обращения к первой строке top-N.
+    if thresholds.max_manager_facts < 1:
+        raise ValueError("max_manager_facts должен быть не меньше 1")
 
     def metric_pct_output(row: Optional[pd.Series] = None) -> Dict[str, object]:
         """Вернуть отформатированные WoW-проценты для менеджерской строки.
@@ -235,15 +304,21 @@ def build_manager_summary(
                 **metric_pct_output(main),
                 "z_score": round(float(main["robust_z"]), 2),
                 "интерпретация": (
-                    f"Фактический GMV сегмента {'выше' if float(main['abnormal_gmv']) > 0 else 'ниже'} ожидаемого уровня"
+                    "GMV сегмента "
+                    f"{'вырос' if float(main['wow_delta_gmv']) > 0 else 'снизился'} "
+                    "относительно предыдущего периода"
                 ),
             }
         )
 
         for _, row in top.iterrows():
-            direction = "выше" if float(row["abnormal_gmv"]) > 0 else "ниже"
+            direction = (
+                "вырос"
+                if float(row["wow_delta_gmv"]) > 0
+                else "снизился"
+            )
             interpretation = (
-                f"Фактический GMV сегмента {direction} ожидаемого уровня"
+                f"GMV сегмента {direction} относительно предыдущего периода"
             )
             rows.append(
                 {
@@ -469,11 +544,30 @@ def build_anomaly_analysis_sheet(candidates: pd.DataFrame, final_df: pd.DataFram
         "сегмент",
         "глубина",
         "z_scope",
+        "z_scale_source",
+        "z_uses_sigma_floor",
         "base_anomaly_score",
-        "depth_score_weight",
-        "local_max_eligible_depth",
-        "local_depth_gap",
-        "eligible_descendant_count",
+        "hierarchy_eligible_descendant_count",
+        "hierarchy_group_count",
+        "hierarchy_best_group_size",
+        "hierarchy_best_group_ids_json",
+        "hierarchy_best_group_segment_keys",
+        "hierarchy_best_group_score",
+        "hierarchy_direction_unity",
+        "hierarchy_dominant_share",
+        "hierarchy_balance_max",
+        "hierarchy_balance_effective",
+        "hierarchy_balance",
+        "hierarchy_coherence",
+        "hierarchy_coherence_adjustment",
+        "hierarchy_single_child_capture",
+        "hierarchy_single_child_direction_match",
+        "hierarchy_single_child_uncapped_score",
+        "hierarchy_dominance_cap_score",
+        "hierarchy_dominance_rule_matches",
+        "hierarchy_dominance_cap_applied",
+        "hierarchy_dominant_child_segment",
+        "hierarchy_score_factor",
         "anomaly_score",
         "выбран",
         "разрешён",
@@ -485,6 +579,9 @@ def build_anomaly_analysis_sheet(candidates: pd.DataFrame, final_df: pd.DataFram
         "set_packing_solver_status",
         "set_packing_abs_gap",
         "set_packing_rel_gap",
+        "set_packing_component_score_min",
+        "set_packing_component_score_max",
+        "set_packing_component_score_dynamic_range",
         "conflict_count",
         "conflict_segment_keys",
         "selected_atomic_count",
@@ -497,12 +594,120 @@ def build_anomaly_analysis_sheet(candidates: pd.DataFrame, final_df: pd.DataFram
 
     initial_anomaly_mask = (
         candidates["passes_initial_anomaly_filter"].eq(True)
-        & candidates["abs_abnormal_gmv"].astype(float).ge(thresholds.min_anomaly_abs)
+        & candidates["wow_delta_gmv"].astype(float).abs().ge(
+            thresholds.min_anomaly_abs
+        )
     )
     analysis_mask = initial_anomaly_mask
     analysis = candidates[analysis_mask].copy()
     if analysis.empty:
         return pd.DataFrame(columns=columns)
+
+    # ADDED: В граф передаётся человекочитаемый ключ ребёнка, а не его ID.
+    segment_key_by_id = (
+        candidates.assign(segment_id=candidates["segment_id"].astype(str))
+        .set_index("segment_id")["segment_key"]
+        .astype(str)
+        .to_dict()
+    )
+
+    def dominance_rule_matches(row: pd.Series) -> bool:
+        """Проверить выполнение правила доминирующего ребёнка.
+
+        Args:
+            row: Строка кандидата из диагностики.
+
+        Returns:
+            ``True``, если единственный ребёнок объясняет достаточную долю
+            движения родителя и направление изменения совпадает.
+
+        Raises:
+            ValueError: Не выбрасывается.
+
+        Examples:
+            >>> dominance_rule_matches(pd.Series({'hierarchy_best_group_size': 0}))
+            False
+        """
+
+        best_group_size = _safe_float(
+            row.get("hierarchy_best_group_size"),
+            math.nan,
+        )
+        capture = _safe_float(
+            row.get("hierarchy_single_child_capture"),
+            math.nan,
+        )
+        direction_value = row.get(
+            "hierarchy_single_child_direction_match",
+            False,
+        )
+        # FIXED: После round-trip через Excel boolean читается как ``1.0``.
+        direction_match = (
+            str(direction_value).strip().lower() in {"true", "1", "yes"}
+            or _safe_float(direction_value, 0.0) == 1.0
+        )
+        return (
+            best_group_size == 1.0
+            and math.isfinite(capture)
+            and capture >= float(thresholds.dominant_child_capture_threshold)
+            and direction_match
+        )
+
+    def dominant_child_segment(row: pd.Series) -> str:
+        """Вернуть ключ ребёнка, объясняющего родительский сегмент.
+
+        Args:
+            row: Строка кандидата из диагностики.
+
+        Returns:
+            Человекочитаемый ключ доминирующего ребёнка или пустая строка.
+
+        Raises:
+            ValueError: Не выбрасывается.
+
+        Examples:
+            >>> dominant_child_segment(pd.Series({'hierarchy_best_group_size': 0}))
+            ''
+        """
+
+        if not dominance_rule_matches(row):
+            return ""
+        # FIXED: Технические ID читаются из однозначного JSON-массива.
+        try:
+            group_ids = json.loads(
+                str(row.get("hierarchy_best_group_ids_json", "[]"))
+            )
+        except (TypeError, ValueError, json.JSONDecodeError):
+            return ""
+        if not isinstance(group_ids, list) or len(group_ids) != 1:
+            return ""
+        child_id = str(group_ids[0]).strip()
+        return str(segment_key_by_id.get(child_id, "")) if child_id else ""
+
+    analysis["hierarchy_dominant_child_segment"] = analysis.apply(
+        dominant_child_segment,
+        axis=1,
+    )
+    # ADDED: Отделяем выполнение правила от факта урезания score родителя.
+    analysis["hierarchy_dominance_rule_matches"] = analysis.apply(
+        dominance_rule_matches,
+        axis=1,
+    )
+    # ADDED: В отчёт выводится только добавка ``lambda * (coherence - 0.5)``.
+    best_group_sizes = pd.to_numeric(
+        analysis.get("hierarchy_best_group_size", pd.Series(0, index=analysis.index)),
+        errors="coerce",
+    )
+    coherence = pd.to_numeric(
+        analysis.get("hierarchy_coherence", pd.Series(math.nan, index=analysis.index)),
+        errors="coerce",
+    )
+    analysis["hierarchy_coherence_adjustment"] = math.nan
+    multi_child_mask = best_group_sizes.gt(1) & coherence.notna()
+    analysis.loc[multi_child_mask, "hierarchy_coherence_adjustment"] = (
+        float(thresholds.aggregation_bonus_lambda)
+        * (coherence.loc[multi_child_mask] - 0.5)
+    )
 
     selected_ids = set(final_df["segment_id"].astype(str).tolist()) if not final_df.empty else set()
     manager_ids = (
@@ -555,27 +760,113 @@ def build_anomaly_analysis_sheet(candidates: pd.DataFrame, final_df: pd.DataFram
         {
             "сегмент": analysis["segment_key"].astype(str),
             "глубина": analysis["slice_depth"].astype(int),
-            "z_scope": analysis["robust_z_capped"].astype(float).round(2),
+            "z_scope": analysis["robust_z"].astype(float).round(2),
+            "z_scale_source": analysis.get(
+                "z_scale_source", pd.Series("", index=analysis.index)
+            ).astype(str),
+            "z_uses_sigma_floor": analysis.get(
+                "z_uses_sigma_floor", pd.Series(False, index=analysis.index)
+            ).astype(bool),
             "base_anomaly_score": pd.to_numeric(
                 analysis.get("base_anomaly_score", pd.Series(math.nan, index=analysis.index)),
                 errors="coerce",
             ),
-            "depth_score_weight": pd.to_numeric(
-                analysis.get("depth_score_weight", pd.Series(math.nan, index=analysis.index)),
+            "hierarchy_eligible_descendant_count": pd.to_numeric(
+                analysis.get(
+                    "hierarchy_eligible_descendant_count",
+                    pd.Series(0, index=analysis.index),
+                ),
+                errors="coerce",
+            ).fillna(0).astype(int),
+            "hierarchy_group_count": pd.to_numeric(
+                analysis.get("hierarchy_group_count", pd.Series(0, index=analysis.index)),
+                errors="coerce",
+            ).fillna(0).astype(int),
+            "hierarchy_best_group_size": pd.to_numeric(
+                analysis.get("hierarchy_best_group_size", pd.Series(0, index=analysis.index)),
+                errors="coerce",
+            ).fillna(0).astype(int),
+            "hierarchy_best_group_ids_json": analysis.get(
+                "hierarchy_best_group_ids_json", pd.Series("[]", index=analysis.index)
+            ).astype(str),
+            "hierarchy_best_group_segment_keys": analysis.get(
+                "hierarchy_best_group_segment_keys",
+                pd.Series("[]", index=analysis.index),
+            ).astype(str),
+            "hierarchy_best_group_score": pd.to_numeric(
+                analysis.get("hierarchy_best_group_score", pd.Series(0.0, index=analysis.index)),
                 errors="coerce",
             ),
-            "local_max_eligible_depth": pd.to_numeric(
-                analysis.get("local_max_eligible_depth", pd.Series(pd.NA, index=analysis.index)),
+            "hierarchy_direction_unity": pd.to_numeric(
+                analysis.get("hierarchy_direction_unity", pd.Series(math.nan, index=analysis.index)),
                 errors="coerce",
-            ).astype("Int64"),
-            "local_depth_gap": pd.to_numeric(
-                analysis.get("local_depth_gap", pd.Series(pd.NA, index=analysis.index)),
+            ),
+            "hierarchy_dominant_share": pd.to_numeric(
+                analysis.get("hierarchy_dominant_share", pd.Series(math.nan, index=analysis.index)),
                 errors="coerce",
-            ).astype("Int64"),
-            "eligible_descendant_count": pd.to_numeric(
-                analysis.get("eligible_descendant_count", pd.Series(pd.NA, index=analysis.index)),
+            ),
+            "hierarchy_balance_max": pd.to_numeric(
+                analysis.get("hierarchy_balance_max", pd.Series(math.nan, index=analysis.index)),
                 errors="coerce",
-            ).astype("Int64"),
+            ),
+            "hierarchy_balance_effective": pd.to_numeric(
+                analysis.get("hierarchy_balance_effective", pd.Series(math.nan, index=analysis.index)),
+                errors="coerce",
+            ),
+            "hierarchy_balance": pd.to_numeric(
+                analysis.get("hierarchy_balance", pd.Series(math.nan, index=analysis.index)),
+                errors="coerce",
+            ),
+            "hierarchy_coherence": pd.to_numeric(
+                analysis.get("hierarchy_coherence", pd.Series(math.nan, index=analysis.index)),
+                errors="coerce",
+            ),
+            "hierarchy_coherence_adjustment": pd.to_numeric(
+                analysis.get(
+                    "hierarchy_coherence_adjustment",
+                    pd.Series(math.nan, index=analysis.index),
+                ),
+                errors="coerce",
+            ),
+            "hierarchy_single_child_capture": pd.to_numeric(
+                analysis.get(
+                    "hierarchy_single_child_capture",
+                    pd.Series(math.nan, index=analysis.index),
+                ),
+                errors="coerce",
+            ),
+            "hierarchy_single_child_direction_match": analysis.get(
+                "hierarchy_single_child_direction_match",
+                pd.Series(pd.NA, index=analysis.index, dtype="boolean"),
+            ).astype("boolean"),
+            "hierarchy_single_child_uncapped_score": pd.to_numeric(
+                analysis.get(
+                    "hierarchy_single_child_uncapped_score",
+                    pd.Series(math.nan, index=analysis.index),
+                ),
+                errors="coerce",
+            ),
+            "hierarchy_dominance_cap_score": pd.to_numeric(
+                analysis.get(
+                    "hierarchy_dominance_cap_score",
+                    pd.Series(math.nan, index=analysis.index),
+                ),
+                errors="coerce",
+            ),
+            "hierarchy_dominance_rule_matches": analysis[
+                "hierarchy_dominance_rule_matches"
+            ].astype(bool),
+            "hierarchy_dominance_cap_applied": analysis.get(
+                "hierarchy_dominance_cap_applied",
+                pd.Series(False, index=analysis.index),
+            ).astype(bool),
+            "hierarchy_dominant_child_segment": analysis[
+                "hierarchy_dominant_child_segment"
+            ],
+            "hierarchy_score_factor": pd.to_numeric(
+                analysis.get("hierarchy_score_factor", pd.Series(1.0, index=analysis.index)),
+                errors="coerce",
+            ),
             "anomaly_score": analysis["anomaly_score"].astype(float),
             "выбран": analysis.get(
                 "selected", pd.Series(False, index=analysis.index)
@@ -607,6 +898,27 @@ def build_anomaly_analysis_sheet(candidates: pd.DataFrame, final_df: pd.DataFram
             ),
             "set_packing_rel_gap": pd.to_numeric(
                 analysis.get("set_packing_rel_gap", pd.Series(math.nan, index=analysis.index)),
+                errors="coerce",
+            ),
+            "set_packing_component_score_min": pd.to_numeric(
+                analysis.get(
+                    "set_packing_component_score_min",
+                    pd.Series(math.nan, index=analysis.index),
+                ),
+                errors="coerce",
+            ),
+            "set_packing_component_score_max": pd.to_numeric(
+                analysis.get(
+                    "set_packing_component_score_max",
+                    pd.Series(math.nan, index=analysis.index),
+                ),
+                errors="coerce",
+            ),
+            "set_packing_component_score_dynamic_range": pd.to_numeric(
+                analysis.get(
+                    "set_packing_component_score_dynamic_range",
+                    pd.Series(math.nan, index=analysis.index),
+                ),
                 errors="coerce",
             ),
             "conflict_count": pd.to_numeric(
@@ -1079,12 +1391,17 @@ def build_anomaly_tree_from_excel(
         )
 
     nodes = analysis.copy()
+    # FIXED: Граф больше не использует диагностические причины set packing.
     optional_tree_columns = [
-        "set_packing_status",
-        "set_packing_reason",
-        "set_packing_component_id",
-        "set_packing_solver_status",
+        # FIXED: Поле ниже используется при нормализации, но отсутствует в
+        # минимальном контракте листа «Анализ аномалий».
         "conflict_count",
+        "hierarchy_best_group_size",
+        "hierarchy_best_group_segment_keys",
+        "hierarchy_coherence_adjustment",
+        "hierarchy_dominance_rule_matches",
+        "hierarchy_dominance_cap_applied",
+        "hierarchy_dominant_child_segment",
         "номер добавления в менеджерский вывод",
     ]
     for column in optional_tree_columns:
@@ -1116,7 +1433,7 @@ def build_anomaly_tree_from_excel(
         f"depth={int(depth)}|segment={segment}"
         for depth, segment in zip(nodes["глубина"], nodes["сегмент"])
     ]
-    nodes["parts"] = nodes["сегмент"].map(_segment_key_parts)
+    nodes["parts"] = nodes["сегмент"].map(parse_segment_key_parts)
     nodes["feature_set"] = nodes["parts"].map(frozenset)
 
     def clean_tree_value(value: object) -> str:
@@ -1142,44 +1459,88 @@ def build_anomaly_tree_from_excel(
         return "" if text.lower() in {"", "nan", "<na>", "none"} else text
 
     def build_tree_detail_lines(row: pd.Series) -> List[str]:
-        """Собрать дополнительные строки для не-менеджерского узла.
+        """Собрать детали иерархической корректировки score для узла.
 
         Args:
             row: Строка узла из листа анализа аномалий.
 
         Returns:
-            Список строк со статусом оптимизационного выбора.
+            Строки с объясняющими детьми либо пустой список.
 
         Raises:
             ValueError: Не выбрасывается.
 
         Examples:
-            >>> build_tree_detail_lines(pd.Series({'номер добавления в менеджерский вывод': 1}))
+            >>> build_tree_detail_lines(pd.Series({'hierarchy_best_group_size': 0}))
             []
         """
 
-        if not pd.isna(row.get("номер добавления в менеджерский вывод")):
+        rule_matches = clean_tree_value(
+            row.get("hierarchy_dominance_rule_matches")
+        )
+        # FIXED: Excel читает boolean-колонки как ``1.0``/``0.0``.
+        rule_matches_flag = (
+            rule_matches.lower() in {"true", "1", "yes"}
+            or _safe_float(rule_matches, 0.0) == 1.0
+        )
+        if rule_matches_flag:
+            child_segment = clean_tree_value(
+                row.get("hierarchy_dominant_child_segment")
+            )
+            child_suffix = _dominant_child_slice_suffix(
+                row.get("сегмент", ""),
+                child_segment,
+            )
+            cap_applied = clean_tree_value(
+                row.get("hierarchy_dominance_cap_applied")
+            )
+            cap_applied_flag = (
+                cap_applied.lower() in {"true", "1", "yes"}
+                or _safe_float(cap_applied, 0.0) == 1.0
+            )
+            label = (
+                "Доминирующий ребенок cut:"
+                if cap_applied_flag
+                else "Доминирующий ребенок:"
+            )
+            return [label, *_wrap_tree_detail_line(child_suffix)] if child_suffix else []
+
+        adjustment = _safe_float(
+            row.get("hierarchy_coherence_adjustment"),
+            math.nan,
+        )
+        group_segments_text = clean_tree_value(
+            row.get("hierarchy_best_group_segment_keys")
+        )
+        try:
+            group_segments = json.loads(group_segments_text)
+        except (TypeError, ValueError, json.JSONDecodeError):
+            group_segments = []
+        if not math.isfinite(adjustment) or not isinstance(group_segments, list):
             return []
-        lines: List[str] = []
-        status = clean_tree_value(row.get("set_packing_status"))
-        reason = clean_tree_value(row.get("set_packing_reason"))
-        component_id = clean_tree_value(row.get("set_packing_component_id"))
-        solver_status = clean_tree_value(row.get("set_packing_solver_status"))
-        conflict_count = int(row.get("conflict_count", 0) or 0)
-        if status:
-            lines.append(status)
-        if component_id:
-            lines.append(f"component={component_id}")
-        if solver_status:
-            lines.append(f"solver={solver_status}")
-        if conflict_count:
-            lines.append(f"conflicts={conflict_count}")
-        if reason:
-            lines.append(reason[:60].rstrip() + ("…" if len(reason) > 60 else ""))
-        return lines[:5]
+
+        lines = [f"Δ score factor: {adjustment:+.3f}"]
+        for child_segment in group_segments:
+            child_suffix = _dominant_child_slice_suffix(
+                row.get("сегмент", ""),
+                child_segment,
+            )
+            if child_suffix:
+                lines.extend(_wrap_tree_detail_line(child_suffix))
+        return lines if len(lines) > 1 else []
 
     nodes["is_manager_output"] = nodes["номер добавления в менеджерский вывод"].notna()
     nodes["tree_detail_lines"] = nodes.apply(build_tree_detail_lines, axis=1)
+    # ADDED: Перечёркиваем ровно те карточки, в которых показан статус
+    # доминирующего ребёнка, включая вариант с применённым cap.
+    dominant_child_status_labels = {
+        "Доминирующий ребенок:",
+        "Доминирующий ребенок cut:",
+    }
+    nodes["has_dominant_child"] = nodes["tree_detail_lines"].map(
+        lambda lines: bool(lines)
+        and str(lines[0]).strip() in dominant_child_status_labels
+    )
 
     records = {
         str(row["node_id"]): row.to_dict()
@@ -1553,6 +1914,31 @@ def build_anomaly_tree_from_excel(
                 va="bottom",
                 zorder=4,
             )
+            if bool(node.get("has_dominant_child", False)):
+                # ADDED: Полупрозрачный крест поверх всей карточки визуально
+                # помечает сегмент, аномалию которого объясняет один ребёнок.
+                cross_inset = 0.05
+                cross_style = {
+                    "color": "#5f6764",
+                    "linewidth": 7.0,
+                    "alpha": 0.42,
+                    "solid_capstyle": "round",
+                    "zorder": 4.5,
+                }
+                axis.add_line(
+                    Line2D(
+                        [left + cross_inset, left + node_width - cross_inset],
+                        [bottom + cross_inset, bottom + node_height - cross_inset],
+                        **cross_style,
+                    )
+                )
+                axis.add_line(
+                    Line2D(
+                        [left + cross_inset, left + node_width - cross_inset],
+                        [bottom + node_height - cross_inset, bottom + cross_inset],
+                        **cross_style,
+                    )
+                )
             sequence += 1
 
     figure.suptitle(
@@ -1633,7 +2019,21 @@ def write_anomaly_excel(
             ("min_z_score", thresholds.min_z_score),
             ("min_materiality_share", thresholds.min_materiality_share),
             ("sigma_floor", thresholds.sigma_floor),
-            ("z_cap", thresholds.z_cap),
+            ("lifecycle_z_score", thresholds.lifecycle_z_score),
+            (
+                "hierarchy_reconciliation_abs_tolerance",
+                thresholds.hierarchy_reconciliation_abs_tolerance,
+            ),
+            ("aggregation_bonus_lambda", thresholds.aggregation_bonus_lambda),
+            ("single_child_factor", thresholds.single_child_factor),
+            (
+                "dominant_child_capture_threshold",
+                thresholds.dominant_child_capture_threshold,
+            ),
+            (
+                "dominant_child_score_margin",
+                thresholds.dominant_child_score_margin,
+            ),
             ("set_packing_gap_tolerance", thresholds.set_packing_gap_tolerance),
             ("max_exact_fallback_size", thresholds.max_exact_fallback_size),
             ("current_cal_date", int(current_cal_date)),
@@ -1662,17 +2062,32 @@ def write_anomaly_excel(
         "share_delta_current",
         "baseline_relative_growth",
         "robust_z",
-        "robust_z_capped",
+        "abs_robust_z",
+        "z_scale_source",
+        "z_uses_sigma_floor",
         "materiality_share",
         "gross_atomic_movement",
         "base_anomaly_score",
-        "depth_score_weight",
-        "local_max_eligible_depth",
-        "local_depth_gap",
-        "eligible_descendant_count",
+        "hierarchy_eligible_descendant_count",
+        "hierarchy_group_count",
+        "hierarchy_best_group_size",
+        "hierarchy_best_group_ids_json",
+        "hierarchy_best_group_segment_keys",
+        "hierarchy_best_group_score",
+        "hierarchy_direction_unity",
+        "hierarchy_dominant_share",
+        "hierarchy_balance_max",
+        "hierarchy_balance_effective",
+        "hierarchy_balance",
+        "hierarchy_coherence",
+        "hierarchy_coherence_adjustment",
+        "hierarchy_single_child_capture",
+        "hierarchy_single_child_direction_match",
+        "hierarchy_single_child_uncapped_score",
+        "hierarchy_dominance_cap_score",
+        "hierarchy_dominance_cap_applied",
+        "hierarchy_score_factor",
         "anomaly_score",
-        "abnormal_gmv",
-        "abs_abnormal_gmv",
         "selection_score",
         "reliability_factor",
         "history_nonzero_weeks",
@@ -1692,6 +2107,9 @@ def write_anomaly_excel(
         "set_packing_solve_time_sec",
         "set_packing_variable_count",
         "set_packing_constraint_count",
+        "set_packing_component_score_min",
+        "set_packing_component_score_max",
+        "set_packing_component_score_dynamic_range",
         "conflict_count",
         "conflict_segment_ids",
         "conflict_segment_keys",

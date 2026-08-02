@@ -1,10 +1,11 @@
 """Поиск аномальных GMV-сегментов."""
 
 from .anomaly_scoring import (
-    apply_local_depth_penalty,
+    apply_hierarchy_score_adjustment,
     build_anomaly_candidates,
     build_atomic_coverage,
     calculate_segment_anomaly,
+    validate_hierarchy_reconciliation,
 )
 from .config import (
     CURRENT_CAL_DATE,
@@ -24,6 +25,7 @@ from .data_preparation import (
     infer_anomaly_dimension_columns,
     load_history_table,
     normalize_dim_value,
+    period_to_weeks,
     segment_id_from_row,
 )
 from .pipeline import run_anomaly_analysis, run_pipeline
@@ -49,7 +51,7 @@ __all__ = [
     "SHEET_NAME",
     "THRESHOLDS",
     "TREE_OUTPUT_PATH",
-    "apply_local_depth_penalty",
+    "apply_hierarchy_score_adjustment",
     "build_anomaly_analysis_sheet",
     "build_anomaly_candidates",
     "build_anomaly_tree_from_excel",
@@ -66,10 +68,12 @@ __all__ = [
     "infer_anomaly_dimension_columns",
     "load_history_table",
     "normalize_dim_value",
+    "period_to_weeks",
     "run_anomaly_analysis",
     "run_pipeline",
     "search_anomal",
     "segment_id_from_row",
     "validate_set_packing_solution",
+    "validate_hierarchy_reconciliation",
     "write_anomaly_excel",
 ]
