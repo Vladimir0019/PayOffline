@@ -8,7 +8,7 @@ from typing import Dict, Optional, Sequence
 import pandas as pd
 
 from .anomaly_scoring import (
-    apply_local_depth_penalty,
+    apply_hierarchy_score_adjustment,
     build_anomaly_candidates,
     build_atomic_coverage,
 )
@@ -27,7 +27,8 @@ def run_anomaly_analysis(
     input_path: str | Path,
     output_path: str | Path,
     sheet_name: int | str = 0,
-    period: Optional[str] = "1W",
+    *,
+    period: str,
     dim_cols: Optional[Sequence[str]] = None,
     current_cal_date: Optional[int] = None,
     thresholds: Optional[AnomalyThresholds] = None,
@@ -39,7 +40,7 @@ def run_anomaly_analysis(
         input_path: Путь к входному файлу.
         output_path: Путь к итоговому Excel-файлу.
         sheet_name: Имя или номер листа Excel.
-        period: Период для фильтрации.
+        period: Обязательный период для фильтрации в формате ``<N>W``.
         dim_cols: Явно заданные признаки.
         current_cal_date: Анализируемая неделя. Если None, берётся последняя.
         thresholds: Пороги алгоритма. Если None, используются значения по умолчанию.
@@ -62,9 +63,30 @@ def run_anomaly_analysis(
     history_df, dims, dates = load_history_table(input_path, sheet_name=sheet_name, period=period, dim_cols=dim_cols)
     current = int(current_cal_date) if current_cal_date is not None else int(dates[-1])
     panel_df = build_full_week_grid(history_df, dims, dates)
-    candidates, total_by_date = build_anomaly_candidates(panel_df, dims, dates, thresholds, current)
-    coverage = build_atomic_coverage(candidates, dims)
-    candidates = apply_local_depth_penalty(candidates, coverage)
+    # FIXED: Покрытие считается один раз по metadata панели и переиспользуется
+    # сверкой иерархии, hierarchy-корректировкой и Set Packing.
+    segment_metadata = panel_df.drop_duplicates(subset=["segment_id"]).reset_index(drop=True)
+    coverage = build_atomic_coverage(segment_metadata, dims)
+    candidates, total_by_date = build_anomaly_candidates(
+        panel_df,
+        dims,
+        dates,
+        thresholds,
+        current,
+        coverage=coverage,
+    )
+    # REMOVED: Штраф за расстояние до eligible-глубины заменён hierarchy coherence.
+    candidates = apply_hierarchy_score_adjustment(
+        candidates,
+        coverage,
+        aggregation_bonus_lambda=thresholds.aggregation_bonus_lambda,
+        single_child_factor=thresholds.single_child_factor,
+        dominant_child_capture_threshold=(
+            thresholds.dominant_child_capture_threshold
+        ),
+        dominant_child_score_margin=thresholds.dominant_child_score_margin,
+        max_hierarchy_descendants=thresholds.max_hierarchy_descendants,
+    )
     final_df, diagnostics, optimization_decision_log = search_anomal(candidates, thresholds, coverage=coverage)
     manager_df = build_manager_summary(final_df, thresholds, float(total_by_date.loc[current]), diagnostics)
     write_anomaly_excel(

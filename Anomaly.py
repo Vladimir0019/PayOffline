@@ -9,10 +9,11 @@ from __future__ import annotations
 from .anomaly_scoring import (
     _history_reliability,
     _safe_float,
-    apply_local_depth_penalty,
+    apply_hierarchy_score_adjustment,
     build_anomaly_candidates,
     build_atomic_coverage,
     calculate_segment_anomaly,
+    validate_hierarchy_reconciliation,
 )
 from .config import (
     ANOMALY_TECH_COLUMNS,
@@ -39,6 +40,7 @@ from .data_preparation import (
     infer_anomaly_dimension_columns,
     load_history_table,
     normalize_dim_value,
+    period_to_weeks,
     segment_id_from_row,
 )
 from .pipeline import run_anomaly_analysis, run_pipeline
@@ -56,6 +58,12 @@ from .reporting import (
     highlight_manager_rows_on_anomaly_analysis,
     write_anomaly_excel,
 )
+# FIXED: Парсер ключа переехал в segment_keys.py; прежние приватные имена
+# сохранены как aliases, чтобы не сломать внешний код.
+from .segment_keys import (
+    parse_segment_key_parts as _segment_key_parts,
+    segment_feature_set_from_key as _segment_feature_set_from_key,
+)
 from .set_packing import (
     _build_coverage_from_segment_keys,
     _build_set_packing_components,
@@ -63,8 +71,6 @@ from .set_packing import (
     _build_set_packing_decision_log,
     _component_atom_to_segments,
     _prepare_set_packing_coverage,
-    _segment_feature_set_from_key,
-    _segment_key_parts,
     _set_packing_canonical_key,
     _set_packing_result_is_proven_optimal,
     _set_packing_solver_result,
@@ -94,7 +100,7 @@ __all__ = [
     "THRESHOLDS",
     "TREE_OUTPUT_PATH",
     "AnomalyThresholds",
-    "apply_local_depth_penalty",
+    "apply_hierarchy_score_adjustment",
     "build_anomaly_analysis_sheet",
     "build_anomaly_candidates",
     "build_anomaly_tree_from_excel",
@@ -112,11 +118,13 @@ __all__ = [
     "load_history_table",
     "main",
     "normalize_dim_value",
+    "period_to_weeks",
     "run_anomaly_analysis",
     "run_pipeline",
     "search_anomal",
     "segment_id_from_row",
     "validate_set_packing_solution",
+    "validate_hierarchy_reconciliation",
     "write_anomaly_excel",
 ]
 
