@@ -1,0 +1,342 @@
+-- FIXED: скрипт формирует иерархическую витрину GMV для 1W, 4W и 13W.
+-- Типы мерчантов разделяются на TOP-5 по captured-обороту предыдущих
+-- до 12 доступных полных периодов без текущего интервала и категорию «Прочее».
+-- все уровни детализации по четырём измерениям и рассчитываются GMV, TX, AU, AM,
+-- AOV, TPM, Freq и доля сегмента в общем GMV.
+-- !!!!!! Важные моменты: !!!!!!
+-- 1. Состав TOP-5 меняется между запусками
+-- TOP-5 пересчитывается отдельно для каждого периода по предыдущим
+-- максимум 12 доступным полным интервалам.
+-- Поэтому один merchant может быть отдельной категорией в 1W и попасть в «Прочее» в 4W/13W.
+-- 2. Пропущенные значения в $source_table заменяются на Unknown, в противном случае алгоритм сломается. Unknown может отражать проблему качества данных
+-- После замены NULL на Unknown структура срезов становится корректной, но рост сегмента:
+-- geo=Unknown
+-- может означать не бизнес-аномалию, а ухудшение заполненности источника.
+-- Такие сегменты желательно отдельно маркировать как data-quality anomalies.
+USE hahn;
+
+PRAGMA AnsiInForEmptyOrNullableItemsCollections;
+PRAGMA OrderedColumns;
+PRAGMA SimpleColumns;
+PRAGMA DqEngine = 'disable';
+PRAGMA GroupByLimit = '400';
+
+-- input
+$source_table = '//home/fdt/payoffline/projects/qr_yandex_pay/bi/payoffline_pulse_raw';
+$output_table = '//home/fdt/payoffline/projects/qr_yandex_pay/bi/payoffline_pulse_hier';
+$history_periods = 13;
+$top_merchants_history_periods = 12;
+
+-- ADDED: единый справочник поддерживаемых периодов.
+$periods = (
+    SELECT
+        *
+    FROM
+        AS_TABLE(AsList(
+            AsStruct('1W' AS period, 7 AS period_days),
+            AsStruct('4W' AS period, 28 AS period_days),
+            AsStruct('13W' AS period, 91 AS period_days)
+        ))
+);
+
+-- ADDED: фактическая левая граница данных отдельно для каждого периода.
+$source_bounds = (
+    SELECT
+        CAST(s.period AS String) AS period,
+        MIN(CAST(s.created_at AS Date)) AS min_source_date,
+        MAX(CAST(s.created_at AS Date)) AS max_source_date
+    FROM
+        $source_table AS s
+    INNER JOIN
+        $periods AS p
+    ON
+        CAST(s.period AS String) == p.period
+    GROUP BY
+        s.period
+);
+
+-- ADDED: оставляем не более 13 периодов и только полностью покрытые интервалы.
+-- cal_date — конец интервала, поэтому проверяем доступность обеих границ:
+-- cal_date - (period_days - 1) и сам cal_date.
+$source_complete_periods = (
+    SELECT
+        CAST(r.period AS String) AS period,
+        p.period_days AS period_days,
+        CAST(r.cal_date_index AS Int64) AS cal_date_index,
+        CAST(r.cal_date AS Date) AS cal_date,
+        r.geo AS geo,
+        r.products AS products,
+        r.merchants_type AS merchants_type,
+        r.is_terminal_or_cpqr AS is_terminal_or_cpqr,
+        r.users_newness AS users_newness,
+        r.user_cohort AS user_cohort,
+        r.status AS status,
+        r.amount AS amount,
+        r.checkout_order_id AS checkout_order_id,
+        r.phone_token AS phone_token,
+        r.merchant_id AS merchant_id,
+        r.payment_method AS payment_method,
+        r.credlim_flg AS credlim_flg,
+        r.refunds_cnt_payment_id AS refunds_cnt_payment_id,
+        r.appmetrika3_qr_qrc_id AS appmetrika3_qr_qrc_id,
+        r.start_user_agent_media AS start_user_agent_media,
+        r.start_media AS start_media,
+        r.tips_show_staff_cnt AS tips_show_staff_cnt,
+        r.tips_recive_amount_sum AS tips_recive_amount_sum,
+        r.cashback_amount AS cashback_amount
+    FROM
+        $source_table AS r
+    INNER JOIN
+        $periods AS p
+    ON
+        CAST(r.period AS String) == p.period
+    INNER JOIN
+        $source_bounds AS b
+    ON
+        CAST(r.period AS String) == b.period
+    WHERE
+        CAST(r.cal_date_index AS Int64) < $history_periods
+        AND CAST(r.cal_date AS Date) - DateTime::IntervalFromDays(p.period_days - 1) >= b.min_source_date
+        AND CAST(r.cal_date AS Date) <= b.max_source_date
+);
+
+$merchant_amounts = (
+    -- FIXED: TOP-5 считается независимо для 1W, 4W и 13W
+    -- по доступным полным предыдущим периодам; текущий период (index = 0) исключён.
+    SELECT
+        r.period AS period,
+        CAST(r.merchants_type AS String) AS merchants_type,
+        SUM(ABS(COALESCE(CAST(r.amount AS Int64), 0))) AS abs_sum_amount
+    FROM
+        $source_complete_periods AS r
+    WHERE
+        CAST(r.status AS String) == 'captured'
+        AND r.merchants_type IS NOT NULL
+        AND r.cal_date_index >= 1
+        AND r.cal_date_index <= $top_merchants_history_periods
+    GROUP BY
+        r.period,
+        r.merchants_type
+);
+
+$ranked_merchants = (
+    SELECT
+        m.period AS period,
+        m.merchants_type AS merchants_type,
+        m.abs_sum_amount AS abs_sum_amount,
+        ROW_NUMBER() OVER (
+            PARTITION BY
+                m.period
+            ORDER BY
+                m.abs_sum_amount DESC,
+                m.merchants_type
+        ) AS merchant_rank
+    FROM
+        $merchant_amounts AS m
+);
+
+$top_merchants = (
+    SELECT
+        m.period AS period,
+        m.merchants_type AS merchants_type
+    FROM
+        $ranked_merchants AS m
+    WHERE
+        m.merchant_rank <= 5
+);
+
+-- proc
+-- FIXED: нормализуем 1W, 4W и 13W; неполные интервалы уже исключены.
+$source_history = (
+    SELECT
+        r.period AS period,
+        r.cal_date AS cal_date,
+        COALESCE(CAST(r.geo AS String), 'Unknown') AS geo,
+        COALESCE(CAST(r.products AS String), 'Unknown') AS products,
+
+        -- 2. Логика категоризации: если есть в списке ТОП-5 — оставляем, иначе — 'Прочее'
+        CASE
+            WHEN r.merchants_type IS NULL THEN 'Unknown'
+            WHEN t.merchants_type IS NOT NULL THEN CAST(r.merchants_type AS String)
+            ELSE 'Прочее'
+        END AS merchants_type,
+        COALESCE(CAST(r.is_terminal_or_cpqr AS String), 'Unknown') AS is_terminal_or_cpqr,
+        CAST(r.users_newness AS String?) AS users_newness,
+        COALESCE(CAST(r.user_cohort AS String), 'Unknown') AS users_activity, -- user_cohort ПРИНИМАЕТ NULL, ЕСЛИ PHONE_TOKEN NULL
+        CAST(r.status AS String) AS status,
+        r.amount AS amount,
+        r.checkout_order_id AS checkout_order_id,
+        r.phone_token AS phone_token,
+        r.merchant_id AS merchant_id,
+        r.payment_method AS payment_method,
+        r.credlim_flg AS credlim_flg,
+        r.refunds_cnt_payment_id AS refunds_cnt_payment_id,
+        r.appmetrika3_qr_qrc_id AS appmetrika3_qr_qrc_id,
+        r.start_user_agent_media AS start_user_agent_media,
+        r.start_media AS start_media,
+        r.tips_show_staff_cnt AS tips_show_staff_cnt,
+        r.tips_recive_amount_sum AS tips_recive_amount_sum,
+        r.cashback_amount AS cashback_amount,
+        CASE
+            WHEN r.credlim_flg THEN 1
+            WHEN r.payment_method IN ('UNIQR_ONETIME', 'UNIQR_REUSABLE') THEN 0
+            WHEN r.payment_method IS NULL THEN 0
+            ELSE 1
+        END AS is_authzone
+    FROM
+        $source_complete_periods AS r
+    LEFT JOIN
+        $top_merchants AS t
+    ON
+        r.period == t.period
+        AND CAST(r.merchants_type AS String) == t.merchants_type
+);
+
+-- proc
+-- Все C(4,0)+C(4,1)+C(4,2)+C(4,3)+C(4,4)=16 срезов через GROUPING SETS — один проход по данным.
+-- Убраны users_newness и users_activity. Максимальная глубина теперь 4.
+$aggregated = (
+    SELECT
+        s.period AS period,
+        s.cal_date AS cal_date,
+        CAST(
+            (1 - GROUPING(s.geo))
+            + (1 - GROUPING(s.products))
+            + (1 - GROUPING(s.merchants_type))
+            + (1 - GROUPING(s.is_terminal_or_cpqr)) AS Uint8
+        ) AS slice_depth,
+        IF(GROUPING(s.geo) == 1, CAST(NULL AS String?), s.geo) AS geo,
+        IF(GROUPING(s.products) == 1, CAST(NULL AS String?), s.products) AS products,
+        IF(GROUPING(s.merchants_type) == 1, CAST(NULL AS String?), s.merchants_type) AS merchants_type,
+        IF(GROUPING(s.is_terminal_or_cpqr) == 1, CAST(NULL AS String?), s.is_terminal_or_cpqr) AS is_terminal_or_cpqr,
+        SUM(IF(s.status == 'captured', COALESCE(CAST(s.amount AS Int64), 0) / 100.0, 0.0)) AS gmv,
+        COUNT(s.checkout_order_id) AS tx0,
+        COUNT(IF(s.status == 'captured', s.checkout_order_id, NULL)) AS tx,
+        COUNT(DISTINCT IF(s.status == 'captured', s.phone_token, NULL)) AS au,
+        COUNT(DISTINCT IF(s.status == 'captured', s.merchant_id, NULL)) AS am,
+        COUNT(IF(s.status == 'captured' AND s.refunds_cnt_payment_id > 0, s.checkout_order_id, NULL)) AS refund_tx_numerator,
+        COUNT(IF(s.status == 'captured' AND s.is_authzone == 1, s.checkout_order_id, NULL)) AS authzone_tx_numerator,
+        COUNT(
+            IF(
+                s.status == 'captured'
+                AND s.is_authzone == 1
+                AND s.appmetrika3_qr_qrc_id IS NOT NULL
+                AND (s.start_user_agent_media IN ('ios', 'android') OR s.start_media IN ('ios', 'android')),
+                s.checkout_order_id,
+                NULL
+            )
+        ) AS payapp_tx_numerator,
+        SUM(
+            IF(
+                s.status == 'captured' AND s.payment_method IN ('SPLIT', 'SPLIT_SBP'),
+                COALESCE(CAST(s.amount AS Int64), 0) / 100.0,
+                0.0
+            )
+        ) AS split_gmv_numerator,
+        SUM(
+            IF(
+                s.status == 'captured' AND s.credlim_flg,
+                COALESCE(CAST(s.amount AS Int64), 0) / 100.0,
+                0.0
+            )
+        ) AS credlim_gmv_numerator,
+        SUM(
+            IF(
+                s.status == 'captured' AND s.tips_show_staff_cnt > 0,
+                COALESCE(CAST(s.tips_recive_amount_sum AS Int64), 0) / 100.0,
+                0.0
+            )
+        ) AS tips_gmv_numerator,
+        SUM(
+            IF(
+                s.status == 'captured' AND s.cashback_amount > 0,
+                COALESCE(CAST(s.cashback_amount AS Double), 0.0) / 100.0,
+                0.0
+            )
+        ) AS cashback_gmv_numerator
+    FROM
+        $source_history AS s
+    GROUP BY
+        s.period AS period,
+        s.cal_date AS cal_date,
+        GROUPING SETS (
+            -- depth 0: total (1 срез)
+            (),
+
+            -- depth 1: одно измерение C(4,1)=4 среза
+            (s.geo),
+            (s.products),
+            (s.merchants_type),
+            (s.is_terminal_or_cpqr),
+
+            -- depth 2: два измерения C(4,2)=6 срезов
+            (s.geo, s.products),
+            (s.geo, s.merchants_type),
+            (s.geo, s.is_terminal_or_cpqr),
+            (s.products, s.merchants_type),
+            (s.products, s.is_terminal_or_cpqr),
+            (s.merchants_type, s.is_terminal_or_cpqr),
+
+            -- depth 3: три измерения C(4,3)=4 среза
+            (s.geo, s.products, s.merchants_type),
+            (s.geo, s.products, s.is_terminal_or_cpqr),
+            (s.geo, s.merchants_type, s.is_terminal_or_cpqr),
+            (s.products, s.merchants_type, s.is_terminal_or_cpqr),
+
+            -- depth 4: четыре измерения C(4,4)=1 срез
+            (s.geo, s.products, s.merchants_type, s.is_terminal_or_cpqr)
+        )
+);
+
+$total_by_date = (
+    SELECT
+        a.period AS period,
+        a.cal_date AS cal_date,
+        a.gmv AS total_gmv
+    FROM
+        $aggregated AS a
+    WHERE
+        a.slice_depth == 0
+);
+
+INSERT INTO $output_table WITH TRUNCATE
+    SELECT
+        a.period AS period,
+        a.cal_date AS cal_date,
+        a.slice_depth AS slice_depth,
+        a.geo AS geo,
+        a.products AS products,
+        a.merchants_type AS merchants_type,
+        a.is_terminal_or_cpqr AS is_terminal_or_cpqr,
+        a.gmv AS gmv,
+        a.tx0 AS tx0,
+        a.tx AS tx,
+        a.au AS au,
+        a.am AS am,
+        a.refund_tx_numerator AS refund_tx_numerator,
+        a.authzone_tx_numerator AS authzone_tx_numerator,
+        a.payapp_tx_numerator AS payapp_tx_numerator,
+        a.split_gmv_numerator AS split_gmv_numerator,
+        a.credlim_gmv_numerator AS credlim_gmv_numerator,
+        a.tips_gmv_numerator AS tips_gmv_numerator,
+        a.cashback_gmv_numerator AS cashback_gmv_numerator,
+        IF(a.tx > 0, CAST(a.gmv AS Double) / CAST(a.tx AS Double), CAST(NULL AS Double?)) AS aov,
+        IF(a.am > 0, CAST(a.tx AS Double) / CAST(a.am AS Double), CAST(NULL AS Double?)) AS tpm,
+        IF(a.au > 0, CAST(a.tx AS Double) / CAST(a.au AS Double), CAST(NULL AS Double?)) AS freq,
+        IF(t.total_gmv != 0, CAST(a.gmv AS Double) / CAST(t.total_gmv AS Double), CAST(NULL AS Double?)) AS share_in_total_gmv,
+        IF(a.tx0 > 0, CAST(a.tx AS Double) / CAST(a.tx0 AS Double), CAST(NULL AS Double?)) AS success_rate,
+        IF(a.tx > 0, CAST(a.refund_tx_numerator AS Double) / CAST(a.tx AS Double), CAST(NULL AS Double?)) AS refund_tx_share,
+        IF(a.tx > 0, CAST(a.authzone_tx_numerator AS Double) / CAST(a.tx AS Double), CAST(NULL AS Double?)) AS authzone_tx_share,
+        IF(a.tx > 0, CAST(a.payapp_tx_numerator AS Double) / CAST(a.tx AS Double), CAST(NULL AS Double?)) AS payapp_tx_share,
+        IF(a.gmv > 0, CAST(a.split_gmv_numerator AS Double) / CAST(a.gmv AS Double), CAST(NULL AS Double?)) AS split_gmv_share,
+        IF(a.gmv > 0, CAST(a.credlim_gmv_numerator AS Double) / CAST(a.gmv AS Double), CAST(NULL AS Double?)) AS credlim_gmv_share,
+        IF(a.gmv > 0, CAST(a.tips_gmv_numerator AS Double) / CAST(a.gmv AS Double), CAST(NULL AS Double?)) AS tips_gmv_share,
+        IF(a.gmv > 0, CAST(a.cashback_gmv_numerator AS Double) / CAST(a.gmv AS Double), CAST(NULL AS Double?)) AS cashback_gmv_share
+    FROM
+        $aggregated AS a
+    LEFT JOIN
+        $total_by_date AS t
+    ON
+        a.period == t.period
+        AND a.cal_date == t.cal_date
+;
