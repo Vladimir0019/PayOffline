@@ -109,6 +109,7 @@ WHERE CAST(r.cal_date_index AS Int64) < $history_periods
 | `slice_depth` | Глубина 0–4 |
 | четыре dimension columns | `NULL` означает, что измерение не входит в срез |
 | `gmv` | Captured amount, делённый на 100; в этой витрине GMV в рублях |
+| `tx0` | Все checkout-заказы; знаменатель `success_rate` |
 | `tx` | Captured-транзакции |
 | `au` | Уникальные `phone_token` captured-транзакций |
 | `am` | Уникальные `merchant_id` captured-транзакций |
@@ -116,12 +117,12 @@ WHERE CAST(r.cal_date_index AS Int64) < $history_periods
 | `tpm` | `tx / am` |
 | `freq` | `tx / au` |
 | `share_in_total_gmv` | `gmv сегмента / total_gmv` той же даты и периода |
+| `*_numerator` | Сырые числители всех восьми долей; нужны Python для materiality и иерархии |
 
 Запрос дополнительно пишет `success_rate`, `refund_tx_share`,
 `authzone_tx_share`, `payapp_tx_share`, `split_gmv_share`, `credlim_gmv_share`,
-`tips_gmv_share`, `cashback_gmv_share`. В Excel-выгрузке для `gmv_anomaly` их
-нет, и Python их не читает. Это **намеренный задел на будущее**: не удалять их
-как «неиспользуемые».
+`tips_gmv_share`, `cashback_gmv_share` и все их числители. Python-пилот сейчас использует
+`authzone_tx_share`, `authzone_tx_numerator` и `tx`; остальные пары готовы к последующему включению.
 
 Важно: документация `payoffline_pulse_mvp.md` относится к Family B/MVP и
 описывает `payoffline_pulse_hier_mvp`, где GMV хранится в копейках. Это другой
@@ -141,6 +142,8 @@ output. В `pred_insight.yql` для `payoffline_pulse_hier` GMV явно дел
 - для каждого parent/date GMV совпадает с суммой покрытых атомов максимальной
   глубины; Python проверяет это до scoring с абсолютным допуском `1e-4` по
   умолчанию и немедленно прекращает расчёт при расхождении.
+- для пилота `authzone_tx_share` Python сверяет готовую YQL-долю с
+  `authzone_tx_numerator / tx`, а также аддитивно сверяет числитель и знаменатель по иерархии.
 
 Если формат выгрузки `Date` меняется, сначала проверь фактическое представление
 `cal_date` в Excel/CSV: Python не парсит календарные строки как даты, а приводит

@@ -15,7 +15,7 @@ from typing import Dict, List, Optional, Sequence, Tuple
 
 import pandas as pd
 
-from .config import AnomalyThresholds, METRIC_COLUMNS
+from .config import AnomalyThresholds, METRIC_COLUMNS, RatioMetricSpec
 from .data_preparation import candidate_covers_atomic
 
 
@@ -296,6 +296,219 @@ def build_anomaly_candidates(
     return candidates.sort_values(["slice_depth", "segment_key"]).reset_index(drop=True), total_by_date
 
 
+def calculate_ratio_segment_anomaly(
+    segment_panel: pd.DataFrame,
+    dates: Sequence[int],
+    current_cal_date: int,
+    thresholds: AnomalyThresholds,
+    spec: RatioMetricSpec,
+) -> Dict[str, object]:
+    """ADDED: Посчитать аномальность одной доли для одного сегмента.
+
+    Args:
+        segment_panel: Недельная панель одного сегмента.
+        dates: Полная календарная ось.
+        current_cal_date: Анализируемая неделя.
+        thresholds: Пороги алгоритма.
+        spec: Контракт долевой метрики.
+
+    Returns:
+        Словарь метрик для scoring и диагностики.
+
+    Raises:
+        ValueError: Если не поддержан режим изменения или текущая неделя первая.
+
+    Examples:
+        >>> # result = calculate_ratio_segment_anomaly(panel, dates, dates[-1], thresholds, spec)
+    """
+
+    if spec.change_mode != "absolute_delta":
+        raise ValueError(
+            f"Режим change_mode={spec.change_mode!r} пока не поддерживается"
+        )
+    current_idx = list(dates).index(int(current_cal_date))
+    if current_idx == 0:
+        raise ValueError("Текущая неделя не может быть первой неделей истории")
+    previous_cal_date = int(dates[current_idx - 1])
+    indexed = segment_panel.sort_values("cal_date").set_index("cal_date")
+    metric_value = indexed[spec.value_column].astype(float).reindex(dates)
+    numerator = indexed[spec.numerator_column].astype(float).reindex(dates, fill_value=0.0)
+    denominator = indexed[spec.denominator_column].astype(float).reindex(dates, fill_value=0.0)
+    gmv = indexed["gmv"].astype(float).reindex(dates, fill_value=0.0)
+    metric_change = metric_value.diff()
+
+    history_changes = metric_change.reindex(dates[1:current_idx]).dropna()
+    baseline = _safe_float(history_changes.median(), 0.0) if not history_changes.empty else 0.0
+    mad = _safe_float((history_changes - baseline).abs().median(), 0.0) if not history_changes.empty else 0.0
+    robust_sigma = 1.4826 * mad
+    z_uses_sigma_floor = robust_sigma < thresholds.sigma_floor
+    sigma = max(robust_sigma, thresholds.sigma_floor)
+
+    current_value_raw = metric_value.loc[current_cal_date]
+    previous_value_raw = metric_value.loc[previous_cal_date]
+    metric_valid_for_scoring = bool(
+        pd.notna(current_value_raw)
+        and pd.notna(previous_value_raw)
+        and math.isfinite(float(current_value_raw))
+        and math.isfinite(float(previous_value_raw))
+    )
+    current_delta = (
+        float(current_value_raw) - float(previous_value_raw)
+        if metric_valid_for_scoring
+        else math.nan
+    )
+    robust_z = (
+        (current_delta - baseline) / sigma
+        if metric_valid_for_scoring
+        else 0.0
+    )
+
+    numerator_current = _safe_float(numerator.loc[current_cal_date], 0.0)
+    numerator_previous = _safe_float(numerator.loc[previous_cal_date], 0.0)
+    denominator_current = _safe_float(denominator.loc[current_cal_date], 0.0)
+    denominator_previous = _safe_float(denominator.loc[previous_cal_date], 0.0)
+    earlier_nonzero_numerator_weeks = int(
+        (numerator.reindex(dates[: current_idx - 1]) > 0.0).sum()
+    )
+    if numerator_current > 0.0 and int((numerator.reindex(dates[:current_idx]) > 0.0).sum()) == 0:
+        state = "новый"
+    elif numerator_current > 0.0 and numerator_previous == 0.0 and earlier_nonzero_numerator_weeks > 0:
+        state = "возобновившийся"
+    elif numerator_current == 0.0 and numerator_previous > 0.0:
+        state = "исчезнувший"
+    else:
+        state = "обычный"
+
+    history_nonzero_weeks = int((gmv.reindex(dates[:current_idx]) > 0.0).sum())
+    mean_denominator = (denominator_current + denominator_previous) / 2.0
+    hierarchy_movement = (
+        current_delta * mean_denominator
+        if metric_valid_for_scoring
+        else math.nan
+    )
+    row_missing_current = bool(
+        indexed.get(
+            "row_missing_in_source",
+            pd.Series(False, index=indexed.index),
+        ).reindex(dates, fill_value=False).loc[current_cal_date]
+    )
+    if row_missing_current:
+        metric_status = "METRIC_ROW_MISSING_IN_SOURCE"
+    elif denominator_current == 0.0:
+        metric_status = "METRIC_UNDEFINED_ZERO_DENOMINATOR"
+    elif not metric_valid_for_scoring:
+        metric_status = "METRIC_UNDEFINED_COMPARISON"
+    else:
+        metric_status = "METRIC_VALID"
+    return {
+        "metric_name": spec.name,
+        "change_mode": spec.change_mode,
+        "current_cal_date": int(current_cal_date),
+        "previous_cal_date": previous_cal_date,
+        "metric_value_current": float(current_value_raw) if pd.notna(current_value_raw) else math.nan,
+        "metric_value_previous": float(previous_value_raw) if pd.notna(previous_value_raw) else math.nan,
+        "metric_delta": current_delta,
+        "metric_delta_pp": current_delta * 100.0 if metric_valid_for_scoring else math.nan,
+        "numerator_current": numerator_current,
+        "numerator_previous": numerator_previous,
+        "denominator_current": denominator_current,
+        "denominator_previous": denominator_previous,
+        "mean_denominator": mean_denominator,
+        "hierarchy_movement": hierarchy_movement,
+        # ADDED: Технический alias сохраняет контракт Set Packing; это не GMV.
+        "wow_delta_gmv": hierarchy_movement,
+        "baseline_metric_delta": baseline,
+        "mad_metric_delta": mad,
+        "sigma_metric_delta": sigma,
+        "z_scale_source": "SIGMA_FLOOR" if z_uses_sigma_floor else "MAD",
+        "z_uses_sigma_floor": z_uses_sigma_floor,
+        "robust_z": robust_z,
+        "abs_robust_z": abs(robust_z),
+        "metric_valid_for_scoring": metric_valid_for_scoring,
+        "metric_status": metric_status,
+        "history_points": int(len(history_changes)),
+        "history_nonzero_weeks": history_nonzero_weeks,
+        "reliability_factor": _history_reliability(history_nonzero_weeks),
+        "state": state,
+    }
+
+
+def build_ratio_anomaly_candidates(
+    panel_df: pd.DataFrame,
+    dim_cols: Sequence[str],
+    dates: Sequence[int],
+    thresholds: AnomalyThresholds,
+    spec: RatioMetricSpec,
+    current_cal_date: Optional[int] = None,
+    coverage: Optional[Dict[str, frozenset[str]]] = None,
+) -> pd.DataFrame:
+    """ADDED: Построить кандидатов одной долевой метрики.
+
+    Args:
+        panel_df: Полная недельная панель.
+        dim_cols: Иерархические признаки.
+        dates: Полная календарная ось.
+        thresholds: Пороги алгоритма.
+        spec: Контракт одной метрики.
+        current_cal_date: Анализируемая неделя.
+        coverage: Готовое атомарное покрытие.
+
+    Returns:
+        Все сегменты со scoring, materiality и структурным статусом.
+
+    Raises:
+        ValueError: Если нет колонок метрики или нарушена аддитивная иерархия.
+
+    Examples:
+        >>> # candidates = build_ratio_anomaly_candidates(panel, dims, dates, thresholds, spec)
+    """
+
+    required = {spec.value_column, spec.numerator_column, spec.denominator_column, "gmv"}
+    missing = sorted(required - set(panel_df.columns))
+    if missing:
+        raise ValueError(f"Для метрики {spec.name!r} не хватает колонок: {missing}")
+    current = int(current_cal_date) if current_cal_date is not None else int(dates[-1])
+    for additive_column in (spec.numerator_column, spec.denominator_column):
+        validate_hierarchy_reconciliation(
+            panel_df,
+            dim_cols,
+            dates,
+            thresholds.hierarchy_reconciliation_abs_tolerance,
+            coverage=coverage,
+            value_column=additive_column,
+        )
+
+    rows: List[Dict[str, object]] = []
+    meta_cols = ["segment_id", "segment_key", "segment_level", "slice_depth", *dim_cols]
+    for _, segment_panel in panel_df.groupby("segment_id", sort=False):
+        meta = segment_panel.iloc[0][meta_cols].to_dict()
+        metrics = calculate_ratio_segment_anomaly(
+            segment_panel, dates, current, thresholds, spec
+        )
+        rows.append({**meta, **metrics})
+    candidates = pd.DataFrame(rows)
+    candidates["slice_depth"] = candidates["slice_depth"].astype(int)
+    max_depth = int(candidates["slice_depth"].max())
+    atomic = candidates[candidates["slice_depth"].eq(max_depth)]
+    atomic_numerator_total = float(atomic["numerator_current"].astype(float).sum())
+    candidates["atomic_numerator_total"] = atomic_numerator_total
+    candidates["materiality_share"] = 0.0
+    if atomic_numerator_total > 0.0:
+        candidates["materiality_share"] = (
+            candidates["numerator_current"].astype(float) / atomic_numerator_total
+        )
+    candidates["passes_initial_anomaly_filter"] = (
+        candidates["slice_depth"].gt(0)
+        & (atomic_numerator_total > 0.0)
+        & candidates["metric_valid_for_scoring"].eq(True)
+        & candidates["abs_robust_z"].astype(float).ge(thresholds.min_z_score)
+        & candidates["materiality_share"].astype(float).ge(
+            thresholds.min_materiality_share
+        )
+    )
+    return candidates.sort_values(["slice_depth", "segment_key"]).reset_index(drop=True)
+
+
 def build_atomic_coverage(candidates: pd.DataFrame, dim_cols: Sequence[str]) -> Dict[str, frozenset[str]]:
     """Построить покрытие каждого кандидата атомарными сегментами.
 
@@ -334,8 +547,9 @@ def validate_hierarchy_reconciliation(
     dates: Sequence[int],
     absolute_tolerance: float = 1e-4,
     coverage: Optional[Dict[str, frozenset[str]]] = None,
+    value_column: str = "gmv",
 ) -> None:
-    """ADDED: Сверить GMV каждого родителя с суммой покрытых атомов по датам.
+    """ADDED: Сверить аддитивную метрику родителя с покрытыми атомами.
 
     Args:
         panel_df: Полная панель ``segment_id x cal_date``.
@@ -343,12 +557,13 @@ def validate_hierarchy_reconciliation(
         dates: Полный список анализируемых дат.
         absolute_tolerance: Допустимая абсолютная ошибка сверки GMV.
         coverage: Готовое атомарное покрытие. Если None, считается здесь.
+        value_column: Имя сверяемой аддитивной колонки.
 
     Returns:
         None.
 
     Raises:
-        ValueError: Если контракт панели нарушен, coverage пусто или GMV
+        ValueError: Если контракт панели нарушен, coverage пусто или метрика
             родителя не совпадает с суммой атомов хотя бы на одной дате.
 
     Examples:
@@ -356,6 +571,7 @@ def validate_hierarchy_reconciliation(
     """
 
     tolerance = float(absolute_tolerance)
+    value_label = "GMV" if value_column == "gmv" else value_column
     if not math.isfinite(tolerance) or tolerance < 0.0:
         raise ValueError(
             "hierarchy_reconciliation_abs_tolerance должен быть конечным "
@@ -367,7 +583,7 @@ def validate_hierarchy_reconciliation(
         "segment_key",
         "slice_depth",
         "cal_date",
-        "gmv",
+        value_column,
         *dim_cols,
     }
     missing_columns = sorted(required_columns - set(panel_df.columns))
@@ -400,24 +616,24 @@ def validate_hierarchy_reconciliation(
     ]
 
     try:
-        gmv_by_segment_date = panel_df.pivot(
+        value_by_segment_date = panel_df.pivot(
             index="segment_id",
             columns="cal_date",
-            values="gmv",
+            values=value_column,
         ).reindex(columns=list(dates))
     except ValueError as exc:
         raise ValueError(
             "Панель содержит дубли segment_id x cal_date; сверка иерархии невозможна"
         ) from exc
-    gmv_by_segment_date.index = gmv_by_segment_date.index.astype(str)
-    gmv_by_segment_date = gmv_by_segment_date.apply(
+    value_by_segment_date.index = value_by_segment_date.index.astype(str)
+    value_by_segment_date = value_by_segment_date.apply(
         pd.to_numeric,
         errors="coerce",
     )
-    if gmv_by_segment_date.isna().any().any():
+    if value_by_segment_date.isna().any().any():
         raise ValueError(
-            "Панель содержит пропущенный или нечисловой GMV после построения "
-            "полной сетки"
+            f"Панель содержит пропущенный или нечисловой {value_label} "
+            "после построения полной сетки"
         )
 
     for _, parent in parent_rows.iterrows():
@@ -429,7 +645,7 @@ def validate_hierarchy_reconciliation(
                 f"segment_id={parent_id}, segment_key={parent['segment_key']}"
             )
         missing_atomic_ids = sorted(
-            set(atomic_ids) - set(gmv_by_segment_date.index)
+            set(atomic_ids) - set(value_by_segment_date.index)
         )
         if missing_atomic_ids:
             raise ValueError(
@@ -437,17 +653,17 @@ def validate_hierarchy_reconciliation(
                 f"segment_id={parent_id}, atomic_ids={missing_atomic_ids[:10]}"
             )
 
-        parent_gmv = gmv_by_segment_date.loc[parent_id]
-        atomic_gmv = gmv_by_segment_date.loc[atomic_ids].sum(axis=0)
-        absolute_error = (parent_gmv - atomic_gmv).abs()
+        parent_value = value_by_segment_date.loc[parent_id]
+        atomic_value = value_by_segment_date.loc[atomic_ids].sum(axis=0)
+        absolute_error = (parent_value - atomic_value).abs()
         failed_dates = absolute_error[absolute_error > tolerance]
         if not failed_dates.empty:
             failed_date = failed_dates.index[0]
             raise ValueError(
-                "Нарушена сверка GMV родителя с атомами максимальной глубины: "
+                f"Нарушена сверка {value_label} родителя с атомами максимальной глубины: "
                 f"segment_id={parent_id}, segment_key={parent['segment_key']}, "
-                f"cal_date={failed_date}, parent_gmv={float(parent_gmv.loc[failed_date])}, "
-                f"atomic_gmv_sum={float(atomic_gmv.loc[failed_date])}, "
+                f"cal_date={failed_date}, parent_value={float(parent_value.loc[failed_date])}, "
+                f"atomic_value_sum={float(atomic_value.loc[failed_date])}, "
                 f"absolute_error={float(absolute_error.loc[failed_date])}, "
                 f"tolerance={tolerance}"
             )
@@ -544,6 +760,8 @@ def apply_hierarchy_score_adjustment(
     dominant_child_capture_threshold: float = 0.80,
     dominant_child_score_margin: float = 0.02,
     max_hierarchy_descendants: int = 25,
+    movement_column: str = "wow_delta_gmv",
+    allow_zero_movement: bool = False,
 ) -> pd.DataFrame:
     """ADDED: Скорректировать score по coherence сильнейшей группы потомков.
 
@@ -566,6 +784,9 @@ def apply_hierarchy_score_adjustment(
             удерживает score родителя ниже score доминирующего потомка.
         max_hierarchy_descendants: Максимальное число eligible-потомков одного
             родителя для полного перечисления групп.
+        movement_column: Аддитивное движение для hierarchy coherence.
+        allow_zero_movement: Разрешить нулевое движение; нужно для долей,
+            у которых z-score может быть аномальным при нулевой текущей дельте.
 
     Returns:
         Копия `candidates` с базовым и итоговым score, параметрами coherence,
@@ -595,7 +816,7 @@ def apply_hierarchy_score_adjustment(
         "abs_robust_z",
         "materiality_share",
         "reliability_factor",
-        "wow_delta_gmv",
+        movement_column,
     }
     missing_columns = sorted(required_columns - set(candidates.columns))
     if missing_columns:
@@ -686,22 +907,24 @@ def apply_hierarchy_score_adjustment(
             )
             continue
         base_score = _safe_float(row.get("base_anomaly_score"), math.nan)
-        delta_gmv = _safe_float(row.get("wow_delta_gmv"), math.nan)
+        movement = _safe_float(row.get(movement_column), math.nan)
         if not math.isfinite(base_score):
             fatal_issues.append(
                 f"{segment_id} ({row.get('segment_key', '')}): "
                 "некорректный base_anomaly_score"
             )
             continue
-        if not math.isfinite(delta_gmv) or delta_gmv == 0.0:
+        if not math.isfinite(movement) or (
+            movement == 0.0 and not allow_zero_movement
+        ):
             fatal_issues.append(
                 f"{segment_id} ({row.get('segment_key', '')}): "
-                "некорректный wow_delta_gmv"
+                f"некорректный {movement_column}"
             )
             continue
         coverage_by_id[segment_id] = segment_atoms
         depth_by_id[segment_id] = int(row["slice_depth"])
-        delta_by_id[segment_id] = float(delta_gmv)
+        delta_by_id[segment_id] = float(movement)
         index_by_id[segment_id] = int(index)
 
     if fatal_issues:
@@ -805,7 +1028,7 @@ def apply_hierarchy_score_adjustment(
                     atom_id: _safe_float(
                         result.at[
                             all_index_by_id[atom_id],
-                            "wow_delta_gmv",
+                            movement_column,
                         ],
                         math.nan,
                     )
@@ -819,14 +1042,14 @@ def apply_hierarchy_score_adjustment(
                 if invalid_atom_ids:
                     raise ValueError(
                         f"Для dominance cap родителя {parent_id} "
-                        "некорректный wow_delta_gmv атомов: "
+                        f"некорректный {movement_column} атомов: "
                         + ", ".join(invalid_atom_ids[:10])
                     )
 
                 parent_gross_atomic_movement = float(
                     sum(abs(delta) for delta in atomic_delta_by_id.values())
                 )
-                if parent_gross_atomic_movement <= 0.0:
+                if parent_gross_atomic_movement <= 0.0 and not allow_zero_movement:
                     raise ValueError(
                         f"Для dominance cap родителя {parent_id} абсолютное "
                         "движение атомов должно быть положительным"
@@ -837,18 +1060,22 @@ def apply_hierarchy_score_adjustment(
                         for atom_id in coverage_by_id[child_id]
                     )
                 )
-                capture = min(
-                    1.0,
-                    child_gross_atomic_movement
-                    / parent_gross_atomic_movement,
+                capture = (
+                    min(
+                        1.0,
+                        child_gross_atomic_movement
+                        / parent_gross_atomic_movement,
+                    )
+                    if parent_gross_atomic_movement > 0.0
+                    else math.nan
                 )
                 direction_match = (
                     delta_by_id[parent_id] * delta_by_id[child_id] > 0.0
                 )
                 dominance_rule_matches = (
                     direction_match
-                    and capture
-                    >= float(dominant_child_capture_threshold)
+                    and math.isfinite(capture)
+                    and capture >= float(dominant_child_capture_threshold)
                 )
                 adjusted_score = (
                     min(uncapped_score, cap_score)
@@ -888,15 +1115,18 @@ def apply_hierarchy_score_adjustment(
             else:
                 deltas = [delta_by_id[child_id] for child_id in best_group]
                 gross_delta = float(sum(abs(delta) for delta in deltas))
-                if not math.isfinite(gross_delta) or gross_delta <= 0.0:
+                if not math.isfinite(gross_delta) or (
+                    gross_delta <= 0.0 and not allow_zero_movement
+                ):
                     raise ValueError(
                         f"Для сильнейшей группы родителя {parent_id} "
                         "gross-сумма изменений GMV должна быть положительной"
                     )
-                direction_unity = min(
-                    1.0,
-                    max(0.0, abs(sum(deltas)) / gross_delta),
-                )
+                if gross_delta == 0.0:
+                    result.at[parent_index, "hierarchy_score_factor"] = 1.0
+                    result.at[parent_index, "anomaly_score"] = base_parent_score
+                    continue
+                direction_unity = min(1.0, max(0.0, abs(sum(deltas)) / gross_delta))
                 shares = [abs(delta) / gross_delta for delta in deltas]
                 dominant_share = max(shares)
                 balance_max = min(

@@ -15,6 +15,10 @@ date_string = "28_07"
 INPUT_PATH = _PROJECT_ROOT / f"payoffline_pulse_hier_{date_string}.xlsx"
 OUTPUT_PATH = _PROJECT_ROOT / f"gmv_anomaly_report_{date_string}.xlsx"
 TREE_OUTPUT_PATH: Path | None = _PROJECT_ROOT / f"Граф_Anomaly_{date_string}.png"
+# ADDED: Путь долевого графа задаётся явно и не выводится из GMV-пути в pipeline.
+RATIO_TREE_OUTPUT_PATH: Path | None = (
+    _PROJECT_ROOT / f"Граф_Anomaly_{date_string}_Доля.png"
+)
 SHEET_NAME: int | str = 0
 # FIXED: Период обязателен для запуска. Его значение определяет и фильтр
 # входной витрины, и ожидаемый шаг календарной оси.
@@ -32,6 +36,7 @@ CURRENT_CAL_DATE: int | None = None
 DEFAULT_INPUT_PATH = INPUT_PATH
 DEFAULT_OUTPUT_PATH = OUTPUT_PATH
 DEFAULT_TREE_OUTPUT_PATH = TREE_OUTPUT_PATH
+DEFAULT_RATIO_TREE_OUTPUT_PATH = RATIO_TREE_OUTPUT_PATH
 
 # Для исторического anomaly-файла фиксируем служебные и метрические колонки.
 # FIXED: При заданном DIM_COLUMNS все остальные колонки входного Excel также
@@ -49,12 +54,40 @@ ANOMALY_TECH_COLUMNS = {
     "tpm",
     "freq",
     "share_in_total_gmv",
+    "tx0",
+    "refund_tx_numerator",
+    "authzone_tx_numerator",
+    "payapp_tx_numerator",
+    "split_gmv_numerator",
+    "credlim_gmv_numerator",
+    "tips_gmv_numerator",
+    "cashback_gmv_numerator",
+    "success_rate",
+    "refund_tx_share",
+    "authzone_tx_share",
+    "payapp_tx_share",
+    "split_gmv_share",
+    "credlim_gmv_share",
+    "tips_gmv_share",
+    "cashback_gmv_share",
     "segment_id",
     "segment_key",
     "segment_level",
 }
 
 METRIC_COLUMNS = ["tx", "au", "am", "aov", "tpm", "freq"]
+# ADDED: Аддитивные компоненты долевых метрик восстанавливаются нулём
+# только для строк, отсутствующих в upstream-витрине.
+RATIO_ADDITIVE_COLUMNS = (
+    "tx0",
+    "refund_tx_numerator",
+    "authzone_tx_numerator",
+    "payapp_tx_numerator",
+    "split_gmv_numerator",
+    "credlim_gmv_numerator",
+    "tips_gmv_numerator",
+    "cashback_gmv_numerator",
+)
 MANAGER_METRIC_PCT_COLUMNS = {
     "relative_wow": "GMV WoW %",
     "tx_wow_pct": "TX WoW %",
@@ -125,6 +158,51 @@ class AnomalyThresholds:
     set_packing_gap_tolerance: float = 1e-9
     max_exact_fallback_size: int = 25
     max_manager_facts: int = 10
+
+
+@dataclass(frozen=True)
+class RatioMetricSpec:
+    """Описать входной и расчётный контракт одной долевой метрики.
+
+    Args:
+        name: Имя метрики в long-отчёте.
+        value_column: Готовое значение доли из YQL.
+        numerator_column: Аддитивный числитель.
+        denominator_column: Аддитивный знаменатель.
+        change_mode: Формула межнедельного изменения; в пилоте только ``absolute_delta``.
+        bounded: Ограничена ли доля интервалом `[0, 1]`.
+        validation_abs_tolerance: Допуск сверки ``metric_value`` с ``numerator / denominator``.
+
+    Returns:
+        Неизменяемая спецификация метрики.
+
+    Raises:
+        ValueError: Не выбрасывается при создании.
+
+    Examples:
+        >>> PILOT_RATIO_METRICS[0].name
+        'authzone_tx_share'
+    """
+
+    name: str
+    value_column: str
+    numerator_column: str
+    denominator_column: str
+    change_mode: str = "absolute_delta"
+    bounded: bool = True
+    validation_abs_tolerance: float = 1e-10
+
+
+# ADDED: Пилот ограничен одной метрикой; цикл в pipeline сразу готов к независимым
+# вызовам для следующих долей.
+PILOT_RATIO_METRICS = (
+    RatioMetricSpec(
+        name="authzone_tx_share",
+        value_column="authzone_tx_share",
+        numerator_column="authzone_tx_numerator",
+        denominator_column="tx",
+    ),
+)
 
 
 # ADDED: Единственный экземпляр порогов, используемый безаргументным запуском.

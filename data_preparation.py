@@ -20,7 +20,13 @@ from typing import List, Optional, Sequence, Tuple
 
 import pandas as pd
 
-from .config import ANOMALY_TECH_COLUMNS, DIM_COLUMNS, METRIC_COLUMNS
+from .config import (
+    ANOMALY_TECH_COLUMNS,
+    DIM_COLUMNS,
+    METRIC_COLUMNS,
+    PILOT_RATIO_METRICS,
+    RATIO_ADDITIVE_COLUMNS,
+)
 from .segment_keys import (
     SEGMENT_KEY_SEPARATOR,
     TOTAL_SEGMENT_KEY,
@@ -376,6 +382,81 @@ def load_history_table(
         if metric in df.columns:
             df[metric] = pd.to_numeric(df[metric], errors="coerce")
 
+    # ADDED: Готовое значение доли из YQL остаётся авторитетным. Python только
+    # валидирует его против числителя/знаменателя, но не пересчитывает колонку.
+    for spec in PILOT_RATIO_METRICS:
+        metric_columns = {
+            spec.value_column,
+            spec.numerator_column,
+            spec.denominator_column,
+        }
+        # FIXED: Общий знаменатель ``tx`` есть и в старых GMV-выгрузках и сам по себе
+        # не активирует контракт долевой метрики.
+        present_columns = {
+            spec.value_column,
+            spec.numerator_column,
+        }.intersection(df.columns)
+        if not present_columns:
+            continue
+        missing_metric_columns = sorted(metric_columns - set(df.columns))
+        if missing_metric_columns:
+            raise ValueError(
+                f"Для метрики {spec.name!r} не хватает колонок: "
+                f"{missing_metric_columns}"
+            )
+
+        numerator = pd.to_numeric(df[spec.numerator_column], errors="coerce")
+        denominator = pd.to_numeric(df[spec.denominator_column], errors="coerce")
+        metric_value = pd.to_numeric(df[spec.value_column], errors="coerce")
+        invalid_numeric = (
+            numerator.isna()
+            | denominator.isna()
+            | ~numerator.map(lambda value: math.isfinite(float(value)))
+            | ~denominator.map(lambda value: math.isfinite(float(value)))
+        )
+        invalid_metric_literal = (
+            df[spec.value_column].notna()
+            & (
+                metric_value.isna()
+                | ~metric_value.fillna(0.0).map(
+                    lambda value: math.isfinite(float(value))
+                )
+            )
+        )
+        negative_components = (numerator < 0.0) | (denominator < 0.0)
+        numerator_exceeds_denominator = spec.bounded & (numerator > denominator)
+        zero_denominator_contract = denominator.eq(0.0) & (
+            numerator.ne(0.0) | metric_value.notna()
+        )
+        positive_denominator = denominator.gt(0.0)
+        invalid_positive_value = positive_denominator & (
+            metric_value.isna()
+            | metric_value.lt(0.0)
+            | (spec.bounded & metric_value.gt(1.0))
+        )
+        expected_value = numerator / denominator.where(positive_denominator)
+        inconsistent_value = positive_denominator & (
+            (metric_value - expected_value).abs() > spec.validation_abs_tolerance
+        )
+        invalid_mask = (
+            invalid_numeric
+            | invalid_metric_literal
+            | negative_components
+            | numerator_exceeds_denominator
+            | zero_denominator_contract
+            | invalid_positive_value
+            | inconsistent_value
+        )
+        if invalid_mask.any():
+            bad_indices = df.index[invalid_mask].tolist()[:5]
+            raise ValueError(
+                f"Нарушен контракт долевой метрики {spec.name!r}: "
+                f"{int(invalid_mask.sum())} строк; примеры индексов: {bad_indices}"
+            )
+        df[spec.numerator_column] = numerator.astype(float)
+        df[spec.denominator_column] = denominator.astype(float)
+        df[spec.value_column] = metric_value.astype(float)
+
     dims = infer_anomaly_dimension_columns(df, dim_cols)
     for col in dims:
         df[col] = df[col].map(normalize_dim_value)
@@ -473,6 +554,19 @@ def build_full_week_grid(history_df: pd.DataFrame, dim_cols: Sequence[str], date
     # FIXED: Вход уже агрегирован upstream YQL и проверен на уникальность segment_id × cal_date.
     # Поэтому метрики переносим напрямую, без повторной агрегации в Python.
     available_metric_cols = [metric for metric in METRIC_COLUMNS if metric in history_df.columns]
+    ratio_value_columns = [
+        spec.value_column
+        for spec in PILOT_RATIO_METRICS
+        if spec.value_column in history_df.columns
+    ]
+    additive_ratio_columns = [
+        column for column in RATIO_ADDITIVE_COLUMNS if column in history_df.columns
+    ]
+    available_metric_cols = list(
+        dict.fromkeys(
+            [*available_metric_cols, *ratio_value_columns, *additive_ratio_columns]
+        )
+    )
     value_cols = ["segment_id", "cal_date", "gmv", *available_metric_cols]
     weekly = history_df[value_cols].copy()
     full_index = pd.MultiIndex.from_product(
@@ -492,10 +586,10 @@ def build_full_week_grid(history_df: pd.DataFrame, dim_cols: Sequence[str], date
     # показатели. NULL ratio-метрики существующих и восстановленных строк
     # сохраняют семантику «отношение не определено».
     panel["gmv"] = panel["gmv"].fillna(0.0).astype(float)
-    for metric in ("tx", "au", "am"):
+    for metric in ("tx", "au", "am", *RATIO_ADDITIVE_COLUMNS):
         if metric in available_metric_cols:
             panel[metric] = panel[metric].fillna(0.0).astype(float)
-    for metric in ("aov", "tpm", "freq"):
+    for metric in ("aov", "tpm", "freq", *ratio_value_columns):
         if metric in available_metric_cols:
             panel[metric] = panel[metric].astype(float)
     panel = panel.merge(meta, how="left", on="segment_id")

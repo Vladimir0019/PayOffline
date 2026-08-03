@@ -92,6 +92,35 @@ Lifecycle:
 Это предполагает сбалансированную иерархию. Листья более коротких веток атомами
 не считаются.
 
+## Пилот долевой метрики
+
+`calculate_ratio_segment_anomaly` и `build_ratio_anomaly_candidates` параметризованы
+`RatioMetricSpec`. Сейчас включена только `authzone_tx_share`.
+
+```text
+metric_delta[t] = metric_value[t] - metric_value[t-1]
+baseline = median(metric_delta до текущего перехода)
+sigma = max(1.4826 × MAD, sigma_floor)
+robust_z = (current_metric_delta - baseline) / sigma
+```
+
+`metric_value` берётся из YQL без повторного расчёта. Reliability в пилоте сохраняет GMV-правило.
+
+```text
+atomic_numerator_total = Σ numerator_current по атомам
+materiality_share = numerator_current(segment) / atomic_numerator_total
+mean_denominator = (denominator_current + denominator_previous) / 2
+hierarchy_movement = metric_delta × mean_denominator
+```
+
+Отдельного фильтра `min_numerator_scale` нет. Eligible-фильтр требует только
+определённую текущую и предыдущую долю, `slice_depth > 0`, z- и materiality-пороги.
+Нулевой числитель трактуется как бизнес-событие: `новый`, `возобновившийся` или
+`исчезнувший`; такая строка остаётся в long-диагностике, даже если не eligible.
+
+Pipeline вызывает `search_anomal` для GMV и для каждой доли отдельно. Технический
+`wow_delta_gmv` в долевом DataFrame — compatibility-alias `hierarchy_movement`, а не GMV.
+
 ## Этап 4. Hierarchy-корректировка score
 
 `apply_hierarchy_score_adjustment` сначала считает:

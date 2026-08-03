@@ -19,10 +19,12 @@ from gmv_anomaly.anomaly_scoring import (
     apply_hierarchy_score_adjustment,
     build_anomaly_candidates,
     build_atomic_coverage,
+    build_ratio_anomaly_candidates,
     calculate_segment_anomaly,
+    calculate_ratio_segment_anomaly,
     validate_hierarchy_reconciliation,
 )
-from gmv_anomaly.config import AnomalyThresholds
+from gmv_anomaly.config import AnomalyThresholds, PILOT_RATIO_METRICS
 from gmv_anomaly.data_preparation import (
     build_full_week_grid,
     build_segment_key_and_level,
@@ -31,7 +33,11 @@ from gmv_anomaly.data_preparation import (
     segment_id_from_row,
 )
 from gmv_anomaly.pipeline import run_pipeline
-from gmv_anomaly.reporting import build_anomaly_tree_from_excel, build_manager_summary
+from gmv_anomaly.reporting import (
+    build_anomaly_tree_from_excel,
+    build_manager_summary,
+    build_ratio_analysis_sheets,
+)
 from gmv_anomaly.segment_keys import (
     SEGMENT_KEY_SEPARATOR,
     parse_segment_key_parts,
@@ -111,6 +117,42 @@ def _history_rows() -> list[dict[str, object]]:
         row.setdefault("aov", float(row["gmv"]) / float(row["tx"]))
         row.setdefault("tpm", float(row["tx"]) / float(row["am"]))
         row.setdefault("freq", float(row["tx"]) / float(row["au"]))
+    return rows
+
+
+def _ratio_history_rows() -> list[dict[str, object]]:
+    """ADDED: Сформировать иерархически согласованную историю ``authzone_tx_share``.
+
+    Args:
+        Нет аргументов.
+
+    Returns:
+        Строки с готовой долей, числителем и знаменателем.
+
+    Raises:
+        ValueError: Не выбрасывается.
+
+    Examples:
+        >>> any('authzone_tx_share' in row for row in _ratio_history_rows())
+        True
+    """
+
+    rows = _history_rows()
+    numerator_by_segment = {
+        None: dict(zip(DATES, [5.0, 5.0, 5.0, 6.0])),
+        "A": dict(zip(DATES, [2.0, 2.0, 2.0, 5.0])),
+        "B": dict(zip(DATES[:-1], [3.0, 3.0, 3.0])),
+        "C": {DATES[-1]: 1.0},
+    }
+    for row in rows:
+        geo = row["geo"]
+        row["tx"] = 20.0 if geo is None else 10.0
+        numerator = numerator_by_segment[geo][int(row["cal_date"])]
+        row["authzone_tx_numerator"] = numerator
+        row["authzone_tx_share"] = numerator / float(row["tx"])
+        row["aov"] = float(row["gmv"]) / float(row["tx"])
+        row["tpm"] = float(row["tx"]) / float(row["am"])
+        row["freq"] = float(row["tx"]) / float(row["au"])
     return rows
 
 
@@ -202,6 +244,7 @@ class GmvAnomalyRefactorTests(unittest.TestCase):
             current_cal_date=runtime_config.CURRENT_CAL_DATE,
             thresholds=runtime_config.THRESHOLDS,
             tree_output_path=runtime_config.TREE_OUTPUT_PATH,
+            ratio_tree_output_path=runtime_config.RATIO_TREE_OUTPUT_PATH,
         )
 
     def test_dimensions_are_fixed_and_ignore_extra_excel_columns(self) -> None:
@@ -1484,26 +1527,36 @@ class GmvAnomalyRefactorTests(unittest.TestCase):
             "05_Пропуски_и_нули",
             "06_Контроль",
             "07_Журнал_set_packing",
+            "Анализ долевых метрик",
+            "Аномалии долевых метрик",
         ]
         with TemporaryDirectory() as temp_dir:
             input_path = Path(temp_dir) / "history.csv"
             output_path = Path(temp_dir) / "result.xlsx"
-            pd.DataFrame(_history_rows()).to_csv(input_path, index=False)
-            result = run_pipeline(
-                input_path,
-                output_path,
-                period="1W",
-                thresholds=AnomalyThresholds(
-                    min_anomaly_abs=0.0,
-                    min_z_score=0.0,
-                    min_materiality_share=0.0,
-                ),
-            )
+            pd.DataFrame(_ratio_history_rows()).to_csv(input_path, index=False)
+            with patch(
+                "gmv_anomaly.pipeline.search_anomal",
+                wraps=search_anomal,
+            ) as optimization_call:
+                result = run_pipeline(
+                    input_path,
+                    output_path,
+                    period="1W",
+                    thresholds=AnomalyThresholds(
+                        min_anomaly_abs=0.0,
+                        min_z_score=0.0,
+                        min_materiality_share=0.0,
+                    ),
+                )
             # FIXED: Явно закрываем ExcelFile, чтобы Windows освободил файл до cleanup.
             with pd.ExcelFile(output_path) as workbook:
                 sheet_names = workbook.sheet_names
                 analysis_columns = list(
                     pd.read_excel(workbook, sheet_name="Анализ аномалий").columns
+                )
+                ratio_analysis = pd.read_excel(
+                    workbook,
+                    sheet_name="Анализ долевых метрик",
                 )
 
         self.assertEqual(sheet_names, expected_sheets)
@@ -1520,6 +1573,11 @@ class GmvAnomalyRefactorTests(unittest.TestCase):
         self.assertNotIn("abs_z_capped", result["candidates"].columns)
         self.assertNotIn("abnormal_gmv", result["candidates"].columns)
         self.assertNotIn("abs_abnormal_gmv", result["candidates"].columns)
+        self.assertEqual(set(ratio_analysis["metric_name"]), {"authzone_tx_share"})
+        # ADDED: GMV и пилотная доля решают две отдельные оптимизационные задачи.
+        self.assertEqual(optimization_call.call_count, 2)
+        self.assertIn("numerator_current", ratio_analysis.columns)
+        self.assertIn("denominator_current", ratio_analysis.columns)
         self.assertEqual(
             list(result),
             [
@@ -1529,9 +1587,211 @@ class GmvAnomalyRefactorTests(unittest.TestCase):
                 "final",
                 "manager",
                 "optimization_decision_log",
+                "ratio_candidates",
+                "ratio_final",
+                "ratio_optimization_decision_log",
+                "ratio_status",
                 "control",
             ],
         )
+
+    def test_ratio_score_uses_absolute_share_delta_and_current_numerator(self) -> None:
+        """ADDED: Проверить z-score по п.п. и materiality по текущему числителю.
+
+        Args:
+            Нет аргументов.
+
+        Returns:
+            None.
+
+        Raises:
+            AssertionError: Если формула долевой метрики изменилась.
+
+        Examples:
+            >>> # Запускается через unittest.
+        """
+
+        thresholds = AnomalyThresholds(
+            min_z_score=2.0,
+            min_materiality_share=0.0,
+            sigma_floor=0.01,
+        )
+        history = pd.DataFrame(_ratio_history_rows())
+        with TemporaryDirectory() as temp_dir:
+            path = Path(temp_dir) / "ratio.csv"
+            history.to_csv(path, index=False)
+            loaded, dims, dates = load_history_table(path, period="1W")
+        panel = build_full_week_grid(loaded, dims, dates)
+        coverage = build_atomic_coverage(
+            panel.drop_duplicates("segment_id"), dims
+        )
+        spec = PILOT_RATIO_METRICS[0]
+        candidates = build_ratio_anomaly_candidates(
+            panel, dims, dates, thresholds, spec, DATES[-1], coverage
+        )
+        segment_a = candidates[candidates["segment_key"].eq("geo=A")].iloc[0]
+
+        self.assertAlmostEqual(float(segment_a["metric_delta"]), 0.3)
+        self.assertAlmostEqual(float(segment_a["metric_delta_pp"]), 30.0)
+        self.assertAlmostEqual(float(segment_a["baseline_metric_delta"]), 0.0)
+        self.assertAlmostEqual(float(segment_a["robust_z"]), 30.0)
+        self.assertAlmostEqual(float(segment_a["hierarchy_movement"]), 3.0)
+        self.assertAlmostEqual(float(segment_a["materiality_share"]), 5.0 / 6.0)
+        self.assertAlmostEqual(float(segment_a["reliability_factor"]), 0.4)
+
+    def test_ratio_zero_numerator_is_reported_as_structure_change(self) -> None:
+        """ADDED: Оставить новые и исчезнувшие операции вне solver-отбора.
+
+        Args:
+            Нет аргументов.
+
+        Returns:
+            None.
+
+        Raises:
+            AssertionError: Если lifecycle-сегмент пропал или попал в optimization.
+
+        Examples:
+            >>> # Запускается через unittest.
+        """
+
+        with TemporaryDirectory() as temp_dir:
+            path = Path(temp_dir) / "ratio.csv"
+            pd.DataFrame(_ratio_history_rows()).to_csv(path, index=False)
+            history, dims, dates = load_history_table(path, period="1W")
+        panel = build_full_week_grid(history, dims, dates)
+        coverage = build_atomic_coverage(panel.drop_duplicates("segment_id"), dims)
+        candidates = build_ratio_anomaly_candidates(
+            panel,
+            dims,
+            dates,
+            AnomalyThresholds(min_z_score=0.0, min_materiality_share=0.0),
+            PILOT_RATIO_METRICS[0],
+            DATES[-1],
+            coverage,
+        )
+        states = candidates.set_index("segment_key")["state"].to_dict()
+        self.assertEqual(states["geo=B"], "исчезнувший")
+        self.assertEqual(states["geo=C"], "новый")
+        self.assertFalse(
+            candidates.set_index("segment_key").loc["geo=B", "passes_initial_anomaly_filter"]
+        )
+        self.assertFalse(
+            candidates.set_index("segment_key").loc["geo=C", "passes_initial_anomaly_filter"]
+        )
+        analysis, selected = build_ratio_analysis_sheets(candidates, pd.DataFrame())
+        self.assertEqual(set(analysis["сегмент"]), {"geo=A", "geo=B", "geo=C"})
+        self.assertTrue(selected.empty)
+
+    def test_ratio_input_contract_rejects_inconsistent_yql_value(self) -> None:
+        """ADDED: Не пересчитывать долю в Python, а отклонять её расхождение с YQL-компонентами.
+
+        Args:
+            Нет аргументов.
+
+        Returns:
+            None.
+
+        Raises:
+            AssertionError: Если повреждённая доля принята.
+
+        Examples:
+            >>> # Запускается через unittest.
+        """
+
+        rows = _ratio_history_rows()
+        rows[0]["authzone_tx_share"] = 0.99
+        with TemporaryDirectory() as temp_dir:
+            path = Path(temp_dir) / "invalid_ratio.csv"
+            pd.DataFrame(rows).to_csv(path, index=False)
+            with self.assertRaisesRegex(ValueError, "Нарушен контракт долевой метрики"):
+                load_history_table(path, period="1W")
+
+    def test_yql_outputs_ratio_components_for_python(self) -> None:
+        """ADDED: Защитить передачу числителя и знаменателя из YQL.
+
+        Args:
+            Нет аргументов.
+
+        Returns:
+            None.
+
+        Raises:
+            AssertionError: Если сырые компоненты исчезли из output.
+
+        Examples:
+            >>> # Запускается через unittest.
+        """
+
+        yql_path = (
+            Path(__file__).resolve().parent.parent
+            / ".proposal"
+            / "fintech"
+            / "fdt"
+            / "payoffline"
+            / "projects"
+            / "qr_yandex_pay"
+            / "bi"
+            / "pred_insight.yql"
+        )
+        yql = yql_path.read_text(encoding="utf-8")
+        final_select = yql.split("INSERT INTO $output_table WITH TRUNCATE", 1)[1]
+        for column in (
+            "tx0",
+            "authzone_tx_numerator",
+            "authzone_tx_share",
+        ):
+            with self.subTest(column=column):
+                self.assertIn(column, final_select)
+
+    def test_ratio_tree_accepts_long_sheet_with_components(self) -> None:
+        """ADDED: Построить отдельный граф доли с числителем и знаменателем.
+
+        Args:
+            Нет аргументов.
+
+        Returns:
+            None.
+
+        Raises:
+            AssertionError: Если граф не создан.
+
+        Examples:
+            >>> # Запускается через unittest.
+        """
+
+        row = {
+            "metric_name": "authzone_tx_share",
+            "сегмент": "geo=A",
+            "глубина": 1,
+            "z_scope": 3.0,
+            "anomaly_score": 2.0,
+            "metric_delta_pp": 5.0,
+            "выбран": True,
+            "numerator_current": 50.0,
+            "denominator_current": 100.0,
+        }
+        with TemporaryDirectory() as temp_dir:
+            report_path = Path(temp_dir) / "ratio.xlsx"
+            tree_path = Path(temp_dir) / "ratio.svg"
+            pd.DataFrame([row]).to_excel(
+                report_path,
+                sheet_name="Анализ долевых метрик",
+                index=False,
+            )
+            created = build_anomaly_tree_from_excel(
+                report_path,
+                tree_path,
+                sheet_name="Анализ долевых метрик",
+                metric_name="authzone_tx_share",
+                delta_column="metric_delta_pp",
+                delta_label="Δ доли, п.п.",
+                selected_column="выбран",
+                numerator_column="numerator_current",
+                denominator_column="denominator_current",
+            )
+            self.assertEqual(created, tree_path.resolve())
+            self.assertGreater(tree_path.stat().st_size, 0)
 
     def test_tree_crosses_nodes_with_dominant_child_status(self) -> None:
         """ADDED: Проверить перечёркивание обоих статусов доминирования.

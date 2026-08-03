@@ -1,7 +1,7 @@
 """Формирование Excel-отчёта и визуализации по найденным GMV-аномалиям.
 
 Модуль не содержит бизнес-логики отбора аномалий: он только представляет уже
-рассчитанный результат. Excel-контракт состоит из девяти листов и защищён
+рассчитанный результат. Excel-контракт состоит из девяти GMV-листов и двух long-листов долей и защищён
 регрессионным тестом ``test_pipeline_excel_sheet_contract``. Дополнительно
 строится необязательный DAG-граф сегментов по листу «Анализ аномалий».
 """
@@ -1324,6 +1324,12 @@ def build_anomaly_tree_from_excel(
     output_path: str | Path | None = None,
     sheet_name: str = "Анализ аномалий",
     dpi: int = 160,
+    metric_name: str | None = None,
+    delta_column: str = "Delta GMV",
+    delta_label: str = "ΔGMV",
+    selected_column: str | None = None,
+    numerator_column: str | None = None,
+    denominator_column: str | None = None,
 ) -> Path:
     """Построить дерево аномальных сегментов по листу итогового Excel-файла.
 
@@ -1340,6 +1346,12 @@ def build_anomaly_tree_from_excel(
             создаётся файл ``<имя_отчёта>_tree.png``.
         sheet_name: Имя листа-источника.
         dpi: Разрешение растрового изображения.
+        metric_name: Имя метрики для фильтрации long-листа.
+        delta_column: Колонка движения, кодирующая цвет карточки.
+        delta_label: Подпись движения на графе.
+        selected_column: Boolean-колонка отбора Set Packing.
+        numerator_column: Колонка текущего числителя для карточки.
+        denominator_column: Колонка текущего знаменателя для карточки.
 
     Returns:
         Путь к созданному файлу визуализации.
@@ -1383,7 +1395,36 @@ def build_anomaly_tree_from_excel(
         raise ValueError("dpi должен быть положительным целым числом")
 
     analysis = pd.read_excel(report, sheet_name=sheet_name)
-    required_columns = {"сегмент", "глубина", "z_scope", "anomaly_score", "Delta GMV"}
+    if metric_name is not None:
+        if "metric_name" not in analysis.columns:
+            raise ValueError(
+                f"На листе {sheet_name!r} нет колонки 'metric_name'"
+            )
+        analysis = analysis[
+            analysis["metric_name"].astype(str).eq(str(metric_name))
+        ].copy()
+        if "passes_initial_anomaly_filter" in analysis.columns:
+            analysis = analysis[
+                analysis["passes_initial_anomaly_filter"].map(
+                    lambda value: str(value).strip().lower()
+                    in {"true", "1", "yes"}
+                    or _safe_float(value, 0.0) == 1.0
+                )
+            ].copy()
+    required_columns = {
+        "сегмент",
+        "глубина",
+        "z_scope",
+        "anomaly_score",
+        delta_column,
+    }
+    for optional_required in (
+        selected_column,
+        numerator_column,
+        denominator_column,
+    ):
+        if optional_required is not None:
+            required_columns.add(optional_required)
     missing_columns = sorted(required_columns - set(analysis.columns))
     if missing_columns:
         raise ValueError(
@@ -1411,7 +1452,12 @@ def build_anomaly_tree_from_excel(
     nodes["глубина"] = pd.to_numeric(nodes["глубина"], errors="coerce")
     nodes["z_scope"] = pd.to_numeric(nodes["z_scope"], errors="coerce")
     nodes["anomaly_score"] = pd.to_numeric(nodes["anomaly_score"], errors="coerce")
-    nodes["Delta GMV"] = pd.to_numeric(nodes["Delta GMV"], errors="coerce")
+    nodes[delta_column] = pd.to_numeric(nodes[delta_column], errors="coerce")
+    for numeric_column in (numerator_column, denominator_column):
+        if numeric_column is not None:
+            nodes[numeric_column] = pd.to_numeric(
+                nodes[numeric_column], errors="coerce"
+            )
     nodes["номер добавления в менеджерский вывод"] = pd.to_numeric(
         nodes["номер добавления в менеджерский вывод"],
         errors="coerce",
@@ -1529,8 +1575,49 @@ def build_anomaly_tree_from_excel(
                 lines.extend(_wrap_tree_detail_line(child_suffix))
         return lines if len(lines) > 1 else []
 
-    nodes["is_manager_output"] = nodes["номер добавления в менеджерский вывод"].notna()
-    nodes["tree_detail_lines"] = nodes.apply(build_tree_detail_lines, axis=1)
+    if selected_column is None:
+        nodes["is_manager_output"] = nodes["номер добавления в менеджерский вывод"].notna()
+    else:
+        nodes["is_manager_output"] = nodes[selected_column].map(
+            lambda value: str(value).strip().lower() in {"true", "1", "yes"}
+            or _safe_float(value, 0.0) == 1.0
+        )
+
+    def build_metric_detail_lines(row: pd.Series) -> List[str]:
+        """ADDED: Добавить текущие компоненты доли в карточку.
+
+        Args:
+            row: Строка узла long-таблицы.
+
+        Returns:
+            Строки с числителем и знаменателем.
+
+        Raises:
+            ValueError: Не выбрасывается.
+
+        Examples:
+            >>> build_metric_detail_lines(pd.Series(dtype=object))
+            []
+        """
+
+        lines: List[str] = []
+        if numerator_column is not None:
+            numerator = _safe_float(row.get(numerator_column), math.nan)
+            if math.isfinite(numerator):
+                lines.append(f"Числитель: {numerator:,.0f}".replace(",", " "))
+        if denominator_column is not None:
+            denominator = _safe_float(row.get(denominator_column), math.nan)
+            if math.isfinite(denominator):
+                lines.append(f"Знаменатель: {denominator:,.0f}".replace(",", " "))
+        return lines
+
+    nodes["tree_detail_lines"] = nodes.apply(
+        lambda row: [
+            *build_tree_detail_lines(row),
+            *build_metric_detail_lines(row),
+        ],
+        axis=1,
+    )
     # ADDED: Перечёркиваем ровно те карточки, в которых показан статус
     # доминирующего ребёнка, включая вариант с применённым cap.
     dominant_child_status_labels = {
@@ -1791,8 +1878,8 @@ def build_anomaly_tree_from_excel(
             node = records[node_id]
             center_x, center_y = positions[node_id]
             node_height = node_heights[int(depth)]
-            delta_gmv = _safe_float(node["Delta GMV"])
-            positive = delta_gmv >= 0
+            delta_value = _safe_float(node[delta_column])
+            positive = delta_value >= 0
             facecolor = "#eff9f1" if positive else "#fff0f0"
             edgecolor = "#afd8b8" if positive else "#f0b2b2"
             accent = "#49a15d" if positive else "#df4d4d"
@@ -1892,7 +1979,12 @@ def build_anomaly_tree_from_excel(
             axis.text(
                 left + 0.14,
                 delta_y,
-                f"ΔGMV: {'+' if delta_gmv > 0 else ''}{_format_rub(delta_gmv)}",
+                f"{delta_label}: {'+' if delta_value > 0 else ''}"
+                + (
+                    _format_rub(delta_value)
+                    if delta_column == "Delta GMV"
+                    else f"{delta_value:.3f}"
+                ),
                 color="#171717",
                 fontsize=6.3,
                 fontweight="bold",
@@ -1942,14 +2034,23 @@ def build_anomaly_tree_from_excel(
             sequence += 1
 
     figure.suptitle(
-        "Граф",
+        "Граф" if metric_name is None else f"Граф: {metric_name}",
         fontsize=15,
         y=0.985,
     )
     legend_handles = [
-        Patch(facecolor="#eff9f1", edgecolor="#afd8b8", label="Положительный ΔGMV"),
-        Patch(facecolor="#fff0f0", edgecolor="#f0b2b2", label="Отрицательный ΔGMV"),
-        Patch(facecolor="white", edgecolor="#172554", linewidth=2.4, label="Попал в менеджерский вывод"),
+        Patch(facecolor="#eff9f1", edgecolor="#afd8b8", label=f"Положительный {delta_label}"),
+        Patch(facecolor="#fff0f0", edgecolor="#f0b2b2", label=f"Отрицательный {delta_label}"),
+        Patch(
+            facecolor="white",
+            edgecolor="#172554",
+            linewidth=2.4,
+            label=(
+                "Выбран Set Packing"
+                if selected_column is not None
+                else "Попал в менеджерский вывод"
+            ),
+        ),
         Patch(facecolor="white", edgecolor="#8b9bb2", linestyle="--", label="Изолированный сегмент"),
         Line2D([0], [0], color="#2563eb", linewidth=1.4, label="Одинаковый цвет рёбер — один ребёнок"),
     ]
@@ -1969,6 +2070,123 @@ def build_anomaly_tree_from_excel(
     return tree_path.resolve()
 
 
+def build_ratio_analysis_sheets(
+    candidates: pd.DataFrame,
+    final_df: pd.DataFrame,
+) -> Tuple[pd.DataFrame, pd.DataFrame]:
+    """ADDED: Сформировать два long-листа долевых метрик.
+
+    Args:
+        candidates: Диагностика всех сегментов после независимого Set Packing.
+        final_df: Выбранные Set Packing сегменты.
+
+    Returns:
+        Пара: первичные аномалии и структурные изменения; только выбранные аномалии.
+
+    Raises:
+        ValueError: Если в непустой диагностике нет обязательных long-колонок.
+
+    Examples:
+        >>> analysis, selected = build_ratio_analysis_sheets(pd.DataFrame(), pd.DataFrame())
+        >>> analysis.empty and selected.empty
+        True
+    """
+
+    leading_columns = [
+        "metric_name",
+        "сегмент",
+        "глубина",
+        "z_scope",
+        "выбран",
+        "row_scope",
+        "metric_value_current",
+        "metric_value_previous",
+        "metric_delta",
+        "metric_delta_pp",
+        "numerator_current",
+        "numerator_previous",
+        "denominator_current",
+        "denominator_previous",
+    ]
+    if candidates.empty:
+        return pd.DataFrame(columns=leading_columns), pd.DataFrame(columns=leading_columns)
+    required = {
+        "metric_name",
+        "segment_id",
+        "segment_key",
+        "slice_depth",
+        "robust_z",
+        "passes_initial_anomaly_filter",
+        "state",
+    }
+    missing = sorted(required - set(candidates.columns))
+    if missing:
+        raise ValueError(
+            f"Для long-отчёта долей не хватает колонок: {missing}"
+        )
+
+    selected_keys = set()
+    if not final_df.empty:
+        selected_keys = set(
+            zip(
+                final_df["metric_name"].astype(str),
+                final_df["segment_id"].astype(str),
+            )
+        )
+
+    def prepare(frame: pd.DataFrame, selected_only: bool) -> pd.DataFrame:
+        """ADDED: Нормализовать один long-лист.
+
+        Args:
+            frame: Расчётные строки.
+            selected_only: Оставить только выбранные оптимизацией строки.
+
+        Returns:
+            Long-таблица с алиасами для графа.
+
+        Raises:
+            ValueError: Не выбрасывается.
+
+        Examples:
+            >>> # prepare(candidates, False)
+        """
+
+        result = frame.copy()
+        result["выбран"] = [
+            (str(metric), str(segment_id)) in selected_keys
+            for metric, segment_id in zip(
+                result["metric_name"], result["segment_id"]
+            )
+        ]
+        if selected_only:
+            result = result[result["выбран"]].copy()
+        else:
+            result = result[
+                result["passes_initial_anomaly_filter"].eq(True)
+                | result["state"].astype(str).ne("обычный")
+            ].copy()
+        result["row_scope"] = "solver_candidate"
+        structure_mask = result["state"].astype(str).ne("обычный")
+        result.loc[structure_mask, "row_scope"] = "structure_change"
+        result.loc[
+            structure_mask & result["passes_initial_anomaly_filter"].eq(True),
+            "row_scope",
+        ] = "solver_candidate+structure_change"
+        result["сегмент"] = result["segment_key"].astype(str)
+        result["глубина"] = result["slice_depth"].astype(int)
+        result["z_scope"] = result["robust_z"].astype(float)
+        ordered = [
+            *[column for column in leading_columns if column in result.columns],
+            *[column for column in result.columns if column not in leading_columns],
+        ]
+        return result[ordered].sort_values(
+            ["metric_name", "глубина", "сегмент"],
+            kind="stable",
+        ).reset_index(drop=True)
+
+    return prepare(candidates, False), prepare(candidates, True)
+
+
 def write_anomaly_excel(
     output_path: str | Path,
     thresholds: AnomalyThresholds,
@@ -1983,6 +2201,8 @@ def write_anomaly_excel(
     current_cal_date: int,
     coverage: Dict[str, frozenset[str]],
     optimization_decision_log: pd.DataFrame,
+    ratio_candidates: Optional[pd.DataFrame] = None,
+    ratio_final_df: Optional[pd.DataFrame] = None,
 ) -> None:
     """Записать результат поиска аномалий в Excel.
 
@@ -2000,6 +2220,8 @@ def write_anomaly_excel(
         current_cal_date: Текущая неделя.
         coverage: Покрытие кандидатов атомами.
         optimization_decision_log: Журнал построения и решения Set Packing.
+        ratio_candidates: Long-диагностика долевых метрик.
+        ratio_final_df: Выбранные Set Packing аномалии долевых метрик.
 
     Returns:
         None.
@@ -2048,6 +2270,10 @@ def write_anomaly_excel(
     anomaly_analysis = build_anomaly_analysis_sheet(candidates, final_df, thresholds)
     history_top = build_history_for_selected(panel_df, final_df, total_by_date)
     missing_zero = build_missing_zero_report(panel_df, dates, current_cal_date)
+    ratio_analysis, ratio_selected = build_ratio_analysis_sheets(
+        ratio_candidates if ratio_candidates is not None else pd.DataFrame(),
+        ratio_final_df if ratio_final_df is not None else pd.DataFrame(),
+    )
 
     final_cols = [
         "rank",
@@ -2133,6 +2359,9 @@ def write_anomaly_excel(
         missing_zero.to_excel(writer, sheet_name="05_Пропуски_и_нули", index=False)
         control.to_excel(writer, sheet_name="06_Контроль", index=False)
         optimization_decision_log.to_excel(writer, sheet_name="07_Журнал_set_packing", index=False)
+        # ADDED: GMV не дублируется в новых long-листах.
+        ratio_analysis.to_excel(writer, sheet_name="Анализ долевых метрик", index=False)
+        ratio_selected.to_excel(writer, sheet_name="Аномалии долевых метрик", index=False)
 
         highlight_manager_rows_on_anomaly_analysis(writer.sheets["Анализ аномалий"])
 
