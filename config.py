@@ -9,7 +9,7 @@ from pathlib import Path
 # FIXED: После переноса всех файлов в пакет сохраняем прежнюю базу путей — корень проекта.
 _PROJECT_ROOT = Path(__file__).resolve().parent.parent
 
-date_string = "28_07"
+date_string = "03_08"
 
 # ADDED: Все параметры запуска задаются здесь; CLI-аргументы больше не используются.
 INPUT_PATH = _PROJECT_ROOT / f"payoffline_pulse_hier_{date_string}.xlsx"

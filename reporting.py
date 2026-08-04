@@ -566,6 +566,7 @@ def build_anomaly_analysis_sheet(candidates: pd.DataFrame, final_df: pd.DataFram
         "hierarchy_dominance_cap_score",
         "hierarchy_dominance_rule_matches",
         "hierarchy_dominance_cap_applied",
+        "hierarchy_dominance_cap_status",
         "hierarchy_dominant_child_segment",
         "hierarchy_score_factor",
         "anomaly_score",
@@ -860,6 +861,10 @@ def build_anomaly_analysis_sheet(candidates: pd.DataFrame, final_df: pd.DataFram
                 "hierarchy_dominance_cap_applied",
                 pd.Series(False, index=analysis.index),
             ).astype(bool),
+            "hierarchy_dominance_cap_status": analysis.get(
+                "hierarchy_dominance_cap_status",
+                pd.Series("NOT_APPLICABLE", index=analysis.index),
+            ).astype(str),
             "hierarchy_dominant_child_segment": analysis[
                 "hierarchy_dominant_child_segment"
             ],
@@ -1330,6 +1335,8 @@ def build_anomaly_tree_from_excel(
     selected_column: str | None = None,
     numerator_column: str | None = None,
     denominator_column: str | None = None,
+    numerator_delta_column: str | None = None,
+    denominator_delta_column: str | None = None,
 ) -> Path:
     """Построить дерево аномальных сегментов по листу итогового Excel-файла.
 
@@ -1352,6 +1359,10 @@ def build_anomaly_tree_from_excel(
         selected_column: Boolean-колонка отбора Set Packing.
         numerator_column: Колонка текущего числителя для карточки.
         denominator_column: Колонка текущего знаменателя для карточки.
+        numerator_delta_column: Колонка разности числителя между текущим и
+            предыдущим периодами для карточки.
+        denominator_delta_column: Колонка разности знаменателя между текущим
+            и предыдущим периодами для карточки.
 
     Returns:
         Путь к созданному файлу визуализации.
@@ -1422,6 +1433,8 @@ def build_anomaly_tree_from_excel(
         selected_column,
         numerator_column,
         denominator_column,
+        numerator_delta_column,
+        denominator_delta_column,
     ):
         if optional_required is not None:
             required_columns.add(optional_required)
@@ -1453,7 +1466,12 @@ def build_anomaly_tree_from_excel(
     nodes["z_scope"] = pd.to_numeric(nodes["z_scope"], errors="coerce")
     nodes["anomaly_score"] = pd.to_numeric(nodes["anomaly_score"], errors="coerce")
     nodes[delta_column] = pd.to_numeric(nodes[delta_column], errors="coerce")
-    for numeric_column in (numerator_column, denominator_column):
+    for numeric_column in (
+        numerator_column,
+        denominator_column,
+        numerator_delta_column,
+        denominator_delta_column,
+    ):
         if numeric_column is not None:
             nodes[numeric_column] = pd.to_numeric(
                 nodes[numeric_column], errors="coerce"
@@ -1584,13 +1602,13 @@ def build_anomaly_tree_from_excel(
         )
 
     def build_metric_detail_lines(row: pd.Series) -> List[str]:
-        """ADDED: Добавить текущие компоненты доли в карточку.
+        """ADDED: Добавить компоненты и их межнедельные дельты в карточку.
 
         Args:
             row: Строка узла long-таблицы.
 
         Returns:
-            Строки с числителем и знаменателем.
+            Строки с числителем, знаменателем и их дельтами.
 
         Raises:
             ValueError: Не выбрасывается.
@@ -1609,6 +1627,22 @@ def build_anomaly_tree_from_excel(
             denominator = _safe_float(row.get(denominator_column), math.nan)
             if math.isfinite(denominator):
                 lines.append(f"Знаменатель: {denominator:,.0f}".replace(",", " "))
+        if numerator_delta_column is not None:
+            numerator_delta = _safe_float(
+                row.get(numerator_delta_column), math.nan
+            )
+            if math.isfinite(numerator_delta):
+                lines.append(
+                    f"Δ числителя: {numerator_delta:+,.0f}".replace(",", " ")
+                )
+        if denominator_delta_column is not None:
+            denominator_delta = _safe_float(
+                row.get(denominator_delta_column), math.nan
+            )
+            if math.isfinite(denominator_delta):
+                lines.append(
+                    f"Δ знаменателя: {denominator_delta:+,.0f}".replace(",", " ")
+                )
         return lines
 
     nodes["tree_detail_lines"] = nodes.apply(
@@ -2105,8 +2139,10 @@ def build_ratio_analysis_sheets(
         "metric_delta_pp",
         "numerator_current",
         "numerator_previous",
+        "numerator_delta",
         "denominator_current",
         "denominator_previous",
+        "denominator_delta",
     ]
     if candidates.empty:
         return pd.DataFrame(columns=leading_columns), pd.DataFrame(columns=leading_columns)
@@ -2312,6 +2348,7 @@ def write_anomaly_excel(
         "hierarchy_single_child_uncapped_score",
         "hierarchy_dominance_cap_score",
         "hierarchy_dominance_cap_applied",
+        "hierarchy_dominance_cap_status",
         "hierarchy_score_factor",
         "anomaly_score",
         "selection_score",

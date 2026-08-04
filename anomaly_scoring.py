@@ -367,6 +367,12 @@ def calculate_ratio_segment_anomaly(
     numerator_previous = _safe_float(numerator.loc[previous_cal_date], 0.0)
     denominator_current = _safe_float(denominator.loc[current_cal_date], 0.0)
     denominator_previous = _safe_float(denominator.loc[previous_cal_date], 0.0)
+    row_missing_in_source = indexed.get(
+        "row_missing_in_source",
+        pd.Series(False, index=indexed.index),
+    ).reindex(dates, fill_value=False)
+    row_missing_current = bool(row_missing_in_source.loc[current_cal_date])
+    row_missing_previous = bool(row_missing_in_source.loc[previous_cal_date])
     earlier_nonzero_numerator_weeks = int(
         (numerator.reindex(dates[: current_idx - 1]) > 0.0).sum()
     )
@@ -381,17 +387,15 @@ def calculate_ratio_segment_anomaly(
 
     history_nonzero_weeks = int((gmv.reindex(dates[:current_idx]) > 0.0).sum())
     mean_denominator = (denominator_current + denominator_previous) / 2.0
-    hierarchy_movement = (
-        current_delta * mean_denominator
-        if metric_valid_for_scoring
-        else math.nan
-    )
-    row_missing_current = bool(
-        indexed.get(
-            "row_missing_in_source",
-            pd.Series(False, index=indexed.index),
-        ).reindex(dates, fill_value=False).loc[current_cal_date]
-    )
+    # FIXED: Физически отсутствующий в обеих сравниваемых неделях атом не
+    # определяет долю (0 / 0), но его вклад в movement для dominance capture
+    # равен нулю. Он всё равно остаётся неeligible для ratio-scoring.
+    if metric_valid_for_scoring:
+        hierarchy_movement = current_delta * mean_denominator
+    elif row_missing_current and row_missing_previous:
+        hierarchy_movement = 0.0
+    else:
+        hierarchy_movement = math.nan
     if row_missing_current:
         metric_status = "METRIC_ROW_MISSING_IN_SOURCE"
     elif denominator_current == 0.0:
@@ -411,8 +415,14 @@ def calculate_ratio_segment_anomaly(
         "metric_delta_pp": current_delta * 100.0 if metric_valid_for_scoring else math.nan,
         "numerator_current": numerator_current,
         "numerator_previous": numerator_previous,
+        # ADDED: Абсолютное межнедельное изменение числителя для long-отчёта
+        # и карточки дерева долевой метрики.
+        "numerator_delta": numerator_current - numerator_previous,
         "denominator_current": denominator_current,
         "denominator_previous": denominator_previous,
+        # ADDED: Абсолютное межнедельное изменение знаменателя для long-отчёта
+        # и карточки дерева долевой метрики.
+        "denominator_delta": denominator_current - denominator_previous,
         "mean_denominator": mean_denominator,
         "hierarchy_movement": hierarchy_movement,
         # ADDED: Технический alias сохраняет контракт Set Packing; это не GMV.
@@ -869,6 +879,8 @@ def apply_hierarchy_score_adjustment(
     result["hierarchy_single_child_uncapped_score"] = math.nan
     result["hierarchy_dominance_cap_score"] = math.nan
     result["hierarchy_dominance_cap_applied"] = False
+    # ADDED: Причина применения или безопасного пропуска dominance cap.
+    result["hierarchy_dominance_cap_status"] = "NOT_APPLICABLE"
     result["hierarchy_score_factor"] = 1.0
     result["anomaly_score"] = result["base_anomaly_score"].astype(float)
 
@@ -1040,52 +1052,62 @@ def apply_hierarchy_score_adjustment(
                     if not math.isfinite(atom_delta)
                 )
                 if invalid_atom_ids:
-                    raise ValueError(
-                        f"Для dominance cap родителя {parent_id} "
-                        f"некорректный {movement_column} атомов: "
-                        + ", ".join(invalid_atom_ids[:10])
+                    # FIXED: Не исключаем атом из знаменателя capture: это
+                    # искусственно завысило бы вклад потомка. Вместо этого
+                    # сохраняем обычный single-child factor и диагностируем
+                    # невозможность доказать dominance.
+                    capture = math.nan
+                    direction_match = pd.NA
+                    dominance_rule_matches = False
+                    adjusted_score = uncapped_score
+                    cap_applied = False
+                    cap_status = "SKIPPED_NONFINITE_ATOMIC_MOVEMENT"
+                else:
+                    parent_gross_atomic_movement = float(
+                        sum(abs(delta) for delta in atomic_delta_by_id.values())
                     )
-
-                parent_gross_atomic_movement = float(
-                    sum(abs(delta) for delta in atomic_delta_by_id.values())
-                )
-                if parent_gross_atomic_movement <= 0.0 and not allow_zero_movement:
-                    raise ValueError(
-                        f"Для dominance cap родителя {parent_id} абсолютное "
-                        "движение атомов должно быть положительным"
+                    if parent_gross_atomic_movement <= 0.0 and not allow_zero_movement:
+                        raise ValueError(
+                            f"Для dominance cap родителя {parent_id} абсолютное "
+                            "движение атомов должно быть положительным"
+                        )
+                    child_gross_atomic_movement = float(
+                        sum(
+                            abs(atomic_delta_by_id[atom_id])
+                            for atom_id in coverage_by_id[child_id]
+                        )
                     )
-                child_gross_atomic_movement = float(
-                    sum(
-                        abs(atomic_delta_by_id[atom_id])
-                        for atom_id in coverage_by_id[child_id]
+                    capture = (
+                        min(
+                            1.0,
+                            child_gross_atomic_movement
+                            / parent_gross_atomic_movement,
+                        )
+                        if parent_gross_atomic_movement > 0.0
+                        else math.nan
                     )
-                )
-                capture = (
-                    min(
-                        1.0,
-                        child_gross_atomic_movement
-                        / parent_gross_atomic_movement,
+                    direction_match = (
+                        delta_by_id[parent_id] * delta_by_id[child_id] > 0.0
                     )
-                    if parent_gross_atomic_movement > 0.0
-                    else math.nan
-                )
-                direction_match = (
-                    delta_by_id[parent_id] * delta_by_id[child_id] > 0.0
-                )
-                dominance_rule_matches = (
-                    direction_match
-                    and math.isfinite(capture)
-                    and capture >= float(dominant_child_capture_threshold)
-                )
-                adjusted_score = (
-                    min(uncapped_score, cap_score)
-                    if dominance_rule_matches
-                    else uncapped_score
-                )
-                cap_applied = (
-                    dominance_rule_matches
-                    and adjusted_score < uncapped_score
-                )
+                    dominance_rule_matches = (
+                        direction_match
+                        and math.isfinite(capture)
+                        and capture >= float(dominant_child_capture_threshold)
+                    )
+                    adjusted_score = (
+                        min(uncapped_score, cap_score)
+                        if dominance_rule_matches
+                        else uncapped_score
+                    )
+                    cap_applied = (
+                        dominance_rule_matches
+                        and adjusted_score < uncapped_score
+                    )
+                    cap_status = (
+                        "APPLIED"
+                        if cap_applied
+                        else "NOT_APPLIED_RULE_NOT_MET"
+                    )
                 factor = (
                     adjusted_score / base_parent_score
                     if base_parent_score != 0.0
@@ -1112,6 +1134,10 @@ def apply_hierarchy_score_adjustment(
                     parent_index,
                     "hierarchy_dominance_cap_applied",
                 ] = cap_applied
+                result.at[
+                    parent_index,
+                    "hierarchy_dominance_cap_status",
+                ] = cap_status
             else:
                 deltas = [delta_by_id[child_id] for child_id in best_group]
                 gross_delta = float(sum(abs(delta) for delta in deltas))

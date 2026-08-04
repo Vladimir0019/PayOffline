@@ -209,6 +209,8 @@ def run_anomaly_analysis(
                 selected_column="выбран",
                 numerator_column="numerator_current",
                 denominator_column="denominator_current",
+                numerator_delta_column="numerator_delta",
+                denominator_delta_column="denominator_delta",
             )
 
     return {

@@ -1112,6 +1112,76 @@ class GmvAnomalyRefactorTests(unittest.TestCase):
         self.assertFalse(bool(parent["hierarchy_dominance_cap_applied"]))
         self.assertAlmostEqual(float(parent["anomaly_score"]), 8.5)
 
+    def test_nonfinite_atomic_movement_skips_dominance_cap(self) -> None:
+        """ADDED: Не завышать capture при неопределённом движении атома.
+
+        Args:
+            Нет аргументов.
+
+        Returns:
+            None.
+
+        Raises:
+            AssertionError: Если cap применяется без полного атомарного
+                движения либо расчёт аварийно завершается.
+
+        Examples:
+            >>> # Запускается через unittest.
+        """
+
+        candidates = _candidate_frame(
+            [
+                {
+                    "segment_id": "p",
+                    "segment_key": "parent",
+                    "slice_depth": 1,
+                    "geo": "A",
+                    "product": None,
+                    "score": 10.0,
+                    "delta_gmv": 1_000.0,
+                },
+                {
+                    "segment_id": "eligible_child",
+                    "segment_key": "child=eligible",
+                    "slice_depth": 2,
+                    "geo": "A",
+                    "product": "X",
+                    "score": 8.0,
+                    "delta_gmv": 800.0,
+                },
+                {
+                    "segment_id": "unknown_atom",
+                    "segment_key": "child=unknown",
+                    "slice_depth": 2,
+                    "geo": "A",
+                    "product": "Y",
+                    "score": 1.0,
+                    "delta_gmv": math.nan,
+                },
+            ]
+        )
+        candidates.loc[
+            candidates["segment_id"] == "unknown_atom",
+            "passes_initial_anomaly_filter",
+        ] = False
+        coverage = {
+            "p": frozenset({"eligible_child", "unknown_atom"}),
+            "eligible_child": frozenset({"eligible_child"}),
+            "unknown_atom": frozenset({"unknown_atom"}),
+        }
+
+        scored = apply_hierarchy_score_adjustment(candidates, coverage)
+        parent = scored.loc[scored["segment_id"] == "p"].iloc[0]
+
+        self.assertTrue(math.isnan(float(parent["hierarchy_single_child_capture"])))
+        self.assertTrue(pd.isna(parent["hierarchy_single_child_direction_match"]))
+        self.assertFalse(bool(parent["hierarchy_dominance_cap_applied"]))
+        self.assertEqual(
+            parent["hierarchy_dominance_cap_status"],
+            "SKIPPED_NONFINITE_ATOMIC_MOVEMENT",
+        )
+        self.assertAlmostEqual(float(parent["anomaly_score"]), 8.5)
+
     def test_effective_balance_penalizes_unequal_tail(self) -> None:
         """ADDED: Учесть всё распределение eligible-изменений через B_eff.
 
@@ -1565,6 +1635,7 @@ class GmvAnomalyRefactorTests(unittest.TestCase):
         self.assertIn("hierarchy_score_factor", analysis_columns)
         self.assertIn("hierarchy_single_child_capture", analysis_columns)
         self.assertIn("hierarchy_dominance_cap_applied", analysis_columns)
+        self.assertIn("hierarchy_dominance_cap_status", analysis_columns)
         self.assertIn("z_scale_source", analysis_columns)
         self.assertIn("z_uses_sigma_floor", analysis_columns)
         self.assertNotIn("hierarchy_best_group_ids", analysis_columns)
@@ -1578,6 +1649,8 @@ class GmvAnomalyRefactorTests(unittest.TestCase):
         self.assertEqual(optimization_call.call_count, 2)
         self.assertIn("numerator_current", ratio_analysis.columns)
         self.assertIn("denominator_current", ratio_analysis.columns)
+        self.assertIn("numerator_delta", ratio_analysis.columns)
+        self.assertIn("denominator_delta", ratio_analysis.columns)
         self.assertEqual(
             list(result),
             [
@@ -1636,6 +1709,8 @@ class GmvAnomalyRefactorTests(unittest.TestCase):
         self.assertAlmostEqual(float(segment_a["baseline_metric_delta"]), 0.0)
         self.assertAlmostEqual(float(segment_a["robust_z"]), 30.0)
         self.assertAlmostEqual(float(segment_a["hierarchy_movement"]), 3.0)
+        self.assertAlmostEqual(float(segment_a["numerator_delta"]), 3.0)
+        self.assertAlmostEqual(float(segment_a["denominator_delta"]), 0.0)
         self.assertAlmostEqual(float(segment_a["materiality_share"]), 5.0 / 6.0)
         self.assertAlmostEqual(float(segment_a["reliability_factor"]), 0.4)
 
@@ -1682,6 +1757,48 @@ class GmvAnomalyRefactorTests(unittest.TestCase):
         analysis, selected = build_ratio_analysis_sheets(candidates, pd.DataFrame())
         self.assertEqual(set(analysis["сегмент"]), {"geo=A", "geo=B", "geo=C"})
         self.assertTrue(selected.empty)
+
+    def test_ratio_two_missing_weeks_have_zero_hierarchy_movement(self) -> None:
+        """ADDED: Сохранить невалидность доли при нулевом вкладе атома.
+
+        Args:
+            Нет аргументов.
+
+        Returns:
+            None.
+
+        Raises:
+            AssertionError: Если отсутствие строки превращает долю в ноль
+                либо оставляет ненужный NaN в hierarchy movement.
+
+        Examples:
+            >>> # Запускается через unittest.
+        """
+
+        spec = PILOT_RATIO_METRICS[0]
+        segment_panel = pd.DataFrame(
+            {
+                "cal_date": DATES,
+                "gmv": [100.0, 100.0, 0.0, 0.0],
+                spec.numerator_column: [1.0, 1.0, 0.0, 0.0],
+                spec.denominator_column: [10.0, 10.0, 0.0, 0.0],
+                spec.value_column: [0.1, 0.1, math.nan, math.nan],
+                "row_missing_in_source": [False, False, True, True],
+            }
+        )
+
+        result = calculate_ratio_segment_anomaly(
+            segment_panel,
+            DATES,
+            DATES[-1],
+            AnomalyThresholds(),
+            spec,
+        )
+
+        self.assertFalse(bool(result["metric_valid_for_scoring"]))
+        self.assertTrue(math.isnan(float(result["metric_delta"])))
+        self.assertEqual(result["metric_status"], "METRIC_ROW_MISSING_IN_SOURCE")
+        self.assertEqual(float(result["hierarchy_movement"]), 0.0)
 
     def test_ratio_input_contract_rejects_inconsistent_yql_value(self) -> None:
         """ADDED: Не пересчитывать долю в Python, а отклонять её расхождение с YQL-компонентами.
@@ -1745,7 +1862,7 @@ class GmvAnomalyRefactorTests(unittest.TestCase):
                 self.assertIn(column, final_select)
 
     def test_ratio_tree_accepts_long_sheet_with_components(self) -> None:
-        """ADDED: Построить отдельный граф доли с числителем и знаменателем.
+        """ADDED: Построить отдельный граф доли с компонентами и дельтами.
 
         Args:
             Нет аргументов.
@@ -1770,6 +1887,8 @@ class GmvAnomalyRefactorTests(unittest.TestCase):
             "выбран": True,
             "numerator_current": 50.0,
             "denominator_current": 100.0,
+            "numerator_delta": 15.0,
+            "denominator_delta": -20.0,
         }
         with TemporaryDirectory() as temp_dir:
             report_path = Path(temp_dir) / "ratio.xlsx"
@@ -1789,6 +1908,8 @@ class GmvAnomalyRefactorTests(unittest.TestCase):
                 selected_column="выбран",
                 numerator_column="numerator_current",
                 denominator_column="denominator_current",
+                numerator_delta_column="numerator_delta",
+                denominator_delta_column="denominator_delta",
             )
             self.assertEqual(created, tree_path.resolve())
             self.assertGreater(tree_path.stat().st_size, 0)
