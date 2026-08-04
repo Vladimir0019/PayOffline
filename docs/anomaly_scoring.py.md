@@ -106,20 +106,43 @@ robust_z = (current_metric_delta - baseline) / sigma
 
 `metric_value` берётся из YQL без повторного расчёта. Reliability в пилоте сохраняет GMV-правило.
 
+Для `contribution_mode = exact_atomic` сначала считается точный signed-вклад
+каждого атома `i` в изменение доли Total:
+
 ```text
-atomic_numerator_total = Σ numerator_current по атомам
-materiality_share = numerator_current(segment) / atomic_numerator_total
-mean_denominator = (denominator_current + denominator_previous) / 2
-hierarchy_movement = metric_delta × mean_denominator
+Contribution_i = 1/2 × (
+    (Δn_i − R0 × Δd_i) / D1
+    +
+    (Δn_i − R1 × Δd_i) / D0
+)
+
+Σ Contribution_i = R1 − R0
 ```
+
+Materiality измеряет долю gross-вклада атомов, покрываемых сегментом:
+
+```text
+global_gross = Σ abs(Contribution_i) по всем атомам
+
+materiality_share(segment) =
+    Σ abs(Contribution_i), i ∈ coverage(segment)
+    / global_gross
+```
+
+Она находится в `[0, 1]` и аддитивна для непересекающихся атомарных покрытий.
+Отдельно сохраняется signed `exact_global_net_contribution(segment)`. Прежние
+`numerator_current / atomic_numerator_total` и
+`metric_delta × mean_denominator` остаются в полях
+`legacy_materiality_share`/`legacy_hierarchy_movement` только для сравнения.
 
 Отдельного фильтра `min_numerator_scale` нет. Eligible-фильтр требует только
 определённую текущую и предыдущую долю, `slice_depth > 0`, z- и materiality-пороги.
 Нулевой числитель трактуется как бизнес-событие: `новый`, `возобновившийся` или
 `исчезнувший`; такая строка остаётся в long-диагностике, даже если не eligible.
 
-Pipeline вызывает `search_anomal` для GMV и для каждой доли отдельно. Технический
-`wow_delta_gmv` в долевом DataFrame — compatibility-alias `hierarchy_movement`, а не GMV.
+Pipeline вызывает `search_anomal` для GMV и для каждой доли отдельно. Технические
+`hierarchy_movement` и `wow_delta_gmv` в exact-режиме — compatibility-alias
+`exact_global_net_contribution`, а не GMV.
 
 ## Этап 4. Hierarchy-корректировка score
 
@@ -165,18 +188,21 @@ P*(p) = argmax_P Σ anomaly_score(c), c ∈ P
 hierarchy_score_factor = 1
 ```
 
-Если сильнейшая группа состоит из одного потомка:
+Если сильнейшая группа состоит из одного потомка, GMV сохраняет расчёт по
+`ΔGMV`. Для доли exact-вклады атомов пересчитываются относительно конкретного
+родителя `p`, то есть с его `R0(p)`, `R1(p)`, `D0(p)`, `D1(p)`:
 
 ```text
 single_child_uncapped_score =
     base_anomaly_score(parent) × single_child_factor
 
 capture =
-    Σ abs(ΔGMV атома), атом ∈ coverage(child)
-    / Σ abs(ΔGMV атома), атом ∈ coverage(parent)
+    Σ abs(Contribution(atom | parent)), атом ∈ coverage(child)
+    / Σ abs(Contribution(atom | parent)), атом ∈ coverage(parent)
 
 direction_match =
-    sign(ΔGMV child) = sign(ΔGMV parent)
+    sign(Σ Contribution(atom | parent), atom ∈ coverage(child))
+    = sign(R1(parent) − R0(parent))
 
 dominance_cap_score =
     anomaly_score(child) × (1 − dominant_child_score_margin)

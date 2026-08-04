@@ -80,6 +80,16 @@ TX/AU/AM/AOV/TPM/Freq. Проценты с нулевой базой или не
 | `Анализ долевых метрик` | Long-таблица eligible-кандидатов и lifecycle-изменений; GMV нет |
 | `Аномалии долевых метрик` | Только выбранные Set Packing долевые сегменты |
 
+Long-листы долей сохраняют одновременно рабочие exact-поля и legacy-диагностику:
+
+- `exact_global_net_contribution`, `exact_global_gross_contribution`,
+  `exact_materiality_share` — вклад относительно Total и materiality;
+- `hierarchy_parent_exact_metric_delta`,
+  `hierarchy_parent_exact_gross_contribution`,
+  `hierarchy_single_child_exact_net_contribution` — parent-relative dominance;
+- `legacy_materiality_share`, `legacy_hierarchy_movement` — прежние значения
+  для сопоставления результатов миграции.
+
 На всех листах фиксируется первая строка, включается autofilter, ширина колонок
 оценивается по первым 200 строкам и ограничивается диапазоном 10–48.
 
@@ -105,7 +115,11 @@ TX/AU/AM/AOV/TPM/Freq. Проценты с нулевой базой или не
 функция параметризована по `metric_name`, колонке/подписи дельты, признаку Set Packing и колонкам
 числителя/знаменателя и их абсолютным межнедельным дельтам. Пилотный граф
 `authzone_tx_share` показывает дельту доли в п.п., текущие числитель/знаменатель,
-а также `Δ числителя` и `Δ знаменателя`; выбранные узлы имеют толстую рамку.
+`Δ числителя`, `Δ знаменателя` и `Contribution` — точный аддитивный вклад
+сегмента в изменение доли Total по формуле exact contribution (в п.п.).
+Выбранные узлы имеют толстую рамку. Родитель зачёркивается, если его единственный
+eligible-ребёнок проходит dominance rule (`capture ≥ 80%` и совпадает направление);
+это не зависит от того, был ли cap численно связывающим.
 Файл долевого графа задаётся `config.RATIO_TREE_OUTPUT_PATH` и не зависит от GMV-пути.
 
 Обязательные колонки: `сегмент`, `глубина`, `z_scope`, `anomaly_score`,

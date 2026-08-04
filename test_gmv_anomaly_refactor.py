@@ -21,6 +21,7 @@ from gmv_anomaly.anomaly_scoring import (
     build_atomic_coverage,
     build_ratio_anomaly_candidates,
     calculate_segment_anomaly,
+    calculate_exact_ratio_contribution,
     calculate_ratio_segment_anomaly,
     validate_hierarchy_reconciliation,
 )
@@ -1112,6 +1113,182 @@ class GmvAnomalyRefactorTests(unittest.TestCase):
         self.assertFalse(bool(parent["hierarchy_dominance_cap_applied"]))
         self.assertAlmostEqual(float(parent["anomaly_score"]), 8.5)
 
+    def test_exact_parent_contribution_caps_dominant_child(self) -> None:
+        """ADDED: Применить cap по parent-relative exact contributions.
+
+        Args:
+            Нет аргументов.
+
+        Returns:
+            None.
+
+        Raises:
+            AssertionError: Если exact-вклады не дают capture 80% либо не
+                ограничивают score родителя ниже score ребёнка.
+
+        Examples:
+            >>> # Запускается через unittest.
+        """
+
+        candidates = _candidate_frame(
+            [
+                {
+                    "segment_id": "p",
+                    "segment_key": "parent",
+                    "slice_depth": 1,
+                    "geo": "A",
+                    "product": None,
+                    "score": 10.0,
+                    "delta_gmv": 0.25,
+                },
+                {
+                    "segment_id": "child",
+                    "segment_key": "child=X",
+                    "slice_depth": 2,
+                    "geo": "A",
+                    "product": "X",
+                    "score": 8.0,
+                    "delta_gmv": 0.40,
+                },
+                {
+                    "segment_id": "other_atom",
+                    "segment_key": "child=Y",
+                    "slice_depth": 2,
+                    "geo": "A",
+                    "product": "Y",
+                    "score": 1.0,
+                    "delta_gmv": 0.10,
+                },
+            ]
+        )
+        components = {
+            "p": (50.0, 100.0, 200.0, 200.0),
+            "child": (40.0, 80.0, 100.0, 100.0),
+            "other_atom": (10.0, 20.0, 100.0, 100.0),
+        }
+        for segment_id, values in components.items():
+            mask = candidates["segment_id"].eq(segment_id)
+            candidates.loc[mask, "numerator_previous"] = values[0]
+            candidates.loc[mask, "numerator_current"] = values[1]
+            candidates.loc[mask, "denominator_previous"] = values[2]
+            candidates.loc[mask, "denominator_current"] = values[3]
+        candidates.loc[
+            candidates["segment_id"].eq("other_atom"),
+            "passes_initial_anomaly_filter",
+        ] = False
+        coverage = {
+            "p": frozenset({"child", "other_atom"}),
+            "child": frozenset({"child"}),
+            "other_atom": frozenset({"other_atom"}),
+        }
+
+        scored = apply_hierarchy_score_adjustment(
+            candidates,
+            coverage,
+            contribution_mode="exact_atomic",
+        )
+        parent = scored.loc[scored["segment_id"].eq("p")].iloc[0]
+
+        self.assertAlmostEqual(
+            float(parent["hierarchy_parent_exact_metric_delta"]),
+            0.25,
+        )
+        self.assertAlmostEqual(
+            float(parent["hierarchy_parent_exact_gross_contribution"]),
+            0.25,
+        )
+        self.assertAlmostEqual(
+            float(parent["hierarchy_single_child_exact_net_contribution"]),
+            0.20,
+        )
+        self.assertAlmostEqual(
+            float(parent["hierarchy_single_child_capture"]),
+            0.80,
+        )
+        self.assertTrue(
+            bool(parent["hierarchy_single_child_direction_match"])
+        )
+        self.assertTrue(bool(parent["hierarchy_dominance_cap_applied"]))
+        self.assertAlmostEqual(float(parent["anomaly_score"]), 7.84)
+
+    def test_exact_parent_contributions_drive_multi_child_coherence(self) -> None:
+        """ADDED: Считать coherence в едином parent-relative масштабе.
+
+        Args:
+            Нет аргументов.
+
+        Returns:
+            None.
+
+        Raises:
+            AssertionError: Если multi-child coherence использует legacy
+                movement детей вместо точных вкладов относительно родителя.
+
+        Examples:
+            >>> # Запускается через unittest.
+        """
+
+        candidates = _candidate_frame(
+            [
+                {
+                    "segment_id": "p",
+                    "segment_key": "parent",
+                    "slice_depth": 1,
+                    "geo": "A",
+                    "product": None,
+                    "score": 10.0,
+                    "delta_gmv": 1.0,
+                },
+                {
+                    "segment_id": "left",
+                    "segment_key": "child=left",
+                    "slice_depth": 2,
+                    "geo": "A",
+                    "product": "X",
+                    "score": 4.0,
+                    "delta_gmv": 100.0,
+                },
+                {
+                    "segment_id": "right",
+                    "segment_key": "child=right",
+                    "slice_depth": 2,
+                    "geo": "A",
+                    "product": "Y",
+                    "score": 3.0,
+                    "delta_gmv": -100.0,
+                },
+            ]
+        )
+        components = {
+            "p": (20.0, 40.0, 200.0, 200.0),
+            "left": (10.0, 20.0, 100.0, 100.0),
+            "right": (10.0, 20.0, 100.0, 100.0),
+        }
+        for segment_id, values in components.items():
+            mask = candidates["segment_id"].eq(segment_id)
+            candidates.loc[mask, "numerator_previous"] = values[0]
+            candidates.loc[mask, "numerator_current"] = values[1]
+            candidates.loc[mask, "denominator_previous"] = values[2]
+            candidates.loc[mask, "denominator_current"] = values[3]
+        coverage = {
+            "p": frozenset({"left", "right"}),
+            "left": frozenset({"left"}),
+            "right": frozenset({"right"}),
+        }
+
+        scored = apply_hierarchy_score_adjustment(
+            candidates,
+            coverage,
+            contribution_mode="exact_atomic",
+        )
+        parent = scored.loc[scored["segment_id"].eq("p")].iloc[0]
+
+        self.assertEqual(int(parent["hierarchy_best_group_size"]), 2)
+        self.assertAlmostEqual(float(parent["hierarchy_direction_unity"]), 1.0)
+        self.assertAlmostEqual(float(parent["hierarchy_balance"]), 1.0)
+        self.assertAlmostEqual(float(parent["hierarchy_coherence"]), 1.0)
+        self.assertAlmostEqual(float(parent["hierarchy_score_factor"]), 1.15)
+
     def test_nonfinite_atomic_movement_skips_dominance_cap(self) -> None:
         """ADDED: Не завышать capture при неопределённом движении атома.
 
@@ -1668,8 +1845,8 @@ class GmvAnomalyRefactorTests(unittest.TestCase):
             ],
         )
 
-    def test_ratio_score_uses_absolute_share_delta_and_current_numerator(self) -> None:
-        """ADDED: Проверить z-score по п.п. и materiality по текущему числителю.
+    def test_ratio_score_uses_exact_contribution_materiality(self) -> None:
+        """FIXED: Проверить z-score и exact contribution-materiality доли.
 
         Args:
             Нет аргументов.
@@ -1678,7 +1855,8 @@ class GmvAnomalyRefactorTests(unittest.TestCase):
             None.
 
         Raises:
-            AssertionError: Если формула долевой метрики изменилась.
+            AssertionError: Если exact contribution или legacy-диагностика
+                рассчитаны неверно.
 
         Examples:
             >>> # Запускается через unittest.
@@ -1708,11 +1886,91 @@ class GmvAnomalyRefactorTests(unittest.TestCase):
         self.assertAlmostEqual(float(segment_a["metric_delta_pp"]), 30.0)
         self.assertAlmostEqual(float(segment_a["baseline_metric_delta"]), 0.0)
         self.assertAlmostEqual(float(segment_a["robust_z"]), 30.0)
-        self.assertAlmostEqual(float(segment_a["hierarchy_movement"]), 3.0)
+        self.assertAlmostEqual(float(segment_a["hierarchy_movement"]), 0.15)
+        self.assertAlmostEqual(float(segment_a["legacy_hierarchy_movement"]), 3.0)
         self.assertAlmostEqual(float(segment_a["numerator_delta"]), 3.0)
         self.assertAlmostEqual(float(segment_a["denominator_delta"]), 0.0)
-        self.assertAlmostEqual(float(segment_a["materiality_share"]), 5.0 / 6.0)
+        self.assertAlmostEqual(float(segment_a["materiality_share"]), 0.60)
+        self.assertAlmostEqual(
+            float(segment_a["legacy_materiality_share"]),
+            5.0 / 6.0,
+        )
+        self.assertEqual(segment_a["exact_contribution_status"], "OK")
         self.assertAlmostEqual(float(segment_a["reliability_factor"]), 0.4)
+        atomic = candidates[candidates["slice_depth"].eq(1)]
+        self.assertAlmostEqual(
+            float(atomic["exact_materiality_share"].sum()),
+            1.0,
+        )
+        self.assertAlmostEqual(
+            float(atomic["exact_global_net_contribution"].sum()),
+            float(atomic["exact_global_metric_delta"].iloc[0]),
+        )
+
+    def test_exact_ratio_contribution_is_additive_and_handles_missing_atoms(
+        self,
+    ) -> None:
+        """ADDED: Проверить точность формулы и отсутствующие недели атома.
+
+        Args:
+            Нет аргументов.
+
+        Returns:
+            None.
+
+        Raises:
+            AssertionError: Если сумма вкладов не равна изменению scope либо
+                пропуск одной/обеих недель создаёт нечисловой результат.
+
+        Examples:
+            >>> # Запускается через unittest.
+        """
+
+        scope_ratio_previous = 0.25
+        scope_ratio_current = 0.50
+        scope_denominator_previous = 200.0
+        scope_denominator_current = 200.0
+        first = calculate_exact_ratio_contribution(
+            40.0,
+            80.0,
+            100.0,
+            100.0,
+            scope_ratio_previous,
+            scope_ratio_current,
+            scope_denominator_previous,
+            scope_denominator_current,
+        )
+        second = calculate_exact_ratio_contribution(
+            10.0,
+            20.0,
+            100.0,
+            100.0,
+            scope_ratio_previous,
+            scope_ratio_current,
+            scope_denominator_previous,
+            scope_denominator_current,
+        )
+        self.assertAlmostEqual(first, 0.20)
+        self.assertAlmostEqual(second, 0.05)
+        self.assertAlmostEqual(first + second, 0.25)
+
+        missing_current = calculate_exact_ratio_contribution(
+            2.0, 0.0, 10.0, 0.0, 0.30, 0.40, 100.0, 120.0
+        )
+        missing_previous = calculate_exact_ratio_contribution(
+            0.0, 2.0, 0.0, 10.0, 0.30, 0.40, 100.0, 120.0
+        )
+        missing_both = calculate_exact_ratio_contribution(
+            0.0, 0.0, 0.0, 0.0, 0.30, 0.40, 100.0, 120.0
+        )
+        self.assertTrue(math.isfinite(missing_current))
+        self.assertTrue(math.isfinite(missing_previous))
+        self.assertEqual(missing_both, 0.0)
+
+        with self.assertRaisesRegex(ValueError, "знаменатели scope"):
+            calculate_exact_ratio_contribution(
+                0.0, 1.0, 0.0, 1.0, 0.0, 1.0, 0.0, 1.0
+            )
 
     def test_ratio_zero_numerator_is_reported_as_structure_change(self) -> None:
         """ADDED: Оставить новые и исчезнувшие операции вне solver-отбора.
@@ -1851,6 +2109,10 @@ class GmvAnomalyRefactorTests(unittest.TestCase):
             / "bi"
             / "pred_insight.yql"
         )
+        # FIXED: Это внешний integration-контракт, а не обязательный локальный
+        # fixture. Отсутствие checkout не должно маскировать регрессии Python.
+        if not yql_path.exists():
+            self.skipTest(f"Внешний YQL-файл недоступен: {yql_path}")
         yql = yql_path.read_text(encoding="utf-8")
         final_select = yql.split("INSERT INTO $output_table WITH TRUNCATE", 1)[1]
         for column in (
@@ -1889,6 +2151,8 @@ class GmvAnomalyRefactorTests(unittest.TestCase):
             "denominator_current": 100.0,
             "numerator_delta": 15.0,
             "denominator_delta": -20.0,
+            # ADDED: Вклад хранится в долях, а на графе показывается в п.п.
+            "exact_global_net_contribution": 0.059,
         }
         with TemporaryDirectory() as temp_dir:
             report_path = Path(temp_dir) / "ratio.xlsx"
@@ -1910,9 +2174,62 @@ class GmvAnomalyRefactorTests(unittest.TestCase):
                 denominator_column="denominator_current",
                 numerator_delta_column="numerator_delta",
                 denominator_delta_column="denominator_delta",
+                contribution_column="exact_global_net_contribution",
             )
             self.assertEqual(created, tree_path.resolve())
             self.assertGreater(tree_path.stat().st_size, 0)
+            self.assertIn("Contribution: +5.900", tree_path.read_text(encoding="utf-8"))
+
+    def test_ratio_report_exposes_dominant_child_for_tree(self) -> None:
+        """ADDED: Передать dominance rule доли в таблицу для зачёркивания.
+
+        Args:
+            Нет аргументов.
+
+        Returns:
+            None.
+
+        Raises:
+            AssertionError: Если long-лист не содержит признака и ключа ребёнка.
+
+        Examples:
+            >>> # Запускается через unittest.
+        """
+
+        candidates = pd.DataFrame(
+            [
+                {
+                    "metric_name": "authzone_tx_share",
+                    "segment_id": "parent",
+                    "segment_key": "geo=A",
+                    "slice_depth": 1,
+                    "robust_z": 3.0,
+                    "passes_initial_anomaly_filter": True,
+                    "state": "обычный",
+                    "hierarchy_dominance_rule_matches": True,
+                    "hierarchy_best_group_ids_json": '["child"]',
+                },
+                {
+                    "metric_name": "authzone_tx_share",
+                    "segment_id": "child",
+                    "segment_key": "geo=A × products=X",
+                    "slice_depth": 2,
+                    "robust_z": 3.1,
+                    "passes_initial_anomaly_filter": True,
+                    "state": "обычный",
+                    "hierarchy_dominance_rule_matches": False,
+                    "hierarchy_best_group_ids_json": "[]",
+                },
+            ]
+        )
+
+        analysis, _ = build_ratio_analysis_sheets(candidates, pd.DataFrame())
+        parent = analysis.loc[analysis["segment_id"].eq("parent")].iloc[0]
+        self.assertTrue(bool(parent["hierarchy_dominance_rule_matches"]))
+        self.assertEqual(
+            parent["hierarchy_dominant_child_segment"],
+            "geo=A × products=X",
+        )
 
     def test_tree_crosses_nodes_with_dominant_child_status(self) -> None:
         """ADDED: Проверить перечёркивание обоих статусов доминирования.

@@ -1337,6 +1337,8 @@ def build_anomaly_tree_from_excel(
     denominator_column: str | None = None,
     numerator_delta_column: str | None = None,
     denominator_delta_column: str | None = None,
+    contribution_column: str | None = None,
+    contribution_label: str = "Contribution",
 ) -> Path:
     """Построить дерево аномальных сегментов по листу итогового Excel-файла.
 
@@ -1363,6 +1365,9 @@ def build_anomaly_tree_from_excel(
             предыдущим периодами для карточки.
         denominator_delta_column: Колонка разности знаменателя между текущим
             и предыдущим периодами для карточки.
+        contribution_column: Колонка точного вклада сегмента в изменение
+            долевой метрики относительно Total. Вклад показывается в п.п.
+        contribution_label: Подпись точного вклада на карточке дерева.
 
     Returns:
         Путь к созданному файлу визуализации.
@@ -1435,6 +1440,7 @@ def build_anomaly_tree_from_excel(
         denominator_column,
         numerator_delta_column,
         denominator_delta_column,
+        contribution_column,
     ):
         if optional_required is not None:
             required_columns.add(optional_required)
@@ -2010,6 +2016,18 @@ def build_anomaly_tree_from_excel(
                     zorder=4,
                 )
             delta_y = bottom + 0.35
+            # FIXED: Contribution — часть главной строки изменения доли, а не
+            # мелкая техническая деталь. Поэтому он наследует её размер и bold.
+            contribution = (
+                _safe_float(node.get(contribution_column), math.nan)
+                if contribution_column is not None
+                else math.nan
+            )
+            contribution_suffix = (
+                f" ({contribution_label}: {contribution * 100.0:+.3f} п.п.)"
+                if math.isfinite(contribution)
+                else ""
+            )
             axis.text(
                 left + 0.14,
                 delta_y,
@@ -2018,7 +2036,8 @@ def build_anomaly_tree_from_excel(
                     _format_rub(delta_value)
                     if delta_column == "Delta GMV"
                     else f"{delta_value:.3f}"
-                ),
+                )
+                + contribution_suffix,
                 color="#171717",
                 fontsize=6.3,
                 fontweight="bold",
@@ -2170,6 +2189,80 @@ def build_ratio_analysis_sheets(
             )
         )
 
+    # ADDED: Долевое дерево использует тот же контракт доминирования, что и
+    # GMV-дерево. Зачёркивание определяется правилом, а не фактом снижения score.
+    segment_key_by_id = (
+        candidates.set_index(candidates["segment_id"].astype(str))["segment_key"]
+        .astype(str)
+        .to_dict()
+    )
+
+    def dominance_rule_matches(row: pd.Series) -> bool:
+        """ADDED: Проверить dominance rule для строки долевой метрики.
+
+        Args:
+            row: Строка диагностики кандидата.
+
+        Returns:
+            True, если единственный ребёнок покрывает порог capture и имеет
+            совпадающее направление изменения.
+
+        Raises:
+            ValueError: Не выбрасывается.
+
+        Examples:
+            >>> dominance_rule_matches(pd.Series({'hierarchy_best_group_size': 0}))
+            False
+        """
+
+        explicit_value = row.get("hierarchy_dominance_rule_matches", pd.NA)
+        if not pd.isna(explicit_value):
+            return (
+                str(explicit_value).strip().lower() in {"true", "1", "yes"}
+                or _safe_float(explicit_value, 0.0) == 1.0
+            )
+        # Совместимость со старыми diagnostics, в которых этого поля нет.
+        best_group_size = _safe_float(row.get("hierarchy_best_group_size"), math.nan)
+        capture = _safe_float(row.get("hierarchy_single_child_capture"), math.nan)
+        direction = row.get("hierarchy_single_child_direction_match", False)
+        direction_match = (
+            str(direction).strip().lower() in {"true", "1", "yes"}
+            or _safe_float(direction, 0.0) == 1.0
+        )
+        return (
+            best_group_size == 1.0
+            and math.isfinite(capture)
+            and capture >= 0.80
+            and direction_match
+        )
+
+    def dominant_child_segment(row: pd.Series) -> str:
+        """ADDED: Вернуть ключ единственного доминирующего ребёнка.
+
+        Args:
+            row: Строка диагностики кандидата.
+
+        Returns:
+            Ключ ребёнка либо пустая строка.
+
+        Raises:
+            ValueError: Не выбрасывается.
+
+        Examples:
+            >>> dominant_child_segment(pd.Series({'hierarchy_best_group_size': 0}))
+            ''
+        """
+
+        if not dominance_rule_matches(row):
+            return ""
+        try:
+            child_ids = json.loads(str(row.get("hierarchy_best_group_ids_json", "[]")))
+        except (TypeError, ValueError, json.JSONDecodeError):
+            return ""
+        if not isinstance(child_ids, list) or len(child_ids) != 1:
+            return ""
+        return segment_key_by_id.get(str(child_ids[0]), "")
+
     def prepare(frame: pd.DataFrame, selected_only: bool) -> pd.DataFrame:
         """ADDED: Нормализовать один long-лист.
 
@@ -2211,6 +2304,14 @@ def build_ratio_analysis_sheets(
         result["сегмент"] = result["segment_key"].astype(str)
         result["глубина"] = result["slice_depth"].astype(int)
         result["z_scope"] = result["robust_z"].astype(float)
+        result["hierarchy_dominance_rule_matches"] = result.apply(
+            dominance_rule_matches,
+            axis=1,
+        )
+        result["hierarchy_dominant_child_segment"] = result.apply(
+            dominant_child_segment,
+            axis=1,
+        )
         ordered = [
             *[column for column in leading_columns if column in result.columns],
             *[column for column in result.columns if column not in leading_columns],

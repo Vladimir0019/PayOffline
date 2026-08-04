@@ -443,6 +443,173 @@ def calculate_ratio_segment_anomaly(
     }
 
 
+def calculate_exact_ratio_contribution(
+    numerator_previous: float,
+    numerator_current: float,
+    denominator_previous: float,
+    denominator_current: float,
+    scope_ratio_previous: float,
+    scope_ratio_current: float,
+    scope_denominator_previous: float,
+    scope_denominator_current: float,
+) -> float:
+    """ADDED: Рассчитать точный аддитивный вклад атома в изменение доли scope.
+
+    Args:
+        numerator_previous: Числитель атома в предыдущем периоде.
+        numerator_current: Числитель атома в текущем периоде.
+        denominator_previous: Знаменатель атома в предыдущем периоде.
+        denominator_current: Знаменатель атома в текущем периоде.
+        scope_ratio_previous: Доля декомпозируемого scope в предыдущем периоде.
+        scope_ratio_current: Доля декомпозируемого scope в текущем периоде.
+        scope_denominator_previous: Знаменатель scope в предыдущем периоде.
+        scope_denominator_current: Знаменатель scope в текущем периоде.
+
+    Returns:
+        Signed-вклад атома; сумма вкладов атомов равна изменению доли scope.
+
+    Raises:
+        ValueError: Если входы не конечны либо знаменатель scope неположителен.
+
+    Examples:
+        >>> round(calculate_exact_ratio_contribution(2, 3, 10, 10, 0.2, 0.3, 100, 100), 6)
+        0.01
+    """
+
+    values = {
+        "numerator_previous": numerator_previous,
+        "numerator_current": numerator_current,
+        "denominator_previous": denominator_previous,
+        "denominator_current": denominator_current,
+        "scope_ratio_previous": scope_ratio_previous,
+        "scope_ratio_current": scope_ratio_current,
+        "scope_denominator_previous": scope_denominator_previous,
+        "scope_denominator_current": scope_denominator_current,
+    }
+    invalid = [
+        name
+        for name, value in values.items()
+        if not math.isfinite(float(value))
+    ]
+    if invalid:
+        raise ValueError(
+            "Для exact ratio contribution нужны конечные значения: "
+            + ", ".join(invalid)
+        )
+    if scope_denominator_previous <= 0.0 or scope_denominator_current <= 0.0:
+        raise ValueError(
+            "Для exact ratio contribution знаменатели scope должны быть положительными"
+        )
+
+    delta_numerator = float(numerator_current) - float(numerator_previous)
+    delta_denominator = float(denominator_current) - float(denominator_previous)
+    current_scale_term = (
+        delta_numerator
+        - float(scope_ratio_previous) * delta_denominator
+    ) / float(scope_denominator_current)
+    previous_scale_term = (
+        delta_numerator
+        - float(scope_ratio_current) * delta_denominator
+    ) / float(scope_denominator_previous)
+    return 0.5 * (current_scale_term + previous_scale_term)
+
+
+def _calculate_scope_atomic_contributions(
+    candidates: pd.DataFrame,
+    atom_ids: Sequence[str],
+    index_by_id: Dict[str, int],
+    *,
+    reconciliation_tolerance: float,
+) -> Tuple[Dict[str, float], float, float]:
+    """ADDED: Декомпозировать изменение доли scope по его атомам.
+
+    Args:
+        candidates: Расчётные строки всех сегментов долевой метрики.
+        atom_ids: Физические атомы декомпозируемого scope.
+        index_by_id: Соответствие ``segment_id -> index`` в candidates.
+        reconciliation_tolerance: Допуск проверки точной аддитивности.
+
+    Returns:
+        Кортеж: вклад каждого атома, изменение доли scope и gross-вклад.
+
+    Raises:
+        ValueError: Если атом отсутствует, компоненты невалидны, знаменатель
+            scope равен нулю или нарушена аддитивность формулы.
+
+    Examples:
+        >>> # contributions, delta, gross = _calculate_scope_atomic_contributions(...)
+    """
+
+    normalized_atom_ids = tuple(sorted(str(atom_id) for atom_id in atom_ids))
+    if not normalized_atom_ids:
+        raise ValueError("Для exact ratio contribution scope не содержит атомов")
+    missing = [atom_id for atom_id in normalized_atom_ids if atom_id not in index_by_id]
+    if missing:
+        raise ValueError(
+            "Для exact ratio contribution отсутствуют атомы: "
+            + ", ".join(missing[:10])
+        )
+
+    component_columns = (
+        "numerator_previous",
+        "numerator_current",
+        "denominator_previous",
+        "denominator_current",
+    )
+    atomic_values: Dict[str, Tuple[float, float, float, float]] = {}
+    for atom_id in normalized_atom_ids:
+        index = index_by_id[atom_id]
+        values = tuple(
+            _safe_float(candidates.at[index, column], math.nan)
+            for column in component_columns
+        )
+        if not all(math.isfinite(value) for value in values):
+            raise ValueError(
+                f"У атома {atom_id} невалидны компоненты exact ratio contribution"
+            )
+        atomic_values[atom_id] = values
+
+    scope_numerator_previous = float(sum(values[0] for values in atomic_values.values()))
+    scope_numerator_current = float(sum(values[1] for values in atomic_values.values()))
+    scope_denominator_previous = float(sum(values[2] for values in atomic_values.values()))
+    scope_denominator_current = float(sum(values[3] for values in atomic_values.values()))
+    if scope_denominator_previous <= 0.0 or scope_denominator_current <= 0.0:
+        raise ValueError(
+            "Для exact ratio contribution знаменатели scope должны быть положительными"
+        )
+    scope_ratio_previous = scope_numerator_previous / scope_denominator_previous
+    scope_ratio_current = scope_numerator_current / scope_denominator_current
+    scope_delta = scope_ratio_current - scope_ratio_previous
+
+    contributions = {
+        atom_id: calculate_exact_ratio_contribution(
+            numerator_previous=values[0],
+            numerator_current=values[1],
+            denominator_previous=values[2],
+            denominator_current=values[3],
+            scope_ratio_previous=scope_ratio_previous,
+            scope_ratio_current=scope_ratio_current,
+            scope_denominator_previous=scope_denominator_previous,
+            scope_denominator_current=scope_denominator_current,
+        )
+        for atom_id, values in atomic_values.items()
+    }
+    contribution_sum = float(sum(contributions.values()))
+    tolerance = max(float(reconciliation_tolerance), 1e-12)
+    if not math.isclose(
+        contribution_sum,
+        scope_delta,
+        rel_tol=tolerance,
+        abs_tol=tolerance,
+    ):
+        raise ValueError(
+            "Нарушена аддитивность exact ratio contribution: "
+            f"sum={contribution_sum}, scope_delta={scope_delta}"
+        )
+    gross_contribution = float(sum(abs(value) for value in contributions.values()))
+    return contributions, float(scope_delta), gross_contribution
+
+
 def build_ratio_anomaly_candidates(
     panel_df: pd.DataFrame,
     dim_cols: Sequence[str],
@@ -502,14 +669,105 @@ def build_ratio_anomaly_candidates(
     atomic = candidates[candidates["slice_depth"].eq(max_depth)]
     atomic_numerator_total = float(atomic["numerator_current"].astype(float).sum())
     candidates["atomic_numerator_total"] = atomic_numerator_total
-    candidates["materiality_share"] = 0.0
+    candidates["legacy_materiality_share"] = 0.0
     if atomic_numerator_total > 0.0:
-        candidates["materiality_share"] = (
+        candidates["legacy_materiality_share"] = (
             candidates["numerator_current"].astype(float) / atomic_numerator_total
         )
+    candidates["legacy_hierarchy_movement"] = candidates[
+        "hierarchy_movement"
+    ].astype(float)
+
+    contribution_mode = str(spec.contribution_mode).strip().lower()
+    if contribution_mode not in {"exact_atomic", "legacy_proxy"}:
+        raise ValueError(
+            f"Неизвестный contribution_mode={spec.contribution_mode!r} "
+            f"для метрики {spec.name!r}"
+        )
+    candidates["ratio_contribution_mode"] = contribution_mode
+    candidates["exact_contribution_status"] = "NOT_CALCULATED"
+    candidates["exact_global_net_contribution"] = math.nan
+    candidates["exact_global_gross_contribution"] = math.nan
+    candidates["exact_global_gross_atomic_contribution"] = math.nan
+    candidates["exact_global_metric_delta"] = math.nan
+    candidates["exact_materiality_share"] = 0.0
+    candidates["exact_contribution_valid"] = False
+
+    effective_coverage = coverage or build_atomic_coverage(candidates, dim_cols)
+    all_index_by_id = {
+        str(row["segment_id"]): int(index)
+        for index, row in candidates.iterrows()
+    }
+    atomic_ids = tuple(str(atom_id) for atom_id in atomic["segment_id"])
+    try:
+        global_contributions, global_delta, global_gross = (
+            _calculate_scope_atomic_contributions(
+                candidates,
+                atomic_ids,
+                all_index_by_id,
+                reconciliation_tolerance=spec.validation_abs_tolerance,
+            )
+        )
+    except ValueError as exc:
+        contribution_error = str(exc)
+        if "знаменатели scope" not in contribution_error:
+            raise
+        candidates["exact_contribution_status"] = (
+            "SKIPPED_ZERO_GLOBAL_DENOMINATOR"
+        )
+        if contribution_mode == "exact_atomic":
+            candidates["materiality_share"] = 0.0
+            candidates["hierarchy_movement"] = math.nan
+            candidates["wow_delta_gmv"] = math.nan
+        else:
+            candidates["materiality_share"] = candidates[
+                "legacy_materiality_share"
+            ]
+    else:
+        for index, row in candidates.iterrows():
+            segment_id = str(row["segment_id"])
+            segment_atoms = effective_coverage.get(segment_id, frozenset())
+            net_contribution = float(
+                sum(global_contributions[atom_id] for atom_id in segment_atoms)
+            )
+            gross_contribution = float(
+                sum(abs(global_contributions[atom_id]) for atom_id in segment_atoms)
+            )
+            materiality = (
+                min(1.0, gross_contribution / global_gross)
+                if global_gross > 0.0
+                else 0.0
+            )
+            candidates.at[index, "exact_global_net_contribution"] = net_contribution
+            candidates.at[index, "exact_global_gross_contribution"] = gross_contribution
+            candidates.at[index, "exact_global_gross_atomic_contribution"] = global_gross
+            candidates.at[index, "exact_materiality_share"] = materiality
+            candidates.at[index, "exact_contribution_valid"] = True
+            candidates.at[index, "exact_contribution_status"] = "OK"
+        candidates["exact_global_metric_delta"] = float(global_delta)
+        if contribution_mode == "exact_atomic":
+            candidates["materiality_share"] = candidates[
+                "exact_materiality_share"
+            ].astype(float)
+            # FIXED: Compatibility-поля для Set Packing теперь содержат
+            # signed exact contribution относительно Total, а не legacy proxy.
+            candidates["hierarchy_movement"] = candidates[
+                "exact_global_net_contribution"
+            ].astype(float)
+            candidates["wow_delta_gmv"] = candidates[
+                "exact_global_net_contribution"
+            ].astype(float)
+        else:
+            candidates["materiality_share"] = candidates[
+                "legacy_materiality_share"
+            ].astype(float)
     candidates["passes_initial_anomaly_filter"] = (
         candidates["slice_depth"].gt(0)
-        & (atomic_numerator_total > 0.0)
+        & (
+            candidates["exact_contribution_valid"].eq(True)
+            if contribution_mode == "exact_atomic"
+            else (atomic_numerator_total > 0.0)
+        )
         & candidates["metric_valid_for_scoring"].eq(True)
         & candidates["abs_robust_z"].astype(float).ge(thresholds.min_z_score)
         & candidates["materiality_share"].astype(float).ge(
@@ -772,6 +1030,8 @@ def apply_hierarchy_score_adjustment(
     max_hierarchy_descendants: int = 25,
     movement_column: str = "wow_delta_gmv",
     allow_zero_movement: bool = False,
+    contribution_mode: str = "legacy_proxy",
+    contribution_reconciliation_tolerance: float = 1e-10,
 ) -> pd.DataFrame:
     """ADDED: Скорректировать score по coherence сильнейшей группы потомков.
 
@@ -797,6 +1057,11 @@ def apply_hierarchy_score_adjustment(
         movement_column: Аддитивное движение для hierarchy coherence.
         allow_zero_movement: Разрешить нулевое движение; нужно для долей,
             у которых z-score может быть аномальным при нулевой текущей дельте.
+        contribution_mode: ``legacy_proxy`` использует плоский movement,
+            ``exact_atomic`` пересчитывает вклад атомов относительно каждого
+            рассматриваемого родителя.
+        contribution_reconciliation_tolerance: Допуск проверки, что сумма
+            exact-вкладов атомов равна изменению доли родителя.
 
     Returns:
         Копия `candidates` с базовым и итоговым score, параметрами coherence,
@@ -828,6 +1093,20 @@ def apply_hierarchy_score_adjustment(
         "reliability_factor",
         movement_column,
     }
+    normalized_contribution_mode = str(contribution_mode).strip().lower()
+    if normalized_contribution_mode not in {"legacy_proxy", "exact_atomic"}:
+        raise ValueError(
+            f"Неизвестный contribution_mode={contribution_mode!r}"
+        )
+    if normalized_contribution_mode == "exact_atomic":
+        required_columns.update(
+            {
+                "numerator_previous",
+                "numerator_current",
+                "denominator_previous",
+                "denominator_current",
+            }
+        )
     missing_columns = sorted(required_columns - set(candidates.columns))
     if missing_columns:
         raise ValueError(
@@ -878,9 +1157,16 @@ def apply_hierarchy_score_adjustment(
     )
     result["hierarchy_single_child_uncapped_score"] = math.nan
     result["hierarchy_dominance_cap_score"] = math.nan
+    # ADDED: Семантический результат dominance rule для отчёта и графа.
+    result["hierarchy_dominance_rule_matches"] = False
     result["hierarchy_dominance_cap_applied"] = False
     # ADDED: Причина применения или безопасного пропуска dominance cap.
     result["hierarchy_dominance_cap_status"] = "NOT_APPLICABLE"
+    # ADDED: Parent-relative exact contribution не смешивается с глобальной
+    # contribution-materiality и сохраняется отдельной диагностикой.
+    result["hierarchy_parent_exact_metric_delta"] = math.nan
+    result["hierarchy_parent_exact_gross_contribution"] = math.nan
+    result["hierarchy_single_child_exact_net_contribution"] = math.nan
     result["hierarchy_score_factor"] = 1.0
     result["anomaly_score"] = result["base_anomaly_score"].astype(float)
 
@@ -1016,6 +1302,30 @@ def apply_hierarchy_score_adjustment(
             base_parent_score = float(
                 result.at[parent_index, "base_anomaly_score"]
             )
+            parent_atomic_contributions: Optional[Dict[str, float]] = None
+            parent_exact_delta = math.nan
+            parent_exact_gross = math.nan
+            if normalized_contribution_mode == "exact_atomic":
+                (
+                    parent_atomic_contributions,
+                    parent_exact_delta,
+                    parent_exact_gross,
+                ) = _calculate_scope_atomic_contributions(
+                    result,
+                    tuple(parent_atoms),
+                    all_index_by_id,
+                    reconciliation_tolerance=(
+                        contribution_reconciliation_tolerance
+                    ),
+                )
+                result.at[
+                    parent_index,
+                    "hierarchy_parent_exact_metric_delta",
+                ] = parent_exact_delta
+                result.at[
+                    parent_index,
+                    "hierarchy_parent_exact_gross_contribution",
+                ] = parent_exact_gross
             if best_group_size == 1:
                 child_id = best_group[0]
                 uncapped_score = base_parent_score * float(
@@ -1036,16 +1346,20 @@ def apply_hierarchy_score_adjustment(
                         "строки атомов: "
                         + ", ".join(missing_atom_ids[:10])
                     )
-                atomic_delta_by_id = {
-                    atom_id: _safe_float(
-                        result.at[
-                            all_index_by_id[atom_id],
-                            movement_column,
-                        ],
-                        math.nan,
-                    )
-                    for atom_id in parent_atoms
-                }
+                atomic_delta_by_id = (
+                    dict(parent_atomic_contributions)
+                    if parent_atomic_contributions is not None
+                    else {
+                        atom_id: _safe_float(
+                            result.at[
+                                all_index_by_id[atom_id],
+                                movement_column,
+                            ],
+                            math.nan,
+                        )
+                        for atom_id in parent_atoms
+                    }
+                )
                 invalid_atom_ids = sorted(
                     atom_id
                     for atom_id, atom_delta in atomic_delta_by_id.items()
@@ -1086,8 +1400,24 @@ def apply_hierarchy_score_adjustment(
                         if parent_gross_atomic_movement > 0.0
                         else math.nan
                     )
+                    child_net_contribution = float(
+                        sum(
+                            atomic_delta_by_id[atom_id]
+                            for atom_id in coverage_by_id[child_id]
+                        )
+                    )
+                    parent_direction_delta = (
+                        parent_exact_delta
+                        if parent_atomic_contributions is not None
+                        else delta_by_id[parent_id]
+                    )
+                    child_direction_delta = (
+                        child_net_contribution
+                        if parent_atomic_contributions is not None
+                        else delta_by_id[child_id]
+                    )
                     direction_match = (
-                        delta_by_id[parent_id] * delta_by_id[child_id] > 0.0
+                        parent_direction_delta * child_direction_delta > 0.0
                     )
                     dominance_rule_matches = (
                         direction_match
@@ -1132,14 +1462,35 @@ def apply_hierarchy_score_adjustment(
                 ] = cap_score
                 result.at[
                     parent_index,
+                    "hierarchy_dominance_rule_matches",
+                ] = dominance_rule_matches
+                result.at[
+                    parent_index,
                     "hierarchy_dominance_cap_applied",
                 ] = cap_applied
+                if parent_atomic_contributions is not None:
+                    result.at[
+                        parent_index,
+                        "hierarchy_single_child_exact_net_contribution",
+                    ] = child_net_contribution
                 result.at[
                     parent_index,
                     "hierarchy_dominance_cap_status",
                 ] = cap_status
             else:
-                deltas = [delta_by_id[child_id] for child_id in best_group]
+                deltas = (
+                    [
+                        float(
+                            sum(
+                                parent_atomic_contributions[atom_id]
+                                for atom_id in coverage_by_id[child_id]
+                            )
+                        )
+                        for child_id in best_group
+                    ]
+                    if parent_atomic_contributions is not None
+                    else [delta_by_id[child_id] for child_id in best_group]
+                )
                 gross_delta = float(sum(abs(delta) for delta in deltas))
                 if not math.isfinite(gross_delta) or (
                     gross_delta <= 0.0 and not allow_zero_movement

@@ -135,6 +135,10 @@ def run_anomaly_analysis(
             max_hierarchy_descendants=thresholds.max_hierarchy_descendants,
             movement_column="hierarchy_movement",
             allow_zero_movement=True,
+            contribution_mode=spec.contribution_mode,
+            contribution_reconciliation_tolerance=(
+                spec.validation_abs_tolerance
+            ),
         )
         ratio_final, ratio_diagnostics, ratio_log = search_anomal(
             ratio_candidates,
@@ -211,6 +215,9 @@ def run_anomaly_analysis(
                 denominator_column="denominator_current",
                 numerator_delta_column="numerator_delta",
                 denominator_delta_column="denominator_delta",
+                # ADDED: Точный вклад долевого сегмента относительно Total.
+                contribution_column="exact_global_net_contribution",
+                contribution_label="Contribution",
             )
 
     return {

@@ -170,6 +170,9 @@ class RatioMetricSpec:
         numerator_column: Аддитивный числитель.
         denominator_column: Аддитивный знаменатель.
         change_mode: Формула межнедельного изменения; в пилоте только ``absolute_delta``.
+        contribution_mode: Способ расчёта materiality и hierarchy contribution.
+            ``exact_atomic`` использует точную аддитивную формулу, ``legacy_proxy``
+            сохраняет прежний rate-effect для сравнительной диагностики.
         bounded: Ограничена ли доля интервалом `[0, 1]`.
         validation_abs_tolerance: Допуск сверки ``metric_value`` с ``numerator / denominator``.
 
@@ -189,6 +192,7 @@ class RatioMetricSpec:
     numerator_column: str
     denominator_column: str
     change_mode: str = "absolute_delta"
+    contribution_mode: str = "exact_atomic"
     bounded: bool = True
     validation_abs_tolerance: float = 1e-10
 
