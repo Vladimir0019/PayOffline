@@ -121,8 +121,8 @@ WHERE CAST(r.cal_date_index AS Int64) < $history_periods
 
 Запрос дополнительно пишет `success_rate`, `refund_tx_share`,
 `authzone_tx_share`, `payapp_tx_share`, `split_gmv_share`, `credlim_gmv_share`,
-`tips_gmv_share`, `cashback_gmv_share` и все их числители. Python-пилот сейчас использует
-`authzone_tx_share`, `authzone_tx_numerator` и `tx`; остальные пары готовы к последующему включению.
+`tips_gmv_share`, `cashback_gmv_share` и все их компоненты. Python рассчитывает
+все восемь метрик независимо; `share_in_total_gmv` в anomaly-scoring не входит.
 
 Важно: документация `payoffline_pulse_mvp.md` относится к Family B/MVP и
 описывает `payoffline_pulse_hier_mvp`, где GMV хранится в копейках. Это другой
@@ -142,8 +142,8 @@ output. В `pred_insight.yql` для `payoffline_pulse_hier` GMV явно дел
 - для каждого parent/date GMV совпадает с суммой покрытых атомов максимальной
   глубины; Python проверяет это до scoring с абсолютным допуском `1e-4` по
   умолчанию и немедленно прекращает расчёт при расхождении.
-- для пилота `authzone_tx_share` Python сверяет готовую YQL-долю с
-  `authzone_tx_numerator / tx`, а также аддитивно сверяет числитель и знаменатель по иерархии.
+- для каждой относительной метрики Python сверяет готовое YQL-значение с
+  `numerator / denominator`, а также аддитивно сверяет компоненты по иерархии.
 
 Если формат выгрузки `Date` меняется, сначала проверь фактическое представление
 `cal_date` в Excel/CSV: Python не парсит календарные строки как даты, а приводит

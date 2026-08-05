@@ -13,7 +13,7 @@ from .anomaly_scoring import (
     build_atomic_coverage,
     build_ratio_anomaly_candidates,
 )
-from .config import AnomalyThresholds, PILOT_RATIO_METRICS
+from .config import AnomalyThresholds, RATIO_METRICS
 from .data_preparation import build_full_week_grid, load_history_table
 from .reporting import (
     build_anomaly_tree_from_excel,
@@ -34,8 +34,9 @@ def run_anomaly_analysis(
     current_cal_date: Optional[int] = None,
     thresholds: Optional[AnomalyThresholds] = None,
     tree_output_path: str | Path | None = None,
+    ratio_trees_output_dir: str | Path | None = None,
     ratio_tree_output_path: str | Path | None = None,
-) -> Dict[str, pd.DataFrame]:
+) -> Dict[str, object]:
     """Запустить полный анализ необычных сегментов.
 
     Args:
@@ -48,8 +49,11 @@ def run_anomaly_analysis(
         thresholds: Пороги алгоритма. Если None, используются значения по умолчанию.
         tree_output_path: Необязательный путь к PNG, SVG или PDF с деревом
             листа «Анализ аномалий».
-        ratio_tree_output_path: Необязательный явный путь к графу
-            `authzone_tx_share`. Если None, долевой граф не создаётся.
+        ratio_trees_output_dir: Необязательный каталог восьми PNG-графов
+            относительных метрик. Если None, графы не создаются.
+        ratio_tree_output_path: Устаревший compatibility-параметр. Путь без
+            расширения трактуется как каталог; у пути к файлу используется
+            соседний каталог с именем файла без расширения.
 
     Returns:
         Словарь таблиц результата.
@@ -62,6 +66,19 @@ def run_anomaly_analysis(
     Examples:
         >>> # result = run_anomaly_analysis('input.xlsx', 'output.xlsx')
     """
+
+    if ratio_trees_output_dir is not None and ratio_tree_output_path is not None:
+        raise ValueError(
+            "Нельзя одновременно задавать ratio_trees_output_dir и "
+            "ratio_tree_output_path"
+        )
+    if ratio_trees_output_dir is None and ratio_tree_output_path is not None:
+        legacy_ratio_path = Path(ratio_tree_output_path)
+        ratio_trees_output_dir = (
+            legacy_ratio_path.parent / legacy_ratio_path.stem
+            if legacy_ratio_path.suffix
+            else legacy_ratio_path
+        )
 
     thresholds = thresholds or AnomalyThresholds()
     history_df, dims, dates = load_history_table(input_path, sheet_name=sheet_name, period=period, dim_cols=dim_cols)
@@ -99,7 +116,7 @@ def run_anomaly_analysis(
     ratio_final_frames = []
     ratio_log_frames = []
     ratio_status_rows = []
-    for spec in PILOT_RATIO_METRICS:
+    for spec in RATIO_METRICS:
         required_metric_columns = {
             spec.value_column,
             spec.numerator_column,
@@ -171,6 +188,8 @@ def run_anomaly_analysis(
         else pd.DataFrame(columns=["metric_name"])
     )
     ratio_status = pd.DataFrame(ratio_status_rows)
+    ratio_status["tree_status"] = "DISABLED"
+    ratio_status["tree_path"] = ""
     manager_df = build_manager_summary(final_df, thresholds, float(total_by_date.loc[current]), diagnostics)
     write_anomaly_excel(
         output_path,
@@ -191,23 +210,23 @@ def run_anomaly_analysis(
     )
     if tree_output_path is not None:
         build_anomaly_tree_from_excel(output_path, tree_output_path)
-    if ratio_tree_output_path is not None:
-        ratio_tree_rows = (
-            ratio_diagnostics[
-                ratio_diagnostics["metric_name"].astype(str).eq(
-                    "authzone_tx_share"
-                )
-                & ratio_diagnostics["passes_initial_anomaly_filter"].eq(True)
-            ]
-            if not ratio_diagnostics.empty
-            else pd.DataFrame()
-        )
-        if not ratio_tree_rows.empty:
-            build_anomaly_tree_from_excel(
+    if ratio_trees_output_dir is not None:
+        ratio_tree_dir = Path(ratio_trees_output_dir)
+        for spec in RATIO_METRICS:
+            status_mask = ratio_status["metric_name"].astype(str).eq(spec.name)
+            is_calculated = bool(
+                status_mask.any()
+                and ratio_status.loc[status_mask, "status"].iloc[0] == "CALCULATED"
+            )
+            if not is_calculated:
+                ratio_status.loc[status_mask, "tree_status"] = "SKIPPED_NOT_CALCULATED"
+                continue
+            tree_path = ratio_tree_dir / f"{spec.name}.png"
+            created_tree = build_anomaly_tree_from_excel(
                 output_path,
-                ratio_tree_output_path,
+                tree_path,
                 sheet_name="Анализ долевых метрик",
-                metric_name="authzone_tx_share",
+                metric_name=spec.name,
                 delta_column="metric_delta_pp",
                 delta_label="Δ доли, п.п.",
                 selected_column="выбран",
@@ -215,10 +234,13 @@ def run_anomaly_analysis(
                 denominator_column="denominator_current",
                 numerator_delta_column="numerator_delta",
                 denominator_delta_column="denominator_delta",
-                # ADDED: Точный вклад долевого сегмента относительно Total.
+                # ADDED: Точный net-вклад относительного сегмента к Total.
                 contribution_column="exact_global_net_contribution",
-                contribution_label="Contribution",
+                contribution_label="C",
+                allow_empty=True,
             )
+            ratio_status.loc[status_mask, "tree_status"] = "GENERATED"
+            ratio_status.loc[status_mask, "tree_path"] = str(created_tree)
 
     return {
         "history": history_df,

@@ -1339,6 +1339,7 @@ def build_anomaly_tree_from_excel(
     denominator_delta_column: str | None = None,
     contribution_column: str | None = None,
     contribution_label: str = "Contribution",
+    allow_empty: bool = False,
 ) -> Path:
     """Построить дерево аномальных сегментов по листу итогового Excel-файла.
 
@@ -1368,6 +1369,8 @@ def build_anomaly_tree_from_excel(
         contribution_column: Колонка точного вклада сегмента в изменение
             долевой метрики относительно Total. Вклад показывается в п.п.
         contribution_label: Подпись точного вклада на карточке дерева.
+        allow_empty: Создать PNG-заглушку, если у метрики нет сегментов,
+            прошедших первичный фильтр.
 
     Returns:
         Путь к созданному файлу визуализации.
@@ -1494,7 +1497,44 @@ def build_anomaly_tree_from_excel(
         & nodes["сегмент"].ne("nan")
     ].copy()
     if nodes.empty:
-        raise ValueError(f"Лист {sheet_name!r} не содержит сегментов глубины выше нуля")
+        if not allow_empty:
+            raise ValueError(
+                f"Лист {sheet_name!r} не содержит сегментов глубины выше нуля"
+            )
+        # ADDED: Для пакетной генерации сохраняем явный результат по каждой
+        # рассчитанной метрике, даже если аномалий на текущей неделе нет.
+        figure, axis = plt.subplots(figsize=(12, 4.5))
+        axis.axis("off")
+        metric_label = str(metric_name) if metric_name is not None else sheet_name
+        axis.text(
+            0.5,
+            0.58,
+            metric_label,
+            ha="center",
+            va="center",
+            fontsize=18,
+            fontweight="bold",
+        )
+        axis.text(
+            0.5,
+            0.40,
+            "Аномальных сегментов не найдено",
+            ha="center",
+            va="center",
+            fontsize=13,
+            color="#5f6764",
+        )
+        tree_path.parent.mkdir(parents=True, exist_ok=True)
+        try:
+            figure.savefig(
+                tree_path,
+                dpi=dpi,
+                bbox_inches="tight",
+                facecolor="white",
+            )
+        finally:
+            plt.close(figure)
+        return tree_path.resolve()
 
     nodes["глубина"] = nodes["глубина"].astype(int)
     nodes = nodes.drop_duplicates(subset=["глубина", "сегмент"], keep="first")
@@ -2016,18 +2056,25 @@ def build_anomaly_tree_from_excel(
                     zorder=4,
                 )
             delta_y = bottom + 0.35
-            # FIXED: Contribution — часть главной строки изменения доли, а не
-            # мелкая техническая деталь. Поэтому он наследует её размер и bold.
+            # FIXED: Вклад показывается отдельной строкой над движением метрики:
+            # так не смешиваются локальная дельта сегмента и его net-вклад в Total.
             contribution = (
                 _safe_float(node.get(contribution_column), math.nan)
                 if contribution_column is not None
                 else math.nan
             )
-            contribution_suffix = (
-                f" ({contribution_label}: {contribution * 100.0:+.3f} п.п.)"
-                if math.isfinite(contribution)
-                else ""
-            )
+            if math.isfinite(contribution):
+                axis.text(
+                    left + 0.14,
+                    delta_y + 0.20,
+                    f"{contribution_label}: {contribution * 100.0:+.3f} п.п.",
+                    color="#334155",
+                    fontsize=5.7,
+                    fontweight="bold",
+                    ha="left",
+                    va="bottom",
+                    zorder=4,
+                )
             axis.text(
                 left + 0.14,
                 delta_y,
@@ -2036,8 +2083,7 @@ def build_anomaly_tree_from_excel(
                     _format_rub(delta_value)
                     if delta_column == "Delta GMV"
                     else f"{delta_value:.3f}"
-                )
-                + contribution_suffix,
+                ),
                 color="#171717",
                 fontsize=6.3,
                 fontweight="bold",
@@ -2126,12 +2172,16 @@ def build_anomaly_tree_from_excel(
 def build_ratio_analysis_sheets(
     candidates: pd.DataFrame,
     final_df: pd.DataFrame,
+    thresholds: AnomalyThresholds | None = None,
 ) -> Tuple[pd.DataFrame, pd.DataFrame]:
     """ADDED: Сформировать два long-листа долевых метрик.
 
     Args:
         candidates: Диагностика всех сегментов после независимого Set Packing.
         final_df: Выбранные Set Packing сегменты.
+        thresholds: Параметры hierarchy-корректировки, включая
+            ``aggregation_bonus_lambda``. При ``None`` используются значения
+            ``AnomalyThresholds`` по умолчанию.
 
     Returns:
         Пара: первичные аномалии и структурные изменения; только выбранные аномалии.
@@ -2140,11 +2190,14 @@ def build_ratio_analysis_sheets(
         ValueError: Если в непустой диагностике нет обязательных long-колонок.
 
     Examples:
-        >>> analysis, selected = build_ratio_analysis_sheets(pd.DataFrame(), pd.DataFrame())
+        >>> analysis, selected = build_ratio_analysis_sheets(
+        ...     pd.DataFrame(), pd.DataFrame(), AnomalyThresholds()
+        ... )
         >>> analysis.empty and selected.empty
         True
     """
 
+    thresholds = thresholds or AnomalyThresholds()
     leading_columns = [
         "metric_name",
         "сегмент",
@@ -2312,6 +2365,29 @@ def build_ratio_analysis_sheets(
             dominant_child_segment,
             axis=1,
         )
+        # ADDED: Долевые метрики выводят тот же aggregation bonus, что и GMV.
+        # Его нельзя брать только из diagnostics: там хранится factor, а не
+        # человекочитаемая добавка ``lambda × (coherence - 0.5)``.
+        best_group_sizes = pd.to_numeric(
+            result.get(
+                "hierarchy_best_group_size",
+                pd.Series(0, index=result.index),
+            ),
+            errors="coerce",
+        )
+        coherence = pd.to_numeric(
+            result.get(
+                "hierarchy_coherence",
+                pd.Series(math.nan, index=result.index),
+            ),
+            errors="coerce",
+        )
+        result["hierarchy_coherence_adjustment"] = math.nan
+        multi_child_mask = best_group_sizes.gt(1) & coherence.notna()
+        result.loc[multi_child_mask, "hierarchy_coherence_adjustment"] = (
+            float(thresholds.aggregation_bonus_lambda)
+            * (coherence.loc[multi_child_mask] - 0.5)
+        )
         ordered = [
             *[column for column in leading_columns if column in result.columns],
             *[column for column in result.columns if column not in leading_columns],
@@ -2410,6 +2486,7 @@ def write_anomaly_excel(
     ratio_analysis, ratio_selected = build_ratio_analysis_sheets(
         ratio_candidates if ratio_candidates is not None else pd.DataFrame(),
         ratio_final_df if ratio_final_df is not None else pd.DataFrame(),
+        thresholds,
     )
 
     final_cols = [

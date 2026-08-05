@@ -92,10 +92,11 @@ Lifecycle:
 Это предполагает сбалансированную иерархию. Листья более коротких веток атомами
 не считаются.
 
-## Пилот долевой метрики
+## Относительные метрики
 
 `calculate_ratio_segment_anomaly` и `build_ratio_anomaly_candidates` параметризованы
-`RatioMetricSpec`. Сейчас включена только `authzone_tx_share`.
+`RatioMetricSpec`. Единый контур рассчитывает `success_rate`, три transaction-share
+и четыре GMV-share. `share_in_total_gmv`, `aov`, `tpm` и `freq` в него не входят.
 
 ```text
 metric_delta[t] = metric_value[t] - metric_value[t-1]
@@ -104,7 +105,8 @@ sigma = max(1.4826 × MAD, sigma_floor)
 robust_z = (current_metric_delta - baseline) / sigma
 ```
 
-`metric_value` берётся из YQL без повторного расчёта. Reliability в пилоте сохраняет GMV-правило.
+`metric_value` берётся из YQL без повторного расчёта. Reliability определяется
+числом валидных исторических переходов самой относительной метрики.
 
 Для `contribution_mode = exact_atomic` сначала считается точный signed-вклад
 каждого атома `i` в изменение доли Total:
@@ -125,12 +127,12 @@ Materiality измеряет долю gross-вклада атомов, покр�
 global_gross = Σ abs(Contribution_i) по всем атомам
 
 materiality_share(segment) =
-    Σ abs(Contribution_i), i ∈ coverage(segment)
+    abs(Σ Contribution_i, i ∈ coverage(segment))
     / global_gross
 ```
 
-Она находится в `[0, 1]` и аддитивна для непересекающихся атомарных покрытий.
-Отдельно сохраняется signed `exact_global_net_contribution(segment)`. Прежние
+Gross-capture сохраняется отдельно в `exact_gross_materiality_share` и не входит
+в score. Отдельно сохраняется signed `exact_global_net_contribution(segment)`. Прежние
 `numerator_current / atomic_numerator_total` и
 `metric_delta × mean_denominator` остаются в полях
 `legacy_materiality_share`/`legacy_hierarchy_movement` только для сравнения.
@@ -278,9 +280,9 @@ anomaly_score =
 - NULL ratio-метрик сохраняется и не участвует в их WoW-сравнении.
 - Материальность нормируется на gross movement только максимальной глубины.
 - Полное физическое перечисление групп имеет экспоненциальную сложность:
-  при `n` попарно непересекающихся потомках создаётся `2^n − 1` групп. Поэтому
-  число eligible-потомков одного родителя ограничено параметром
-  `max_hierarchy_descendants = 25`: превышение останавливает расчёт с
-  диагностикой.
+  при `n` попарно непересекающихся потомках создаётся `2^n − 1` групп. До
+  `max_hierarchy_descendants = 25` сохраняется перечисление, выше лимита та же
+  оптимизационная задача решается точным Set Packing. Метод фиксируется в
+  `hierarchy_group_selection_method`, а непосчитанный group count равен `-1`.
 
 Следующий этап: [`set_packing.py.md`](set_packing.py.md).

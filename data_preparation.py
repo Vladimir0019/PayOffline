@@ -24,7 +24,7 @@ from .config import (
     ANOMALY_TECH_COLUMNS,
     DIM_COLUMNS,
     METRIC_COLUMNS,
-    PILOT_RATIO_METRICS,
+    RATIO_METRICS,
     RATIO_ADDITIVE_COLUMNS,
 )
 from .segment_keys import (
@@ -384,18 +384,20 @@ def load_history_table(
 
     # ADDED: Готовое значение доли из YQL остаётся авторитетным. Python только
     # валидирует его против числителя/знаменателя, но не пересчитывает колонку.
-    for spec in PILOT_RATIO_METRICS:
+    for spec in RATIO_METRICS:
         metric_columns = {
             spec.value_column,
             spec.numerator_column,
             spec.denominator_column,
         }
-        # FIXED: Общий знаменатель ``tx`` есть и в старых GMV-выгрузках и сам по себе
-        # не активирует контракт долевой метрики.
-        present_columns = {
+        # FIXED: Базовые ``gmv``/``tx`` есть в любой старой выгрузке и сами
+        # по себе не активируют контракт новой относительной метрики.
+        activation_columns = {
             spec.value_column,
             spec.numerator_column,
-        }.intersection(df.columns)
+            spec.denominator_column,
+        } - {"gmv", "tx", "au", "am"}
+        present_columns = activation_columns.intersection(df.columns)
         if not present_columns:
             continue
         missing_metric_columns = sorted(metric_columns - set(df.columns))
@@ -556,7 +558,7 @@ def build_full_week_grid(history_df: pd.DataFrame, dim_cols: Sequence[str], date
     available_metric_cols = [metric for metric in METRIC_COLUMNS if metric in history_df.columns]
     ratio_value_columns = [
         spec.value_column
-        for spec in PILOT_RATIO_METRICS
+        for spec in RATIO_METRICS
         if spec.value_column in history_df.columns
     ]
     additive_ratio_columns = [

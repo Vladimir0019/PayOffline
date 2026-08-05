@@ -334,7 +334,7 @@ def calculate_ratio_segment_anomaly(
     metric_value = indexed[spec.value_column].astype(float).reindex(dates)
     numerator = indexed[spec.numerator_column].astype(float).reindex(dates, fill_value=0.0)
     denominator = indexed[spec.denominator_column].astype(float).reindex(dates, fill_value=0.0)
-    gmv = indexed["gmv"].astype(float).reindex(dates, fill_value=0.0)
+    # REMOVED: GMV не участвует в расчёте надёжности долевой метрики.
     metric_change = metric_value.diff()
 
     history_changes = metric_change.reindex(dates[1:current_idx]).dropna()
@@ -385,7 +385,10 @@ def calculate_ratio_segment_anomaly(
     else:
         state = "обычный"
 
-    history_nonzero_weeks = int((gmv.reindex(dates[:current_idx]) > 0.0).sum())
+    # FIXED: Надёжность долевой метрики определяется числом наблюдаемых
+    # переходов самой метрики, а не наличием GMV. Иначе сегмент с полной
+    # GMV-историей, но почти без определённых долей, ошибочно получает 1.0.
+    history_valid_transitions = int(len(history_changes))
     mean_denominator = (denominator_current + denominator_previous) / 2.0
     # FIXED: Физически отсутствующий в обеих сравниваемых неделях атом не
     # определяет долю (0 / 0), но его вклад в movement для dominance capture
@@ -436,9 +439,11 @@ def calculate_ratio_segment_anomaly(
         "abs_robust_z": abs(robust_z),
         "metric_valid_for_scoring": metric_valid_for_scoring,
         "metric_status": metric_status,
-        "history_points": int(len(history_changes)),
-        "history_nonzero_weeks": history_nonzero_weeks,
-        "reliability_factor": _history_reliability(history_nonzero_weeks),
+        "history_points": history_valid_transitions,
+        # FIXED: Имя сохранено для обратной совместимости отчётов, но для
+        # ratio содержит число валидных переходов метрики.
+        "history_nonzero_weeks": history_valid_transitions,
+        "reliability_factor": _history_reliability(history_valid_transitions),
         "state": state,
     }
 
@@ -691,6 +696,8 @@ def build_ratio_anomaly_candidates(
     candidates["exact_global_gross_atomic_contribution"] = math.nan
     candidates["exact_global_metric_delta"] = math.nan
     candidates["exact_materiality_share"] = 0.0
+    # ADDED: Gross-capture остаётся диагностикой; в score не используется.
+    candidates["exact_gross_materiality_share"] = 0.0
     candidates["exact_contribution_valid"] = False
 
     effective_coverage = coverage or build_atomic_coverage(candidates, dim_cols)
@@ -733,7 +740,16 @@ def build_ratio_anomaly_candidates(
             gross_contribution = float(
                 sum(abs(global_contributions[atom_id]) for atom_id in segment_atoms)
             )
+            # FIXED: Materiality драйвера Total — его чистый эффект,
+            # нормированный на gross movement. Это та же семантика, что у GMV:
+            # abs(net_effect) / global_gross. Gross-capture сохраняем отдельно,
+            # чтобы видеть компенсирующие друг друга атомарные вклады.
             materiality = (
+                min(1.0, abs(net_contribution) / global_gross)
+                if global_gross > 0.0
+                else 0.0
+            )
+            gross_materiality = (
                 min(1.0, gross_contribution / global_gross)
                 if global_gross > 0.0
                 else 0.0
@@ -742,6 +758,7 @@ def build_ratio_anomaly_candidates(
             candidates.at[index, "exact_global_gross_contribution"] = gross_contribution
             candidates.at[index, "exact_global_gross_atomic_contribution"] = global_gross
             candidates.at[index, "exact_materiality_share"] = materiality
+            candidates.at[index, "exact_gross_materiality_share"] = gross_materiality
             candidates.at[index, "exact_contribution_valid"] = True
             candidates.at[index, "exact_contribution_status"] = "OK"
         candidates["exact_global_metric_delta"] = float(global_delta)
@@ -944,7 +961,7 @@ def _enumerate_disjoint_descendant_groups(
 ) -> List[Tuple[str, ...]]:
     """ADDED: Физически перечислить все непустые непересекающиеся группы потомков.
 
-    Сложность перебора экспоненциальна,поэтому число потомков ограничено:
+    Сложность перебора экспоненциальна, поэтому число потомков ограничено:
     превышение лимита останавливает расчёт с диагностикой.
 
     Args:
@@ -1020,6 +1037,103 @@ def _enumerate_disjoint_descendant_groups(
     return groups
 
 
+def _select_best_disjoint_descendant_group(
+    candidates: pd.DataFrame,
+    descendant_ids: Sequence[str],
+    coverage: Dict[str, frozenset[str]],
+    parent_atoms: frozenset[str],
+    max_enumerated_descendants: int,
+) -> Tuple[float, int, Tuple[str, ...], int, str]:
+    """Выбрать точную сильнейшую непересекающуюся группу потомков.
+
+    Для небольшого числа потомков сохраняется полный перебор. При превышении
+    лимита та же задача решается существующим exact Set Packing, поэтому
+    включение нескольких относительных метрик не приводит к перебору ``2^n``.
+
+    Args:
+        candidates: Таблица кандидатов с уже рассчитанным ``anomaly_score``.
+        descendant_ids: Eligible-потомки рассматриваемого родителя.
+        coverage: Фактическое атомарное покрытие всех сегментов.
+        parent_atoms: Атомы рассматриваемого родителя.
+        max_enumerated_descendants: Лимит физического перечисления групп.
+
+    Returns:
+        Score, размер и ID лучшей группы, число перечисленных групп либо `-1`,
+        а также метод решения.
+
+    Raises:
+        ValueError: Если exact Set Packing не смог доказать оптимум.
+
+    Examples:
+        >>> frame = pd.DataFrame([
+        ...     {'segment_id': 'a', 'segment_key': 'a', 'slice_depth': 1,
+        ...      'passes_initial_anomaly_filter': True, 'robust_z': 1.0,
+        ...      'abs_robust_z': 1.0, 'wow_delta_gmv': 1.0,
+        ...      'anomaly_score': 2.0},
+        ... ])
+        >>> _select_best_disjoint_descendant_group(
+        ...     frame, ['a'], {'a': frozenset({'a'})}, frozenset({'a'}), 25
+        ... )[2]
+        ('a',)
+    """
+
+    ordered_ids = tuple(sorted(str(segment_id) for segment_id in descendant_ids))
+    if len(ordered_ids) <= int(max_enumerated_descendants):
+        groups = _enumerate_disjoint_descendant_groups(
+            ordered_ids,
+            coverage,
+            max_descendants=max_enumerated_descendants,
+        )
+        score_by_id = candidates.set_index("segment_id")["anomaly_score"].to_dict()
+        group_records = [
+            (
+                float(sum(float(score_by_id[child_id]) for child_id in group)),
+                len(group),
+                group,
+            )
+            for group in groups
+        ]
+        best_score, best_size, best_group = sorted(
+            group_records,
+            key=lambda item: (-item[0], item[1], item[2]),
+        )[0]
+        return best_score, best_size, best_group, len(groups), "ENUMERATION"
+
+    # ADDED: Локальный импорт разрывает модульный цикл: set_packing использует
+    # общий _safe_float из этого модуля, но вызов происходит уже после загрузки.
+    from .set_packing import search_anomal
+
+    candidate_ids = set(candidates["segment_id"].astype(str))
+    support_ids = set(ordered_ids) | (set(parent_atoms) & candidate_ids)
+    solver_candidates = candidates[
+        candidates["segment_id"].astype(str).isin(support_ids)
+    ].copy()
+    solver_candidates["passes_initial_anomaly_filter"] = (
+        solver_candidates["segment_id"].astype(str).isin(ordered_ids)
+    )
+    solver_coverage = {
+        segment_id: coverage[segment_id]
+        for segment_id in sorted(support_ids)
+    }
+    solver_thresholds = AnomalyThresholds(
+        min_anomaly_abs=0.0,
+        min_z_score=0.0,
+        min_materiality_share=0.0,
+        max_exact_fallback_size=max(25, len(ordered_ids)),
+    )
+    selected, _, _ = search_anomal(
+        solver_candidates,
+        solver_thresholds,
+        coverage=solver_coverage,
+    )
+    best_group = tuple(sorted(selected["segment_id"].astype(str).tolist()))
+    if not best_group:
+        raise ValueError("Exact Set Packing вернул пустую hierarchy-группу")
+    score_by_id = candidates.set_index("segment_id")["anomaly_score"].to_dict()
+    best_score = float(sum(float(score_by_id[child_id]) for child_id in best_group))
+    return best_score, len(best_group), best_group, -1, "SET_PACKING"
+
+
 def apply_hierarchy_score_adjustment(
     candidates: pd.DataFrame,
     coverage: Dict[str, frozenset[str]],
@@ -1045,15 +1159,16 @@ def apply_hierarchy_score_adjustment(
         candidates: Таблица всех кандидатов до оптимизационного отбора.
         coverage: Атомарное покрытие `segment_id -> set[atomic_segment_id]`.
         aggregation_bonus_lambda: Наклон линейной корректировки coherence.
-        single_child_factor: Коэффициент родителя при одном потомке в
-            сильнейшей группе.
+        single_child_factor: Коэффициент родителя при одном доминирующем
+            потомке в сильнейшей группе.
         dominant_child_capture_threshold: Минимальная доля абсолютного
             атомарного движения родителя, объяснённая единственным сильным
             потомком, для применения dominance cap.
         dominant_child_score_margin: Относительный запас, на который cap
             удерживает score родителя ниже score доминирующего потомка.
         max_hierarchy_descendants: Максимальное число eligible-потомков одного
-            родителя для полного перечисления групп.
+            родителя для полного перечисления групп; выше лимита используется
+            точный Set Packing.
         movement_column: Аддитивное движение для hierarchy coherence.
         allow_zero_movement: Разрешить нулевое движение; нужно для долей,
             у которых z-score может быть аномальным при нулевой текущей дельте.
@@ -1136,6 +1251,9 @@ def apply_hierarchy_score_adjustment(
     )
     result["hierarchy_eligible_descendant_count"] = 0
     result["hierarchy_group_count"] = 0
+    # ADDED: Для больших групп фиксируем exact fallback вместо фиктивного числа
+    # физически перечисленных комбинаций.
+    result["hierarchy_group_selection_method"] = "NOT_APPLICABLE"
     result["hierarchy_best_group_size"] = 0
     # FIXED: Список технических ID хранится в однозначном JSON-массиве.
     result["hierarchy_best_group_ids_json"] = "[]"
@@ -1260,25 +1378,23 @@ def apply_hierarchy_score_adjustment(
             if not descendant_ids:
                 continue
 
-            groups = _enumerate_disjoint_descendant_groups(
+            (
+                best_group_score,
+                best_group_size,
+                best_group,
+                group_count,
+                group_selection_method,
+            ) = _select_best_disjoint_descendant_group(
+                result,
                 descendant_ids,
-                coverage_by_id,
-                max_descendants=max_hierarchy_descendants,
+                normalized_coverage,
+                parent_atoms,
+                max_enumerated_descendants=max_hierarchy_descendants,
             )
-            result.at[parent_index, "hierarchy_group_count"] = int(len(groups))
-            group_records = []
-            for group in groups:
-                group_score = float(
-                    sum(
-                        float(result.at[index_by_id[child_id], "anomaly_score"])
-                        for child_id in group
-                    )
-                )
-                group_records.append((group_score, len(group), group))
-            best_group_score, best_group_size, best_group = sorted(
-                group_records,
-                key=lambda item: (-item[0], item[1], item[2]),
-            )[0]
+            result.at[parent_index, "hierarchy_group_count"] = int(group_count)
+            result.at[
+                parent_index, "hierarchy_group_selection_method"
+            ] = group_selection_method
 
             result.at[parent_index, "hierarchy_best_group_size"] = int(
                 best_group_size
@@ -1328,9 +1444,6 @@ def apply_hierarchy_score_adjustment(
                 ] = parent_exact_gross
             if best_group_size == 1:
                 child_id = best_group[0]
-                uncapped_score = base_parent_score * float(
-                    single_child_factor
-                )
                 cap_score = float(
                     result.at[index_by_id[child_id], "anomaly_score"]
                 ) * (1.0 - float(dominant_child_score_margin))
@@ -1367,13 +1480,13 @@ def apply_hierarchy_score_adjustment(
                 )
                 if invalid_atom_ids:
                     # FIXED: Не исключаем атом из знаменателя capture: это
-                    # искусственно завысило бы вклад потомка. Вместо этого
-                    # сохраняем обычный single-child factor и диагностируем
-                    # невозможность доказать dominance.
+                    # искусственно завысило бы вклад потомка. Без доказанного
+                    # dominance родитель сохраняет базовый score.
                     capture = math.nan
                     direction_match = pd.NA
                     dominance_rule_matches = False
-                    adjusted_score = uncapped_score
+                    uncapped_score = base_parent_score
+                    adjusted_score = base_parent_score
                     cap_applied = False
                     cap_status = "SKIPPED_NONFINITE_ATOMIC_MOVEMENT"
                 else:
@@ -1424,10 +1537,18 @@ def apply_hierarchy_score_adjustment(
                         and math.isfinite(capture)
                         and capture >= float(dominant_child_capture_threshold)
                     )
+                    # FIXED: single_child_factor — санкция только за
+                    # подтверждённое доминирование. Один ребёнок без
+                    # dominance не меняет score родителя.
+                    uncapped_score = (
+                        base_parent_score * float(single_child_factor)
+                        if dominance_rule_matches
+                        else base_parent_score
+                    )
                     adjusted_score = (
                         min(uncapped_score, cap_score)
                         if dominance_rule_matches
-                        else uncapped_score
+                        else base_parent_score
                     )
                     cap_applied = (
                         dominance_rule_matches
@@ -1441,7 +1562,7 @@ def apply_hierarchy_score_adjustment(
                 factor = (
                     adjusted_score / base_parent_score
                     if base_parent_score != 0.0
-                    else float(single_child_factor)
+                    else 1.0
                 )
 
                 result.at[

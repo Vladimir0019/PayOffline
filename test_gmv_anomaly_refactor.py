@@ -25,7 +25,11 @@ from gmv_anomaly.anomaly_scoring import (
     calculate_ratio_segment_anomaly,
     validate_hierarchy_reconciliation,
 )
-from gmv_anomaly.config import AnomalyThresholds, PILOT_RATIO_METRICS
+from gmv_anomaly.config import (
+    AnomalyThresholds,
+    PILOT_RATIO_METRICS,
+    RATIO_METRICS,
+)
 from gmv_anomaly.data_preparation import (
     build_full_week_grid,
     build_segment_key_and_level,
@@ -157,6 +161,44 @@ def _ratio_history_rows() -> list[dict[str, object]]:
     return rows
 
 
+def _all_ratio_history_rows() -> list[dict[str, object]]:
+    """ADDED: Сформировать валидную историю всех восьми относительных метрик.
+
+    Args:
+        Нет аргументов.
+
+    Returns:
+        Иерархически согласованные строки со всеми компонентами отношений.
+
+    Raises:
+        ValueError: Не выбрасывается.
+
+    Examples:
+        >>> len({spec.value_column for spec in RATIO_METRICS})
+        8
+    """
+
+    rows = _ratio_history_rows()
+    for row in rows:
+        tx = float(row["tx"])
+        gmv = float(row["gmv"])
+        row["tx0"] = tx / 0.8
+        row["success_rate"] = 0.8
+        ratio_components = {
+            "refund_tx": (0.10, tx),
+            "payapp_tx": (0.20, tx),
+            "split_gmv": (0.10, gmv),
+            "credlim_gmv": (0.15, gmv),
+            # FIXED: Эти две метрики по бизнес-контракту не ограничены единицей.
+            "tips_gmv": (1.20, gmv),
+            "cashback_gmv": (1.10, gmv),
+        }
+        for prefix, (ratio_value, denominator) in ratio_components.items():
+            row[f"{prefix}_numerator"] = ratio_value * denominator
+            row[f"{prefix}_share"] = ratio_value
+    return rows
+
+
 def _candidate_frame(rows: list[dict[str, object]]) -> pd.DataFrame:
     """Сформировать минимальный контракт кандидатов для Set Packing.
 
@@ -245,7 +287,7 @@ class GmvAnomalyRefactorTests(unittest.TestCase):
             current_cal_date=runtime_config.CURRENT_CAL_DATE,
             thresholds=runtime_config.THRESHOLDS,
             tree_output_path=runtime_config.TREE_OUTPUT_PATH,
-            ratio_tree_output_path=runtime_config.RATIO_TREE_OUTPUT_PATH,
+            ratio_trees_output_dir=runtime_config.RATIO_TREES_OUTPUT_DIR,
         )
 
     def test_dimensions_are_fixed_and_ignore_extra_excel_columns(self) -> None:
@@ -867,8 +909,8 @@ class GmvAnomalyRefactorTests(unittest.TestCase):
         self.assertAlmostEqual(float(parent["hierarchy_score_factor"]), 1.03)
         self.assertAlmostEqual(float(parent["anomaly_score"]), 20.6)
 
-    def test_single_eligible_child_requires_parent_score_advantage(self) -> None:
-        """ADDED: Применить коэффициент 0.85 только к eligible-родителю.
+    def test_single_eligible_child_without_dominance_keeps_parent_score(self) -> None:
+        """FIXED: Не штрафовать одного ребёнка без dominance.
 
         Args:
             Нет аргументов.
@@ -878,7 +920,7 @@ class GmvAnomalyRefactorTests(unittest.TestCase):
 
         Raises:
             AssertionError: Если неeligible-потомок участвует в группе или
-                родитель с достаточным преимуществом не выигрывает.
+                недоминирующий ребёнок снижает score родителя.
 
         Examples:
             >>> # Запускается через unittest.
@@ -939,8 +981,8 @@ class GmvAnomalyRefactorTests(unittest.TestCase):
             json.loads(parent["hierarchy_best_group_ids_json"]),
             ["eligible_child"],
         )
-        self.assertAlmostEqual(float(parent["hierarchy_score_factor"]), 0.85)
-        self.assertAlmostEqual(float(parent["anomaly_score"]), 8.5)
+        self.assertAlmostEqual(float(parent["hierarchy_score_factor"]), 1.0)
+        self.assertAlmostEqual(float(parent["anomaly_score"]), 10.0)
         self.assertAlmostEqual(
             float(parent["hierarchy_single_child_capture"]),
             800.0 / 10_800.0,
@@ -1111,7 +1153,8 @@ class GmvAnomalyRefactorTests(unittest.TestCase):
             bool(parent["hierarchy_single_child_direction_match"])
         )
         self.assertFalse(bool(parent["hierarchy_dominance_cap_applied"]))
-        self.assertAlmostEqual(float(parent["anomaly_score"]), 8.5)
+        self.assertAlmostEqual(float(parent["hierarchy_score_factor"]), 1.0)
+        self.assertAlmostEqual(float(parent["anomaly_score"]), 10.0)
 
     def test_exact_parent_contribution_caps_dominant_child(self) -> None:
         """ADDED: Применить cap по parent-relative exact contributions.
@@ -1357,7 +1400,8 @@ class GmvAnomalyRefactorTests(unittest.TestCase):
             parent["hierarchy_dominance_cap_status"],
             "SKIPPED_NONFINITE_ATOMIC_MOVEMENT",
         )
-        self.assertAlmostEqual(float(parent["anomaly_score"]), 8.5)
+        self.assertAlmostEqual(float(parent["hierarchy_score_factor"]), 1.0)
+        self.assertAlmostEqual(float(parent["anomaly_score"]), 10.0)
 
     def test_effective_balance_penalizes_unequal_tail(self) -> None:
         """ADDED: Учесть всё распределение eligible-изменений через B_eff.
@@ -1845,6 +1889,107 @@ class GmvAnomalyRefactorTests(unittest.TestCase):
             ],
         )
 
+    def test_pipeline_calculates_all_ratio_metrics_and_builds_png_trees(self) -> None:
+        """ADDED: Рассчитать восемь метрик и сохранить восемь PNG в каталог.
+
+        Args:
+            Нет аргументов.
+
+        Returns:
+            None.
+
+        Raises:
+            AssertionError: Если метрика пропущена либо её PNG не создан.
+
+        Examples:
+            >>> # Запускается через unittest.
+        """
+
+        expected_metrics = {spec.name for spec in RATIO_METRICS}
+        with TemporaryDirectory() as temp_dir:
+            input_path = Path(temp_dir) / "all_ratios.csv"
+            output_path = Path(temp_dir) / "result.xlsx"
+            tree_dir = Path(temp_dir) / "ratio_trees"
+            pd.DataFrame(_all_ratio_history_rows()).to_csv(input_path, index=False)
+
+            result = run_pipeline(
+                input_path,
+                output_path,
+                period="1W",
+                thresholds=AnomalyThresholds(
+                    min_anomaly_abs=0.0,
+                    min_z_score=0.1,
+                    min_materiality_share=0.0,
+                ),
+                ratio_trees_output_dir=tree_dir,
+            )
+
+            status = result["ratio_status"].set_index("metric_name")
+            self.assertEqual(set(status.index), expected_metrics)
+            self.assertEqual(set(status["status"]), {"CALCULATED"})
+            self.assertEqual(set(status["tree_status"]), {"GENERATED"})
+            expected_paths = {tree_dir / f"{metric}.png" for metric in expected_metrics}
+            self.assertEqual(set(tree_dir.glob("*.png")), expected_paths)
+            for path in expected_paths:
+                self.assertGreater(path.stat().st_size, 0)
+
+    def test_ratio_metric_registry_has_expected_contracts(self) -> None:
+        """ADDED: Зафиксировать состав и границы относительных метрик.
+
+        Args:
+            Нет аргументов.
+
+        Returns:
+            None.
+
+        Raises:
+            AssertionError: Если реестр содержит лишнюю метрику или неверный bound.
+
+        Examples:
+            >>> # Запускается через unittest.
+        """
+
+        specs = {spec.name: spec for spec in RATIO_METRICS}
+        self.assertEqual(
+            set(specs),
+            {
+                "success_rate",
+                "refund_tx_share",
+                "authzone_tx_share",
+                "payapp_tx_share",
+                "split_gmv_share",
+                "credlim_gmv_share",
+                "tips_gmv_share",
+                "cashback_gmv_share",
+            },
+        )
+        self.assertNotIn("share_in_total_gmv", specs)
+        self.assertEqual(
+            {
+                name: (spec.numerator_column, spec.denominator_column)
+                for name, spec in specs.items()
+            },
+            {
+                "success_rate": ("tx", "tx0"),
+                "refund_tx_share": ("refund_tx_numerator", "tx"),
+                "authzone_tx_share": ("authzone_tx_numerator", "tx"),
+                "payapp_tx_share": ("payapp_tx_numerator", "tx"),
+                "split_gmv_share": ("split_gmv_numerator", "gmv"),
+                "credlim_gmv_share": ("credlim_gmv_numerator", "gmv"),
+                "tips_gmv_share": ("tips_gmv_numerator", "gmv"),
+                "cashback_gmv_share": ("cashback_gmv_numerator", "gmv"),
+            },
+        )
+        self.assertFalse(specs["tips_gmv_share"].bounded)
+        self.assertFalse(specs["cashback_gmv_share"].bounded)
+        self.assertTrue(
+            all(
+                spec.bounded
+                for name, spec in specs.items()
+                if name not in {"tips_gmv_share", "cashback_gmv_share"}
+            )
+        )
+
     def test_ratio_score_uses_exact_contribution_materiality(self) -> None:
         """FIXED: Проверить z-score и exact contribution-materiality доли.
 
@@ -2058,6 +2203,44 @@ class GmvAnomalyRefactorTests(unittest.TestCase):
         self.assertEqual(result["metric_status"], "METRIC_ROW_MISSING_IN_SOURCE")
         self.assertEqual(float(result["hierarchy_movement"]), 0.0)
 
+    def test_ratio_reliability_uses_valid_metric_history_not_gmv(self) -> None:
+        """FIXED: Не завышать reliability при неопределённой истории доли.
+
+        Args:
+            Нет аргументов.
+
+        Returns:
+            None.
+
+        Raises:
+            AssertionError: Если healthy GMV ошибочно заменяет историю доли.
+
+        Examples:
+            >>> # Запускается через unittest.
+        """
+
+        spec = PILOT_RATIO_METRICS[0]
+        dates = list(range(1, 10))
+        segment_panel = pd.DataFrame(
+            {
+                "cal_date": dates,
+                "gmv": [100.0] * len(dates),
+                spec.numerator_column: [0.0] * len(dates),
+                spec.denominator_column: [10.0] * len(dates),
+                # В истории есть только один валидный переход: 0.2 -> 0.2.
+                spec.value_column: [math.nan] * 6 + [0.2, 0.2, 0.5],
+            }
+        )
+
+        result = calculate_ratio_segment_anomaly(
+            segment_panel, dates, dates[-1], AnomalyThresholds(), spec
+        )
+
+        self.assertEqual(int(result["history_points"]), 1)
+        self.assertEqual(int(result["history_nonzero_weeks"]), 1)
+        self.assertAlmostEqual(float(result["reliability_factor"]), 0.4)
+        self.assertNotEqual(float(result["reliability_factor"]), 1.0)
+
     def test_ratio_input_contract_rejects_inconsistent_yql_value(self) -> None:
         """ADDED: Не пересчитывать долю в Python, а отклонять её расхождение с YQL-компонентами.
 
@@ -2175,10 +2358,52 @@ class GmvAnomalyRefactorTests(unittest.TestCase):
                 numerator_delta_column="numerator_delta",
                 denominator_delta_column="denominator_delta",
                 contribution_column="exact_global_net_contribution",
+                contribution_label="C",
             )
             self.assertEqual(created, tree_path.resolve())
             self.assertGreater(tree_path.stat().st_size, 0)
-            self.assertIn("Contribution: +5.900", tree_path.read_text(encoding="utf-8"))
+            svg = tree_path.read_text(encoding="utf-8")
+            self.assertIn("C: +5.900", svg)
+            self.assertLess(svg.index("C: +5.900"), svg.index("Δ доли, п.п.: +5.000"))
+
+    def test_ratio_report_calculates_aggregation_bonus(self) -> None:
+        """ADDED: Вывести для доли ту же hierarchy-поправку, что и для GMV.
+
+        Args:
+            Нет аргументов.
+
+        Returns:
+            None.
+
+        Raises:
+            AssertionError: Если поправка не рассчитана для нескольких детей.
+
+        Examples:
+            >>> # Запускается через unittest.
+        """
+
+        candidates = pd.DataFrame(
+            [{
+                "metric_name": "authzone_tx_share",
+                "segment_id": "parent",
+                "segment_key": "geo=A",
+                "slice_depth": 1,
+                "robust_z": 3.0,
+                "passes_initial_anomaly_filter": True,
+                "state": "обычный",
+                "hierarchy_best_group_size": 2,
+                "hierarchy_coherence": 1.0,
+            }]
+        )
+        analysis, _ = build_ratio_analysis_sheets(
+            candidates,
+            pd.DataFrame(),
+            AnomalyThresholds(aggregation_bonus_lambda=0.3),
+        )
+        self.assertAlmostEqual(
+            analysis.iloc[0]["hierarchy_coherence_adjustment"],
+            0.15,
+        )
 
     def test_ratio_report_exposes_dominant_child_for_tree(self) -> None:
         """ADDED: Передать dominance rule доли в таблицу для зачёркивания.
@@ -2430,6 +2655,67 @@ class GmvAnomalyRefactorTests(unittest.TestCase):
 
         self.assertEqual(AnomalyThresholds().max_hierarchy_descendants, 25)
 
+    def test_hierarchy_uses_exact_set_packing_above_enumeration_limit(self) -> None:
+        """ADDED: Масштабировать выбор hierarchy-группы без перебора ``2^n``.
+
+        Args:
+            Нет аргументов.
+
+        Returns:
+            None.
+
+        Raises:
+            AssertionError: Если fallback не находит точную непересекающуюся группу.
+
+        Examples:
+            >>> # Запускается через unittest.
+        """
+
+        candidates = _candidate_frame(
+            [
+                {
+                    "segment_id": "p",
+                    "segment_key": "parent",
+                    "slice_depth": 1,
+                    "geo": "A",
+                    "product": None,
+                    "score": 2.0,
+                    "delta_gmv": 300.0,
+                },
+                *[
+                    {
+                        "segment_id": f"a{index}",
+                        "segment_key": f"child={index}",
+                        "slice_depth": 2,
+                        "geo": "A",
+                        "product": str(index),
+                        "score": 1.0,
+                        "delta_gmv": 100.0,
+                    }
+                    for index in range(3)
+                ],
+            ]
+        )
+        coverage = {
+            "p": frozenset({"a0", "a1", "a2"}),
+            **{f"a{index}": frozenset({f"a{index}"}) for index in range(3)},
+        }
+
+        adjusted = apply_hierarchy_score_adjustment(
+            candidates,
+            coverage,
+            max_hierarchy_descendants=2,
+        )
+        parent = adjusted.loc[adjusted["segment_id"].eq("p")].iloc[0]
+
+        self.assertEqual(parent["hierarchy_group_selection_method"], "SET_PACKING")
+        self.assertEqual(int(parent["hierarchy_group_count"]), -1)
+        self.assertEqual(int(parent["hierarchy_best_group_size"]), 3)
+        self.assertEqual(
+            json.loads(parent["hierarchy_best_group_ids_json"]),
+            ["a0", "a1", "a2"],
+        )
+
     def test_loading_accepts_yt_type_header_and_string_numbers(self) -> None:
         """ADDED: Принять YT-выгрузку со строкой типов и числами-строками.
 
@@ -2496,6 +2782,320 @@ class GmvAnomalyRefactorTests(unittest.TestCase):
         self.assertTrue(pd.api.types.is_integer_dtype(history["cal_date"]))
         self.assertTrue(pd.api.types.is_integer_dtype(history["slice_depth"]))
         self.assertTrue(pd.api.types.is_float_dtype(history["gmv"]))
+
+
+class GoldenAndPropertyBaselineTests(unittest.TestCase):
+    """Зафиксировать текущее поведение аудита как golden/property-baseline.
+
+    Эти тесты НЕ утверждают, что текущая математика корректна — аудит нашёл
+    в ней ряд дефектов (net/gross асимметрия materiality, reliability по GMV
+    для долевых метрик, двойной учёт иерархии). Тесты фиксируют фактическое
+    поведение системы до правок, чтобы любое последующее изменение формул
+    было осознанным и видимым в diff тестов, а не тихой регрессией.
+    """
+
+    _REAL_INPUT_PATH = Path(__file__).resolve().parent.parent / "payoffline_pulse_hier_03_08.xlsx"
+
+    def test_golden_real_input_selection_and_score(self) -> None:
+        """Зафиксировать выбор и score пайплайна на реальном входном файле.
+
+        Args:
+            Нет аргументов.
+
+        Returns:
+            None.
+
+        Raises:
+            AssertionError: Если состав выбранных сегментов, их score или
+                objective изменились относительно зафиксированного baseline.
+
+        Examples:
+            >>> # Запускается через unittest; пропускается без реального файла.
+        """
+
+        if not self._REAL_INPUT_PATH.exists():
+            self.skipTest(f"Реальный входной файл отсутствует: {self._REAL_INPUT_PATH}")
+
+        with TemporaryDirectory() as temp_dir:
+            output_path = Path(temp_dir) / "golden_result.xlsx"
+            result = run_pipeline(
+                input_path=self._REAL_INPUT_PATH,
+                output_path=output_path,
+                sheet_name=0,
+                period="1W",
+                dim_cols=list(runtime_config.DIM_COLUMNS),
+                current_cal_date=None,
+                thresholds=AnomalyThresholds(),
+                tree_output_path=None,
+                ratio_tree_output_path=None,
+            )
+
+        final_gmv = result["final"]
+        final_ratio = result["ratio_final"]
+        authzone_final = final_ratio[
+            final_ratio["metric_name"].eq("authzone_tx_share")
+        ]
+
+        expected_gmv_keys = {
+            "products=FULLPAYMENT × is_terminal_or_cpqr=QR",
+            "geo=РФ × products=FULLPAYMENT × merchants_type=SMB × is_terminal_or_cpqr=Терминал",
+        }
+        expected_ratio_keys = {
+            "geo=РФ × products=FULLPAYMENT × merchants_type=Лэтуаль",
+            "geo=Другое × products=FULLPAYMENT × merchants_type=Прочее × is_terminal_or_cpqr=QR",
+        }
+
+        self.assertEqual(set(final_gmv["segment_key"]), expected_gmv_keys)
+        self.assertEqual(set(authzone_final["segment_key"]), expected_ratio_keys)
+        self.assertAlmostEqual(
+            float(final_gmv["selection_score"].sum()), 1.991405, places=3
+        )
+        self.assertAlmostEqual(
+            float(authzone_final["selection_score"].sum()), 3.245533, places=3
+        )
+
+    def test_exact_ratio_contribution_additivity_property(self) -> None:
+        """Проверить аддитивность exact contribution на наборе сценариев.
+
+        Args:
+            Нет аргументов.
+
+        Returns:
+            None.
+
+        Raises:
+            AssertionError: Если сумма вкладов атомов отклоняется от Δscope.
+
+        Examples:
+            >>> # Запускается через unittest.
+        """
+
+        # (numerator_prev, numerator_curr, denominator_prev, denominator_curr) на атом.
+        scenarios = {
+            "только числитель растёт": ((5.0, 8.0, 10.0, 10.0), (5.0, 5.0, 10.0, 10.0)),
+            "только знаменатель растёт": ((5.0, 5.0, 10.0, 20.0), (5.0, 5.0, 10.0, 10.0)),
+            "оба растут": ((5.0, 9.0, 10.0, 15.0), (5.0, 6.0, 10.0, 12.0)),
+            "смена знака эффекта": ((5.0, 2.0, 10.0, 10.0), (5.0, 9.0, 10.0, 10.0)),
+            "сильная компенсация": ((5.0, 9.0, 10.0, 10.0), (5.0, 1.0, 10.0, 10.0)),
+        }
+        for label, (atom_a, atom_b) in scenarios.items():
+            with self.subTest(scenario=label):
+                num_prev = atom_a[0] + atom_b[0]
+                num_curr = atom_a[1] + atom_b[1]
+                den_prev = atom_a[2] + atom_b[2]
+                den_curr = atom_a[3] + atom_b[3]
+                ratio_prev = num_prev / den_prev
+                ratio_curr = num_curr / den_curr
+                contributions = [
+                    calculate_exact_ratio_contribution(
+                        atom[0], atom[1], atom[2], atom[3],
+                        ratio_prev, ratio_curr, den_prev, den_curr,
+                    )
+                    for atom in (atom_a, atom_b)
+                ]
+                self.assertAlmostEqual(
+                    sum(contributions), ratio_curr - ratio_prev, places=9
+                )
+
+        forward = calculate_exact_ratio_contribution(5, 8, 10, 12, 0.5, 0.6, 20, 24)
+        backward = calculate_exact_ratio_contribution(8, 5, 12, 10, 0.6, 0.5, 24, 20)
+        self.assertAlmostEqual(forward, -backward, places=9)
+
+    def test_ratio_net_materiality_bounded_by_gross_capture(self) -> None:
+        """Проверить 0 <= |net|/global_gross <= gross/global_gross <= 1.
+
+        Args:
+            Нет аргументов.
+
+        Returns:
+            None.
+
+        Raises:
+            AssertionError: Если инвариант нарушен хотя бы для одного eligible
+                сегмента.
+
+        Examples:
+            >>> # Запускается через unittest.
+        """
+
+        thresholds = AnomalyThresholds(
+            min_z_score=0.0, min_materiality_share=0.0, sigma_floor=0.01
+        )
+        history = pd.DataFrame(_ratio_history_rows())
+        with TemporaryDirectory() as temp_dir:
+            path = Path(temp_dir) / "ratio.csv"
+            history.to_csv(path, index=False)
+            loaded, dims, dates = load_history_table(path, period="1W")
+        panel = build_full_week_grid(loaded, dims, dates)
+        coverage = build_atomic_coverage(panel.drop_duplicates("segment_id"), dims)
+        spec = PILOT_RATIO_METRICS[0]
+        candidates = build_ratio_anomaly_candidates(
+            panel, dims, dates, thresholds, spec, DATES[-1], coverage
+        )
+        valid = candidates[candidates["exact_contribution_valid"].eq(True)]
+        self.assertGreater(len(valid), 0)
+        for row in valid.itertuples(index=False):
+            gross_total = float(row.exact_global_gross_atomic_contribution)
+            if gross_total <= 0.0:
+                continue
+            net_materiality = abs(float(row.exact_global_net_contribution)) / gross_total
+            gross_capture = float(row.exact_global_gross_contribution) / gross_total
+            self.assertGreaterEqual(net_materiality, -1e-9)
+            self.assertLessEqual(net_materiality, gross_capture + 1e-9)
+            self.assertLessEqual(gross_capture, 1.0 + 1e-9)
+            # FIXED: В score идёт чистый вклад; gross-capture — отдельная
+            # диагностика компенсирующихся эффектов.
+            self.assertAlmostEqual(
+                float(row.exact_materiality_share), net_materiality
+            )
+            self.assertAlmostEqual(
+                float(row.exact_gross_materiality_share), gross_capture
+            )
+
+    def test_search_anomal_deterministic_under_row_permutation(self) -> None:
+        """Проверить независимость выбора и objective от порядка строк.
+
+        Args:
+            Нет аргументов.
+
+        Returns:
+            None.
+
+        Raises:
+            AssertionError: Если перестановка строк меняет выбор или objective.
+
+        Examples:
+            >>> # Запускается через unittest.
+        """
+
+        atoms = [f"at{i}" for i in range(4)]
+        coverage: dict[str, frozenset[str]] = {}
+        rows: list[dict[str, object]] = []
+        for index, atom in enumerate(atoms):
+            rows.append(
+                {
+                    "segment_id": atom,
+                    "segment_key": f"d1=v{index} × d2=w{index}",
+                    "slice_depth": 2,
+                    "passes_initial_anomaly_filter": True,
+                    "robust_z": 3.0,
+                    "abs_robust_z": 3.0,
+                    "wow_delta_gmv": 100.0,
+                    "materiality_share": 0.5,
+                    "reliability_factor": 1.0,
+                    "anomaly_score": 1.0,
+                }
+            )
+            coverage[atom] = frozenset({atom})
+        rows.append(
+            {
+                "segment_id": "p1",
+                "segment_key": "d1=v0",
+                "slice_depth": 1,
+                "passes_initial_anomaly_filter": True,
+                "robust_z": 3.0,
+                "abs_robust_z": 3.0,
+                "wow_delta_gmv": 200.0,
+                "materiality_share": 0.5,
+                "reliability_factor": 1.0,
+                "anomaly_score": 2.0,
+            }
+        )
+        coverage["p1"] = frozenset({"at0", "at1"})
+        frame = pd.DataFrame(rows)
+        thresholds = AnomalyThresholds()
+
+        base_final, _, _ = search_anomal(frame, thresholds, coverage=coverage)
+        base_ids = tuple(sorted(base_final["segment_id"]))
+        base_objective = float(base_final["selection_score"].sum())
+
+        for seed in range(8):
+            shuffled = frame.sample(frac=1.0, random_state=seed).reset_index(drop=True)
+            final, _, _ = search_anomal(shuffled, thresholds, coverage=coverage)
+            with self.subTest(seed=seed):
+                self.assertEqual(tuple(sorted(final["segment_id"])), base_ids)
+                self.assertAlmostEqual(
+                    float(final["selection_score"].sum()), base_objective, places=9
+                )
+
+    def test_hierarchy_adjustment_current_behavior_locks_double_counting(self) -> None:
+        """Зафиксировать текущее (дефектное) поведение hierarchy adjustment.
+
+        Родитель получает бонус от потомков через ``aggregation_bonus_lambda``,
+        даже если сами потомки не выбираются оптимизацией. Это зафиксированный
+        аудитом дефект (двойной учёт иерархии в score и в Set Packing), а не
+        желаемое поведение — тест существует, чтобы будущее исправление было
+        осознанным изменением этого теста, а не тихой регрессией.
+
+        Args:
+            Нет аргументов.
+
+        Returns:
+            None.
+
+        Raises:
+            AssertionError: Если текущее поведение изменилось без обновления
+                этого теста.
+
+        Examples:
+            >>> # Запускается через unittest.
+        """
+
+        coverage = {
+            "p": frozenset({"a1", "a2", "a3", "a4"}),
+            "c1": frozenset({"a1", "a2"}),
+            "c2": frozenset({"a3", "a4"}),
+            "a1": frozenset({"a1"}),
+            "a2": frozenset({"a2"}),
+            "a3": frozenset({"a3"}),
+            "a4": frozenset({"a4"}),
+        }
+        specs = [
+            ("p", 1, 400.0, 1.00),
+            ("c1", 2, 200.0, 0.55),
+            ("c2", 2, 200.0, 0.55),
+            ("a1", 3, 100.0, 0.20),
+            ("a2", 3, 100.0, 0.20),
+            ("a3", 3, 100.0, 0.20),
+            ("a4", 3, 100.0, 0.20),
+        ]
+        frame = pd.DataFrame(
+            [
+                {
+                    "segment_id": segment_id,
+                    "segment_key": segment_id,
+                    "slice_depth": depth,
+                    "passes_initial_anomaly_filter": True,
+                    "abs_robust_z": 3.0,
+                    "materiality_share": score / 3.0,
+                    "reliability_factor": 1.0,
+                    "wow_delta_gmv": movement,
+                    "robust_z": 3.0,
+                }
+                for segment_id, depth, movement, score in specs
+            ]
+        )
+        thresholds = AnomalyThresholds()
+        adjusted = apply_hierarchy_score_adjustment(
+            frame,
+            coverage,
+            aggregation_bonus_lambda=0.3,
+            single_child_factor=0.85,
+            dominant_child_capture_threshold=0.80,
+            dominant_child_score_margin=0.02,
+        )
+        final, _, _ = search_anomal(adjusted, thresholds, coverage=coverage)
+
+        parent_row = adjusted.loc[adjusted["segment_id"].eq("p")].iloc[0]
+        self.assertGreater(float(parent_row["hierarchy_score_factor"]), 1.0)
+        self.assertAlmostEqual(
+            float(parent_row["anomaly_score"]), 1.15, places=6
+        )
+        # ADDED: Baseline фиксирует, что c1/c2 сейчас выбираются вместо p —
+        # но score p всё равно вырос из-за coherence детей, которые
+        # проиграли им же в Set Packing.
+        self.assertEqual(set(final["segment_id"]), {"c1", "c2"})
+        self.assertNotIn("p", set(final["segment_id"]))
 
 
 if __name__ == "__main__":

@@ -33,8 +33,9 @@ python -m gmv_anomaly
 Если `TREE_OUTPUT_PATH` задан без расширения, в сообщении пользователю
 добавляется `.png`; фактическое поведение совпадает с `reporting.py`.
 
-Путь графа `authzone_tx_share` задаётся отдельно через `RATIO_TREE_OUTPUT_PATH`.
-Pipeline не формирует его из `TREE_OUTPUT_PATH`. Значение `None` отключает только долевой граф.
+Каталог восьми PNG относительных метрик задаётся через `RATIO_TREES_OUTPUT_DIR`.
+Pipeline не формирует его из `TREE_OUTPUT_PATH`. Значение `None` отключает только
+графы относительных метрик.
 
 ## Зависимости
 
