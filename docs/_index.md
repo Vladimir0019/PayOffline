@@ -1,7 +1,8 @@
 # База знаний `gmv_anomaly`
 
-Актуальность: 2026-08-04. База описывает поиск GMV-аномалий, независимый контур
-восьми относительных метрик и patch-версию upstream-запроса `pred_insight.yql`.
+Актуальность: 2026-08-05. База описывает поиск GMV-аномалий, независимый контур
+восьми относительных метрик, product-YQL с Python3 UDF и patch-версию
+upstream-запроса `pred_insight.yql`.
 
 ## Что делает система
 
@@ -17,8 +18,8 @@ pred_insight.yql
   → data_preparation.py
   → anomaly_scoring.py
   → set_packing.py
-  → reporting.py
-  → Excel + PNG/SVG/PDF
+  → reporting.py → Excel + PNG/SVG/PDF
+  → udf_runtime.py → единая YT-таблица 1W/4W/13W
 ```
 
 Оркестрация находится в `pipeline.py`, безаргументный запуск — в `main.py`,
@@ -35,6 +36,7 @@ pred_insight.yql
 | Понять правило доминирующего потомка и его калибровку | [`hierarchy-dominance-cap.md`](hierarchy-dominance-cap.md) |
 | Изменить конфликты, coverage, solver, статусы отбора | [`set_packing.py.md`](set_packing.py.md) |
 | Изменить Excel-листы, менеджерский вывод или граф | [`reporting.py.md`](reporting.py.md) |
+| Изменить product-UDF или пересобрать YQL после изменения Python | `udf_runtime.py`, `build_yql.py` |
 | Изменить безаргументный запуск | [`main.py.md`](main.py.md) |
 
 ## Сквозной контракт данных
@@ -117,7 +119,8 @@ Set Packing максимизирует сумму `anomaly_score` среди п�
 6. `robust_z` не ограничивается сверху; источник масштаба отражают
    `z_scale_source` и `z_uses_sigma_floor`.
 7. До scoring каждый parent/date сверяется с суммой покрытых атомов максимальной
-   глубины с абсолютным допуском `hierarchy_reconciliation_abs_tolerance`.
+   глубины с абсолютным допуском `hierarchy_reconciliation_abs_tolerance = 0.01`.
+   Относительный допуск намеренно не применяется.
 8. Factual coverage обязательно для production-вызова `search_anomal`; fallback
    по `segment_key` требует `allow_segment_key_fallback=True`.
 9. Excel-контракт состоит из девяти неизменённых GMV-листов и двух long-листов долевых
@@ -156,10 +159,25 @@ python -m unittest gmv_anomaly.test_gmv_anomaly_refactor
 ```
 
 Тесты: [`../test_gmv_anomaly_refactor.py`](../test_gmv_anomaly_refactor.py).
-На момент актуализации базы: **32 теста проходят** (~2.3 с).
+На момент актуализации базы: **57 тестов проходят, 1 пропущен**.
 
 Запуск пайплайна на данных из `config.py`:
 
 ```powershell
 python -m gmv_anomaly
 ```
+
+Product-YQL после любого изменения алгоритма пересобирается одной командой из
+`C:\Python`:
+
+```powershell
+python -m gmv_anomaly.build_yql
+```
+
+Команда заново упаковывает текущие Python-модули в `anomaly_prod.yql`, добавляет
+в результат ровно одну строку `Тип строки = "Техническая информация"` с датой
+сборки и hash версии. Перед заменой файла embedded-UDF импортируется в отдельном
+локальном Python-процессе: забытая внутренняя зависимость сохраняет предыдущий
+корректный YQL. Данные содержат только выбранные Set Packing аномалии и GMV-сегменты
+с изменением структуры. Ошибка любого периода прерывает запрос до атомарной
+перезаписи целевой YT-таблицы.

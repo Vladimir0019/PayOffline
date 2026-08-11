@@ -34,6 +34,7 @@ from .data_preparation import (
     load_history_table,
     normalize_dim_value,
     period_to_weeks,
+    prepare_history_dataframe,
     segment_id_from_row,
 )
 from .pipeline import run_anomaly_analysis, run_pipeline
@@ -87,6 +88,7 @@ __all__ = [
     "load_history_table",
     "normalize_dim_value",
     "period_to_weeks",
+    "prepare_history_dataframe",
     "run_anomaly_analysis",
     "run_pipeline",
     "search_anomal",

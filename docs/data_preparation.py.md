@@ -149,18 +149,22 @@ GMV-выгрузка без специализированных колонок 
 | `build_segment_key_and_level` | Читаемый ключ, уровень и вычисленная глубина |
 | `candidate_covers_atomic` | Проверка, совместим ли родитель со значениями атома |
 | `infer_anomaly_dimension_columns` | Валидирует и возвращает явно заданные dimensions |
-| `load_history_table` | Загрузка, типизация, валидация total-слоя |
+| `prepare_history_dataframe` | Типизация и единая валидация уже загруженного DataFrame |
+| `load_history_table` | Загрузка Excel/CSV и передача в `prepare_history_dataframe` |
 | `build_full_week_grid` | Полная сетка сегментов и недель |
 
-## `load_history_table`
+## `prepare_history_dataframe` и `load_history_table`
 
-Поддерживает `.xlsx`, `.xls`, `.csv`.
+`prepare_history_dataframe` является канонической границей алгоритма для данных
+из YT/Python3 UDF. `load_history_table` поддерживает `.xlsx`, `.xls`, `.csv` и
+после чтения вызывает ту же функцию. Поэтому файловый и продуктовый контуры
+используют идентичные преобразования и проверки.
 
 Обязательные колонки: `period`, `cal_date`, `slice_depth`, `gmv`, `tx`, `au`, `am`.
 
 Последовательность:
 
-1. Читает файл.
+1. `load_history_table` читает файл; UDF передаёт собранный DataFrame напрямую.
 2. Требует колонку и обязательный аргумент `period` формата `<N>W`, удаляет
    служебную строку `period == "string"`, применяет фильтр и требует непустой
    вход с ровно одним периодом.
@@ -233,7 +237,7 @@ JSON сохраняет фиксированный порядок dimensions и 
 ⚠️ Ограничение: значение измерения не должно содержать подстроку ` × `.
 
 Вычисленная глубина ключа строго сверяется с входным `slice_depth` на этапе
-`load_history_table`. Вход отклоняется до расчёта аномалий, если, например,
+`prepare_history_dataframe`. Вход отклоняется до расчёта аномалий, если, например,
 `geo=РФ × products=QR` имеет `slice_depth = 1`, либо metadata одного
 `segment_id` различается между неделями.
 
@@ -294,5 +298,5 @@ python -m unittest gmv_anomaly.test_gmv_anomaly_refactor
 ## Связи
 
 - Логику формирования витрины описывает [`pred_insight.yql.md`](pred_insight.yql.md).
-- Результат `load_history_table` передаётся в `build_full_week_grid`.
+- Результат `prepare_history_dataframe` передаётся в `build_full_week_grid`.
 - Панель потребляет `anomaly_scoring.build_anomaly_candidates`.

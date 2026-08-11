@@ -35,8 +35,10 @@ from gmv_anomaly.data_preparation import (
     build_segment_key_and_level,
     infer_anomaly_dimension_columns,
     load_history_table,
+    prepare_history_dataframe,
     segment_id_from_row,
 )
+from gmv_anomaly.build_yql import build_yql
 from gmv_anomaly.pipeline import run_pipeline
 from gmv_anomaly.reporting import (
     build_anomaly_tree_from_excel,
@@ -48,6 +50,7 @@ from gmv_anomaly.segment_keys import (
     parse_segment_key_parts,
 )
 from gmv_anomaly.set_packing import search_anomal
+from gmv_anomaly.udf_runtime import UDF_OUTPUT_SCHEMA, run_algorithm
 
 
 DATES = [1, 8, 15, 22]
@@ -3096,6 +3099,149 @@ class GoldenAndPropertyBaselineTests(unittest.TestCase):
         # проиграли им же в Set Packing.
         self.assertEqual(set(final["segment_id"]), {"c1", "c2"})
         self.assertNotIn("p", set(final["segment_id"]))
+
+    def test_dataframe_boundary_matches_file_loader(self) -> None:
+        """ADDED: Excel/CSV и YT должны использовать одну подготовку данных.
+
+        Args:
+            Нет аргументов.
+
+        Returns:
+            None.
+
+        Raises:
+            AssertionError: Если два входных адаптера расходятся.
+
+        Examples:
+            >>> # Запускается через unittest.
+        """
+
+        source = pd.DataFrame(_all_ratio_history_rows())
+        direct, direct_dims, direct_dates = prepare_history_dataframe(
+            source,
+            period="1W",
+            dim_cols=runtime_config.DIM_COLUMNS,
+        )
+        with TemporaryDirectory() as temp_dir:
+            path = Path(temp_dir) / "history.csv"
+            source.to_csv(path, index=False)
+            loaded, loaded_dims, loaded_dates = load_history_table(
+                path,
+                period="1W",
+                dim_cols=runtime_config.DIM_COLUMNS,
+            )
+        self.assertEqual(direct_dims, loaded_dims)
+        self.assertEqual(direct_dates, loaded_dates)
+        pd.testing.assert_frame_equal(
+            direct.sort_index(axis=1),
+            loaded.sort_index(axis=1),
+            check_dtype=False,
+        )
+
+    def test_udf_output_contains_only_selected_and_gmv_structure_rows(self) -> None:
+        """ADDED: Зафиксировать компактный продуктовый контракт UDF.
+
+        Args:
+            Нет аргументов.
+
+        Returns:
+            None.
+
+        Raises:
+            AssertionError: Если UDF вернула диагностические или лишние строки.
+
+        Examples:
+            >>> # Запускается через unittest.
+        """
+
+        result = run_algorithm(_all_ratio_history_rows())
+        self.assertEqual(
+            [set(row) for row in result],
+            [set(name for name, _ in UDF_OUTPUT_SCHEMA)] * len(result),
+        )
+        self.assertEqual(
+            {
+                (row["Название метрики"], row["Сегмент"], row["Изменение структуры"])
+                for row in result
+            },
+            {
+                ("GMV", "geo=B", "исчезнувший"),
+                ("GMV", "geo=C", "новый"),
+                ("authzone_tx_share", "geo=A", None),
+            },
+        )
+        forbidden = {
+            "set_packing_status",
+            "Выбрана как аномалия",
+            "Прошла первичный фильтр",
+        }
+        self.assertTrue(all(forbidden.isdisjoint(row) for row in result))
+        for column in (
+            "GMV WoW %",
+            "TX WoW %",
+            "AU WoW %",
+            "AM WoW %",
+            "AOV WoW %",
+            "TPM WoW %",
+            "Freq WoW %",
+        ):
+            self.assertIn(column, result[0])
+        self.assertTrue(
+            all(
+                row["Изменение структуры"] is None
+                for row in result
+                if row["Название метрики"] != "GMV"
+            )
+        )
+
+    def test_yql_builder_adds_one_technical_row_and_source_version(self) -> None:
+        """ADDED: Генератор должен создавать self-contained production YQL.
+
+        Args:
+            Нет аргументов.
+
+        Returns:
+            None.
+
+        Raises:
+            AssertionError: Если метаданные или fail-fast контракт потеряны.
+
+        Examples:
+            >>> # Запускается через unittest.
+        """
+
+        with TemporaryDirectory() as temp_dir:
+            output_path = Path(temp_dir) / "anomaly_prod.yql"
+            built_path, generated_at, version = build_yql(output_path)
+            content = built_path.read_text(encoding="utf-8")
+        self.assertIn(generated_at, content)
+        self.assertIn(version, content)
+        self.assertEqual(content.count('$technical_row = ('), 1)
+        self.assertIn('"Техническая информация" AS `Тип строки`', content)
+        self.assertIn("WITH TRUNCATE", content)
+        self.assertNotIn("_error_row", content)
+        self.assertIn("Python3::run_algorithm", content)
+
+    def test_default_hierarchy_tolerance_is_one_kopeck(self) -> None:
+        """FIXED: Зафиксировать согласованный абсолютный допуск 0.01 рубля.
+
+        Args:
+            Нет аргументов.
+
+        Returns:
+            None.
+
+        Raises:
+            AssertionError: Если production tolerance изменён неявно.
+
+        Examples:
+            >>> # Запускается через unittest.
+        """
+
+        self.assertEqual(
+            AnomalyThresholds().hierarchy_reconciliation_abs_tolerance,
+            0.01,
+        )
 
 
 if __name__ == "__main__":

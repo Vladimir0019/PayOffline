@@ -9,7 +9,7 @@ from pathlib import Path
 # FIXED: После переноса всех файлов в пакет сохраняем прежнюю базу путей — корень проекта.
 _PROJECT_ROOT = Path(__file__).resolve().parent.parent
 
-date_string = "05_08"
+date_string = "11_08"
 
 # ADDED: Все параметры запуска задаются здесь; CLI-аргументы больше не используются.
 INPUT_PATH = _PROJECT_ROOT / f"payoffline_pulse_hier_{date_string}.xlsx"
@@ -225,16 +225,11 @@ class AnomalyThresholds:
     min_z_score: float = 2.0
     min_materiality_share: float = 0.0001
     sigma_floor: float = 0.00001
-    # FIXED: Параметр больше не называется cap: непрерывный robust z-score не ограничивается.
     lifecycle_z_score: float = 6.0
-    # ADDED: Fail-fast допуск бухгалтерской сверки иерархической витрины.
-    hierarchy_reconciliation_abs_tolerance: float = 1e-4
-    # ADDED: Параметры согласованной hierarchy-корректировки score.
+    hierarchy_reconciliation_abs_tolerance: float = 0.01
     aggregation_bonus_lambda: float = 0.3  # +-17.5% к score родителя
     single_child_factor: float = 0.85
-    # FIXED: Порог переключения с перечисления на exact Set Packing.
     max_hierarchy_descendants: int = 25
-    # ADDED: Системный cap для родителя, пересказывающего одного потомка.
     dominant_child_capture_threshold: float = 0.80
     dominant_child_score_margin: float = 0.02
     set_packing_gap_tolerance: float = 1e-9

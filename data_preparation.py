@@ -287,18 +287,16 @@ def period_to_weeks(period: str) -> int:
     return int(match.group(1))
 
 
-def load_history_table(
-    input_path: str | Path,
-    sheet_name: int | str = 0,
+def prepare_history_dataframe(
+    df: pd.DataFrame,
     *,
     period: str,
     dim_cols: Optional[Sequence[str]] = None,
 ) -> Tuple[pd.DataFrame, List[str], List[int]]:
-    """Загрузить историческую таблицу срезов GMV.
+    """Подготовить уже загруженную историческую таблицу срезов GMV.
 
     Args:
-        input_path: Путь к Excel- или CSV-файлу.
-        sheet_name: Имя или номер листа Excel.
+        df: Исходные строки Excel, CSV или YT в виде DataFrame.
         period: Обязательное значение периода для фильтрации в формате ``<N>W``.
         dim_cols: Явно заданные признаки. Если None, признаки определяются автоматически.
 
@@ -306,21 +304,15 @@ def load_history_table(
         Кортеж: очищенная таблица, список признаков, список недель cal_date из total-слоя.
 
     Raises:
-        ValueError: Если входной файл не поддерживается, нет обязательных колонок или total-слой некорректен.
+        ValueError: Если нет обязательных колонок или total-слой некорректен.
 
     Examples:
-        >>> # df, dims, dates = load_history_table('payoffline_pulse_hier_4_13w.xlsx')
+        >>> # history, dims, dates = prepare_history_dataframe(df, period="1W")
     """
 
     period_weeks = period_to_weeks(period)
     normalized_period = str(period).strip().upper()
-    input_path = Path(input_path)
-    if input_path.suffix.lower() in {".xlsx", ".xls"}:
-        df = pd.read_excel(input_path, sheet_name=sheet_name)
-    elif input_path.suffix.lower() == ".csv":
-        df = pd.read_csv(input_path)
-    else:
-        raise ValueError("Поддерживаются только .xlsx, .xls и .csv")
+    df = df.copy()
 
     required = {"period", "cal_date", "slice_depth", "gmv", "tx", "au", "am"}
     missing_required = sorted(required - set(df.columns))
@@ -528,6 +520,41 @@ def load_history_table(
         )
 
     return df.reset_index(drop=True), dims, dates
+
+
+def load_history_table(
+    input_path: str | Path,
+    sheet_name: int | str = 0,
+    *,
+    period: str,
+    dim_cols: Optional[Sequence[str]] = None,
+) -> Tuple[pd.DataFrame, List[str], List[int]]:
+    """Загрузить файл и применить канонический DataFrame-контракт.
+
+    Args:
+        input_path: Путь к входному Excel- или CSV-файлу.
+        sheet_name: Имя или номер листа Excel.
+        period: Обязательное значение периода в формате ``<N>W``.
+        dim_cols: Явно заданные признаки.
+
+    Returns:
+        Кортеж: очищенная таблица, признаки и календарная ось.
+
+    Raises:
+        ValueError: Если формат файла не поддерживается или данные невалидны.
+
+    Examples:
+        >>> # history, dims, dates = load_history_table("input.xlsx", period="1W")
+    """
+
+    normalized_path = Path(input_path)
+    if normalized_path.suffix.lower() in {".xlsx", ".xls"}:
+        source = pd.read_excel(normalized_path, sheet_name=sheet_name)
+    elif normalized_path.suffix.lower() == ".csv":
+        source = pd.read_csv(normalized_path)
+    else:
+        raise ValueError("Поддерживаются только .xlsx, .xls и .csv")
+    return prepare_history_dataframe(source, period=period, dim_cols=dim_cols)
 
 
 def build_full_week_grid(history_df: pd.DataFrame, dim_cols: Sequence[str], dates: Sequence[int]) -> pd.DataFrame:
