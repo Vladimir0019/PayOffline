@@ -60,9 +60,11 @@ from .trend_analysis import (
     SegmentTrendAnalysis,
     TrendChangeEvaluation,
     TrendEvaluation,
+    TrendModelConfig,
     TrendThresholds,
     TrendWindowEvaluation,
     analyze_segment_trend,
+    build_configured_trend_analysis,
     build_trend_analysis,
     evaluate_change_candidates,
     evaluate_suffix_trends,
@@ -73,6 +75,7 @@ from .trend_analysis import (
     theil_sen_slope,
     trim_leading_zero_history,
 )
+from .trend_most_recent_cp import build_most_recent_cp_trend_analysis
 
 __all__ = [
     "AnomalyThresholds",
@@ -84,6 +87,7 @@ __all__ = [
     "SegmentTrendAnalysis",
     "TrendChangeEvaluation",
     "TrendEvaluation",
+    "TrendModelConfig",
     "TrendThresholds",
     "TrendWindowEvaluation",
     "PILOT_RATIO_METRICS",
@@ -108,11 +112,13 @@ __all__ = [
     "build_ratio_analysis_sheets",
     "build_control_table",
     "build_full_week_grid",
+    "build_configured_trend_analysis",
     "build_history_for_selected",
     "build_manager_summary",
     "build_missing_zero_report",
     "build_segment_key_and_level",
     "build_trend_analysis",
+    "build_most_recent_cp_trend_analysis",
     "calculate_segment_anomaly",
     "calculate_exact_ratio_contribution",
     "calculate_ratio_segment_anomaly",

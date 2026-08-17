@@ -1,6 +1,6 @@
 # База знаний `gmv_anomaly`
 
-Актуальность: 2026-08-12. База описывает поиск GMV-аномалий, независимый контур
+Актуальность: 2026-08-14. База описывает поиск GMV-аномалий, независимый контур
 восьми относительных метрик, отдельный Python-модуль анализа GMV-тренда,
 product-YQL с Python3 UDF и patch-версию upstream-запроса `pred_insight.yql`.
 
@@ -21,7 +21,9 @@ Set Packing, Excel-отчёт или production UDF.
 pred_insight.yql
   → payoffline_pulse_hier / Excel
   → data_preparation.py
-      ↘ trend_analysis.py → 3 диагностических DataFrame (независимо)
+      ↘ trend_analysis.py
+          → legacy → 3 диагностических DataFrame
+          → most_recent_cp → trend_most_recent_cp.py → 4 DataFrame
   → anomaly_scoring.py
   → set_packing.py
   → reporting.py → Excel + PNG/SVG/PDF
@@ -216,6 +218,173 @@ RSS, F, направления сторон, прохождение порого
    обязательное подтверждение устойчивого тренда на обеих сторонах.
 6. Тейл–Сен реализован за `O(m²)`. Это дёшево для коротких рядов, но требует
    отдельного архитектурного решения, если N вырастет до сотен или тысяч.
+
+### [ADDED] Selector модели тренда
+
+Legacy API `build_trend_analysis(...)` не изменён и остаётся источником прежних
+трёх таблиц. Общая точка выбора — `build_configured_trend_analysis(...)`:
+
+```python
+from gmv_anomaly import (
+    TrendModelConfig,
+    build_configured_trend_analysis,
+)
+
+legacy_result = build_configured_trend_analysis(panel_df, dates)
+
+cp_result = build_configured_trend_analysis(
+    panel_df,
+    dates,
+    model_config=TrendModelConfig(
+        trend_search_method="most_recent_cp",
+        most_recent_cp_cost="capped",
+    ),
+)
+```
+
+Доступны ровно два `trend_search_method`:
+
+- `legacy` — прежний suffix/F-алгоритм, значение по умолчанию;
+- `most_recent_cp` — exact penalized segmentation по рассчитанным независимым
+  piecewise-linear segment costs.
+
+`RUN_gmv_TREND.py` использует `TREND_MODEL_CONFIG` и общий
+`build_configured_trend_analysis(...)`. При `most_recent_cp` он сохраняет PDF
+в прежнем формате: GMV-ряд, подсвеченный текущий режим и пунктирная линия его
+тренда; вертикальная красная линия отмечает structural CP. В PDF попадают
+только сегменты с `current_trend_exists=True`; один structural CP без
+подтверждённого тренда страницу не создаёт.
+
+Неизвестные method/cost отклоняются через `ValueError`. Параметры нового метода
+живут в отдельном frozen `TrendModelConfig` рядом с `TrendThresholds`, но не
+смешаны с бизнес-порогами `evaluate_trend`.
+
+### Most Recent CP: segment costs
+
+Новый модуль `trend_most_recent_cp.py` получает только готовую полную панель.
+Он переиспользует `trim_leading_zero_history`: ведущие нули удаляются один раз,
+внутренние/конечные нули и восстановленные `build_full_week_grid` missing rows
+остаются наблюдениями. Временная координата глобальна внутри активной истории:
+`t = 0, ..., n_active - 1`. Сегменты независимы и не обязаны быть непрерывными,
+поэтому модель видит как slope change, так и level shift.
+
+Для каждого `[s,e)` длиной не меньше `L_min = 4` доступно три cost:
+
+```text
+ols:
+  C1(s,e) = Σ u_t² = RSS(s,e) / sigma²
+
+capped:
+  C2(s,e) = min_(a,b) Σ min(u_t², K²), K = 2.0
+
+huber:
+  C3(s,e) = min_(a,b) Σ rho_delta(u_t), delta = 1.345
+  rho_delta(u) = u²                         при |u| <= delta
+                 2*delta*|u| - delta²       при |u| > delta
+
+u_t = (y_t - a - b*t) / sigma
+```
+
+Huber намеренно использует `u²`, а не стандартную запись `0.5*u²`: это
+сохраняет масштаб квадратичной части C1/C2 при общей penalty. C2 оптимизирует
+сам bounded objective, а не делает ошибочный `OLS → clip residuals`.
+Используется детерминированный active-set multi-start с четырьмя стартами:
+OLS, Theil–Sen, линия крайних точек и median-level. Случайных стартов нет.
+
+Все допустимые `C(s,e)` считаются один раз и кэшируются. Диагностика каждого
+сегмента содержит `start/end/points`, global intercept, slope, RSS, cost,
+семантический `cost_type` и `optimizer_status`.
+
+### Единая sigma и perfect fit
+
+Scale оценивается один раз на всю активную историю и используется всеми её
+сегментами:
+
+```text
+d_t = y_t - y_(t-1)
+sigma = median(|d_t - median(d)|) / (0.67448975 * sqrt(2))
+```
+
+Если основной estimator является машинным нулём, применяется фиксированная
+цепочка без абсолютного рублёвого floor:
+
+1. `OLS_RESIDUAL_MAD`: `1.4826 * MAD` residuals одной OLS-линии всей истории;
+2. `MAE_FALLBACK`: mean absolute residual, когда residual MAD равен нулю, но
+   residuals не являются машинно нулевыми;
+3. `PERFECT_FIT`: sigma остаётся нулевой; машинно точный линейный segment имеет
+   cost `0`, действительно нелинейный segment при нулевом scale — `+inf`, а не
+   `NaN` или случайный ноль.
+
+Итог всегда хранит `sigma` и `sigma_source`: `DIFF_MAD`,
+`OLS_RESIDUAL_MAD`, `MAE_FALLBACK` либо `PERFECT_FIT`.
+
+### Penalty, exact DP и профиль последнего CP
+
+Для одного активного ряда:
+
+```text
+beta = 3 * ln(n_active)
+
+F(t) = min(
+    C(0,t),
+    min_s [F(s) + C(s,t) + beta]
+)
+
+G(0)   = C(0,n)
+G(tau) = F(tau) + C(tau,n) + beta
+```
+
+Penalty начисляется за changepoint, а не за первый сегмент. DP сохраняет
+predecessor каждого prefix и восстанавливает всю оптимальную segmentation
+прошлого. Затем явно рассчитывается полный `G(tau)` для `tau=0` и всех границ,
+оставляющих не меньше четырёх точек с обеих сторон. Выбирается только минимум
+`G`; при различии исключительно в scale-aware machine tolerance берётся более
+поздний `tau`, и summary получает `numeric_tie_break_used=True`. Legacy-правило
+`near_best_change_ratio=0.95` и recency penalty сюда не переносятся.
+
+Outer DP глобально оптимален для уже рассчитанной матрицы `C(s,e)`. Для C1 это
+closed-form OLS, для C3 objective выпуклый. Для невыпуклого C2 multi-start
+solver не является доказательством глобального оптимума bounded regression;
+документируется только минимальное найденное им значение. Отдельный unit-тест
+сверяет C2 с независимым subset-reference на малом сегменте, а performance-тест
+измеряет все 153 costs при `n=20`.
+
+### Structural regime не равен confirmed trend
+
+Выбранный `tau` определяет начало текущего структурного режима. После этого
+suffix `[tau,n)` передаётся без нового business-классификатора в существующий
+`evaluate_trend(...)`. Поэтому level shift может дать
+`structural_change_detected=True`, но `current_trend_direction=NONE`.
+Legacy `change_detected` не переиспользуется как синоним structural CP.
+
+Для найденной границы дополнительно считаются:
+
+```text
+delta_slope = current_regime_slope - previous_regime_slope
+level_shift = fitted_current(tau) - fitted_previous(tau)
+```
+
+Summary нового метода содержит метод/cost, raw/used history, sigma/source,
+beta, structural CP и его даты, current regime, no-change/selected objective,
+objective improvement, подтверждение текущего тренда, slope/level diagnostics и
+JSON всех восстановленных breakpoints.
+
+Возвращаются четыре таблицы:
+
+- `trend_summary` — одна итоговая строка на сегмент;
+- `trend_cp_profile` — полный `G(tau)`, включая `tau=0`;
+- `trend_segment_diagnostics` — весь кэш допустимых `C(s,e)`;
+- `trend_segmentation` — только сегменты выбранного решения с cumulative cost.
+
+### Численно важный exact-plateau edge
+
+При строго заданных формулах ряд `[100,100,100,100,300,300,300,300]` допускает
+независимые линии с нулевым fit cost при `tau=4`, но fallback даёт
+`sigma = 1.4826 * MAD(OLS residuals)`, поэтому `G(0) ≈ 5.971`, а
+`G(4) = 3*ln(8) ≈ 6.238`. Строгий минимум — отсутствие CP. Реализация не
+подменяет это решение запрещённым near-best коэффициентом. Возможность видеть
+чистый level shift проверяется почти плоским scale-invariant сценарием с
+ненулевым `DIFF_MAD`, где `tau=4` выигрывает по заданному objective.
 
 ## Исключённые из отдельной документации файлы
 

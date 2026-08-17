@@ -25,6 +25,9 @@ GROWTH = "GROWTH"
 DECLINE = "DECLINE"
 NO_DIRECTION = "NONE"
 
+TREND_SEARCH_METHODS = frozenset({"legacy", "most_recent_cp"})
+MOST_RECENT_CP_COSTS = frozenset({"ols", "capped", "huber"})
+
 
 # [ADDED] Пороги тренда отделены от конфигурации anomaly detection.
 @dataclass(frozen=True)
@@ -102,6 +105,83 @@ class TrendThresholds:
             or not 0.0 < float(self.near_best_change_ratio) <= 1.0
         ):
             raise ValueError("near_best_change_ratio должен находиться в диапазоне (0, 1]")
+
+
+# [ADDED] Выбор модели тренда отделён от бизнес-порогов подтверждения тренда.
+@dataclass(frozen=True)
+class TrendModelConfig:
+    """Настроить способ поиска начала текущего тренда.
+
+    Args:
+        trend_search_method: ``legacy`` или ``most_recent_cp``.
+        most_recent_cp_cost: ``ols``, ``capped`` или ``huber``.
+        most_recent_cp_min_segment_points: Минимальная длина каждого режима.
+        most_recent_cp_capped_k: Порог K capped quadratic objective.
+        most_recent_cp_huber_delta: Порог delta нормированного Huber objective.
+
+    Returns:
+        Неизменяемую конфигурацию selector и Most Recent CP.
+
+    Raises:
+        ValueError: Если метод, cost или числовой параметр нарушает контракт.
+
+    Examples:
+        >>> TrendModelConfig().trend_search_method
+        'legacy'
+    """
+
+    trend_search_method: str = "most_recent_cp"
+    most_recent_cp_cost: str = "ols"
+    most_recent_cp_min_segment_points: int = 4
+    most_recent_cp_capped_k: float = 2.0
+    most_recent_cp_huber_delta: float = 1.345
+
+    def __post_init__(self) -> None:
+        """Проверить конфигурацию до запуска расчёта.
+
+        Args:
+            Нет аргументов кроме созданного экземпляра.
+
+        Returns:
+            None.
+
+        Raises:
+            ValueError: Если значение не поддерживается.
+
+        Examples:
+            >>> TrendModelConfig(most_recent_cp_cost="huber").most_recent_cp_cost
+            'huber'
+        """
+
+        if self.trend_search_method not in TREND_SEARCH_METHODS:
+            raise ValueError(
+                "trend_search_method должен быть одним из: "
+                + ", ".join(sorted(TREND_SEARCH_METHODS))
+            )
+        if self.most_recent_cp_cost not in MOST_RECENT_CP_COSTS:
+            raise ValueError(
+                "most_recent_cp_cost должен быть одним из: "
+                + ", ".join(sorted(MOST_RECENT_CP_COSTS))
+            )
+        if (
+            isinstance(self.most_recent_cp_min_segment_points, bool)
+            or not isinstance(
+                self.most_recent_cp_min_segment_points,
+                (int, np.integer),
+            )
+            or self.most_recent_cp_min_segment_points < 4
+        ):
+            raise ValueError(
+                "most_recent_cp_min_segment_points должен быть целым числом "
+                "не меньше 4"
+            )
+        positive_values = {
+            "most_recent_cp_capped_k": self.most_recent_cp_capped_k,
+            "most_recent_cp_huber_delta": self.most_recent_cp_huber_delta,
+        }
+        for name, value in positive_values.items():
+            if not math.isfinite(float(value)) or float(value) <= 0.0:
+                raise ValueError(f"{name} должен быть конечным положительным числом")
 
 
 @dataclass(frozen=True)
@@ -1318,17 +1398,65 @@ def build_trend_analysis(
     }
 
 
+# [ADDED] Общая точка выбора сохраняет legacy-функцию отдельным публичным API.
+def build_configured_trend_analysis(
+    panel_df: pd.DataFrame,
+    dates: Sequence[int],
+    thresholds: Optional[TrendThresholds] = None,
+    model_config: Optional[TrendModelConfig] = None,
+) -> Dict[str, pd.DataFrame]:
+    """Запустить выбранный пользователем способ поиска текущего тренда.
+
+    Args:
+        panel_df: Готовая полная панель из ``build_full_week_grid``.
+        dates: Полная упорядоченная ось из total-слоя.
+        thresholds: Неизменённые бизнес-пороги ``evaluate_trend``.
+        model_config: Selector модели и параметры Most Recent CP.
+
+    Returns:
+        Legacy-таблицы либо собственные диагностические таблицы Most Recent CP.
+
+    Raises:
+        ValueError: Если конфигурация или панель нарушает контракт.
+
+    Examples:
+        >>> panel = pd.DataFrame({'segment_id': ['s'] * 4, 'cal_date': [1, 2, 3, 4], 'gmv': [100, 110, 120, 130]})
+        >>> build_configured_trend_analysis(panel, [1, 2, 3, 4])['trend_summary'].iloc[0]['current_trend_direction']
+        'GROWTH'
+    """
+
+    thresholds = thresholds or TrendThresholds()
+    model_config = model_config or TrendModelConfig()
+    if model_config.trend_search_method == "legacy":
+        return build_trend_analysis(panel_df, dates, thresholds)
+
+    # Локальный импорт разрывает цикл: новый математический модуль переиспользует
+    # TrendThresholds, trim_leading_zero_history и evaluate_trend отсюда.
+    from .trend_most_recent_cp import build_most_recent_cp_trend_analysis
+
+    return build_most_recent_cp_trend_analysis(
+        panel_df,
+        dates,
+        thresholds,
+        model_config,
+    )
+
+
 __all__ = [
     "DECLINE",
     "GROWTH",
+    "MOST_RECENT_CP_COSTS",
     "NO_DIRECTION",
+    "TREND_SEARCH_METHODS",
     "LinearModelFit",
     "SegmentTrendAnalysis",
     "TrendChangeEvaluation",
     "TrendEvaluation",
+    "TrendModelConfig",
     "TrendThresholds",
     "TrendWindowEvaluation",
     "analyze_segment_trend",
+    "build_configured_trend_analysis",
     "build_trend_analysis",
     "evaluate_change_candidates",
     "evaluate_suffix_trends",
