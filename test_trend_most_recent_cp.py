@@ -35,6 +35,7 @@ from gmv_anomaly.trend_most_recent_cp import (
     _calculate_slope_change_statistics,
     _classify_structural_change,
     _classify_local_regime,
+    _build_local_trend_windows,
     _evaluate_selected_regimes,
     _fit_ols_regime_diagnostic,
     _fit_ols_line,
@@ -254,6 +255,16 @@ class MostRecentCPTests(unittest.TestCase):
             for cost in ("ols", "capped", "huber")
         }
         self.assertIsNotNone(results["ols"].summary["last_cp_index"])
+        # [ADDED] Выброс в первой выбранной CP не должен менять структурный
+        # профиль из-за нового post-classification окна тренда.
+        self.assertEqual(
+            results["ols"].summary["optimal_breakpoints_json"],
+            "[4, 8]",
+        )
+        self.assertEqual(
+            results["ols"].summary["structural_change_type"],
+            LEVEL_AND_SLOPE,
+        )
         self.assertIsNone(results["capped"].summary["last_cp_index"])
         self.assertIsNone(results["huber"].summary["last_cp_index"])
         self.assertLess(
@@ -745,6 +756,117 @@ class MostRecentCPTests(unittest.TestCase):
             LEVEL_AND_SLOPE,
         )
         self.assertTrue(combined_reversal["direction_change"])
+
+    def test_local_trend_windows_share_cp_without_repeating_changes(self) -> None:
+        """Включить обе CP в средний тренд и не продублировать ни один переход.
+
+        Args:
+            Нет аргументов.
+
+        Returns:
+            None.
+
+        Raises:
+            AssertionError: Если окна тренда или недельные переходы пересекаются.
+
+        Examples:
+            >>> # Запускается через unittest.
+        """
+
+        segments = [(0, 4), (4, 8), (8, 13)]
+        windows = _build_local_trend_windows(segments, 13)
+        self.assertEqual(windows, ((0, 5), (4, 9), (8, 13)))
+        transition_indices = [
+            transition
+            for start, end in windows
+            for transition in range(start, end - 1)
+        ]
+        self.assertEqual(transition_indices, list(range(12)))
+        self.assertEqual(len(transition_indices), len(set(transition_indices)))
+
+        rows, _ = _evaluate_selected_regimes(
+            np.arange(13, dtype=float) + 1.0,
+            list(range(13)),
+            segments,
+            TrendThresholds(),
+            TrendModelConfig(trend_search_method="most_recent_cp"),
+        )
+        self.assertEqual([row["points"] for row in rows], [4, 4, 5])
+        self.assertEqual([row["trend_points"] for row in rows], [5, 5, 5])
+        self.assertEqual([row["trend_changes"] for row in rows], [4, 4, 4])
+        self.assertEqual(
+            [row["trend_includes_left_cp"] for row in rows],
+            [False, True, True],
+        )
+        self.assertEqual(
+            [row["trend_includes_right_cp"] for row in rows],
+            [True, True, False],
+        )
+
+    def test_new_fashion_middle_window_is_decline_and_cp_fit_is_unchanged(self) -> None:
+        """Зафиксировать разворот «Новой Моды» без изменения CP/OLS-диагностики.
+
+        Args:
+            Нет аргументов.
+
+        Returns:
+            None.
+
+        Raises:
+            AssertionError: Если средний тренд не DECLINE или structural fit изменён.
+
+        Examples:
+            >>> # Запускается через unittest.
+        """
+
+        values = [
+            1_942_291,
+            1_305_382,
+            25_035_287,
+            24_681_921,
+            27_157_779,
+            23_773_741,
+            25_102_193,
+            21_756_752,
+            18_022_954,
+            18_776_653,
+            20_187_117,
+            24_195_998,
+            26_915_152,
+        ]
+        result = analyze_most_recent_cp_series(values)
+        self.assertEqual(result.summary["optimal_breakpoints_json"], "[4, 8]")
+        self.assertEqual(
+            [(row["start"], row["end"]) for row in result.segmentation],
+            [(0, 4), (4, 8), (8, 13)],
+        )
+        self.assertEqual(
+            [(row["trend_start"], row["trend_end"]) for row in result.segmentation],
+            [(0, 5), (4, 9), (8, 13)],
+        )
+        self.assertEqual(
+            [row["local_regime_class"] for row in result.segmentation],
+            [LOCAL_UNCONFIRMED, DECLINE, GROWTH],
+        )
+        middle = result.segmentation[1]
+        self.assertEqual(middle["trend_points"], 5)
+        self.assertEqual(middle["trend_changes"], 4)
+        self.assertAlmostEqual(middle["local_direction_count_share"], 0.75)
+        self.assertEqual(middle["local_gmv_change_abs"], -9_134_825.0)
+
+        first_cp, last_cp = result.changepoints
+        self.assertEqual(first_cp["cp_index"], 4)
+        self.assertEqual(first_cp["structural_change_type"], LEVEL_AND_SLOPE)
+        self.assertEqual(last_cp["cp_index"], 8)
+        self.assertEqual(last_cp["structural_change_type"], SLOPE_CHANGE)
+        self.assertAlmostEqual(last_cp["slope_change_se"], 963_541.4109571645)
+        self.assertAlmostEqual(last_cp["level_shift_se"], 2_549_290.9513049433)
+        self.assertAlmostEqual(last_cp["slope_change_z"], 3.9519183676987626)
+        self.assertAlmostEqual(last_cp["level_shift_z"], 1.4710491943182722)
+        self.assertEqual(last_cp["previous_regime_trend_direction"], DECLINE)
+        self.assertEqual(last_cp["current_regime_trend_direction"], GROWTH)
+        self.assertTrue(last_cp["direction_change"])
+        self.assertTrue(result.summary["direction_change"])
 
     def test_weak_and_threshold_boundary_classification_helper(self) -> None:
         """Проверить weak fallback и включающую границу ``>= threshold``.

@@ -669,6 +669,46 @@ def _classify_local_regime(
     return LOCAL_UNCONFIRMED
 
 
+def _build_local_trend_windows(
+    selected_segments: Sequence[Tuple[int, int]],
+    value_count: int,
+) -> Tuple[Tuple[int, int], ...]:
+    """Построить окна локального тренда с общей структурной CP.
+
+    Args:
+        selected_segments: Упорядоченные непересекающиеся half-open режимы DP.
+        value_count: Число наблюдений в активной GMV-истории.
+
+    Returns:
+        Half-open окна тренда. Правая CP включается в левое окно, а как начало
+        правого окна уже присутствует в нём; последний режим не расширяется.
+
+    Raises:
+        ValueError: Если структурные сегменты некорректны или не стыкуются.
+
+    Examples:
+        >>> _build_local_trend_windows([(0, 4), (4, 8), (8, 13)], 13)
+        ((0, 5), (4, 9), (8, 13))
+    """
+
+    if value_count < 0:
+        raise ValueError("Число наблюдений не может быть отрицательным")
+    windows: List[Tuple[int, int]] = []
+    previous_end: Optional[int] = None
+    segment_count = len(selected_segments)
+    for segment_index, (start, end) in enumerate(selected_segments):
+        if start < 0 or end > value_count or start >= end:
+            raise ValueError("Некорректные границы выбранного структурного режима")
+        if previous_end is not None and start != previous_end:
+            raise ValueError("Соседние выбранные структурные режимы должны стыковаться")
+        trend_end = end + 1 if segment_index < segment_count - 1 else end
+        if trend_end > value_count:
+            raise ValueError("Правая CP окна тренда выходит за GMV-историю")
+        windows.append((int(start), int(trend_end)))
+        previous_end = end
+    return tuple(windows)
+
+
 def _evaluate_selected_regimes(
     values: np.ndarray,
     dates: Sequence[object],
@@ -676,20 +716,21 @@ def _evaluate_selected_regimes(
     thresholds: TrendThresholds,
     model_config: TrendModelConfig,
 ) -> Tuple[List[Dict[str, object]], List[TrendEvaluation]]:
-    """Оценить каждый локальный режим выбранной DP-сегментации.
+    """Оценить локальные тренды на окнах с общей структурной CP.
 
     Args:
         values: Активная GMV-история.
         dates: Синхронная активная календарная ось.
-        selected_segments: Упорядоченные half-open режимы.
+        selected_segments: Упорядоченные непересекающиеся half-open режимы DP.
         thresholds: Неизменённый бизнес-контракт тренда.
         model_config: Параметры FLAT-классификации.
 
     Returns:
-        Строки локальной диагностики и соответствующие ``TrendEvaluation``.
+        Строки структурной и трендовой диагностики и соответствующие
+        ``TrendEvaluation``.
 
     Raises:
-        ValueError: Если границы выбранного режима некорректны.
+        ValueError: Если границы выбранного режима некорректны или не стыкуются.
 
     Examples:
         >>> rows, _ = _evaluate_selected_regimes(
@@ -700,21 +741,27 @@ def _evaluate_selected_regimes(
         'GROWTH'
     """
 
+    # [ADDED] Структурные сегменты остаются непересекающимися для CP/OLS,
+    # а локальный тренд получает отдельное окно с обеими соседними CP.
+    trend_windows = _build_local_trend_windows(selected_segments, len(values))
     rows: List[Dict[str, object]] = []
     evaluations: List[TrendEvaluation] = []
-    for segment_index, (start, end) in enumerate(selected_segments):
-        if start < 0 or end > len(values) or start >= end:
-            raise ValueError("Некорректные границы выбранного локального режима")
-        evaluation = evaluate_trend(values[start:end], thresholds)
+    for segment_index, ((start, end), (trend_start, trend_end)) in enumerate(
+        zip(selected_segments, trend_windows)
+    ):
+        # [FIXED] evaluate_trend по-прежнему работает с уровнями GMV, но теперь
+        # левая сторона CP видит саму граничную точку и последнее изменение.
+        trend_values = values[trend_start:trend_end]
+        evaluation = evaluate_trend(trend_values, thresholds)
         evaluations.append(evaluation)
-        start_gmv = float(values[start])
-        end_gmv = float(values[end - 1])
+        start_gmv = float(values[trend_start])
+        end_gmv = float(values[trend_end - 1])
         gmv_change = float(end_gmv - start_gmv)
         gmv_change_relative = (
             float(gmv_change / abs(start_gmv))
             if not _effectively_zero(
                 np.asarray([start_gmv], dtype=float),
-                values[start:end],
+                trend_values,
             )
             else math.nan
         )
@@ -727,6 +774,16 @@ def _evaluate_selected_regimes(
                 "start_date": dates[start],
                 "end_date": dates[end - 1],
                 "points": int(end - start),
+                "trend_start": int(trend_start),
+                "trend_end": int(trend_end),
+                "trend_start_date": dates[trend_start],
+                "trend_end_date": dates[trend_end - 1],
+                "trend_points": int(trend_end - trend_start),
+                "trend_changes": int(trend_end - trend_start - 1),
+                "trend_includes_left_cp": bool(segment_index > 0),
+                "trend_includes_right_cp": bool(
+                    segment_index < len(selected_segments) - 1
+                ),
                 "local_start_gmv": start_gmv,
                 "local_end_gmv": end_gmv,
                 "local_gmv_change_abs": gmv_change,
@@ -808,7 +865,9 @@ def _select_global_regime_indices(
     global_evaluation = local_evaluations[last_index]
     pending_flat_count = 0
     maximum_flats = int(model_config.global_max_flat_bridge_regimes)
-    global_end = int(local_rows[last_index]["end"])
+    # [FIXED] Глобальная проверка берёт единый непрерывный срез исходного ряда:
+    # общие CP локальных окон не дублируются при объединении режимов.
+    global_end = int(local_rows[last_index]["trend_end"])
 
     for regime_index in range(last_index - 1, -1, -1):
         local_class = str(local_rows[regime_index]["local_regime_class"])
@@ -820,7 +879,7 @@ def _select_global_regime_indices(
         if local_class != direction:
             break
 
-        candidate_start = int(local_rows[regime_index]["start"])
+        candidate_start = int(local_rows[regime_index]["trend_start"])
         candidate_evaluation = evaluate_trend(
             values[candidate_start:global_end],
             thresholds,
@@ -2075,12 +2134,12 @@ def analyze_most_recent_cp_series(
 
     global_exists = bool(included_global_indices)
     global_start_index = (
-        int(local_rows[included_global_indices[0]]["start"])
+        int(local_rows[included_global_indices[0]]["trend_start"])
         if global_exists
         else None
     )
     global_end_index = (
-        int(local_rows[included_global_indices[-1]]["end"])
+        int(local_rows[included_global_indices[-1]]["trend_end"])
         if global_exists
         else None
     )
@@ -2090,7 +2149,7 @@ def analyze_most_recent_cp_series(
         else []
     )
     global_structure = " -> ".join(
-        f"{row['local_regime_class']}({int(row['points'])})"
+        f"{row['local_regime_class']}({int(row['trend_points'])})"
         for row in global_structure_rows
     )
     global_structure_json = json.dumps(
@@ -2102,6 +2161,10 @@ def analyze_most_recent_cp_series(
                 "points": int(row["points"]),
                 "start_date": row["start_date"],
                 "end_date": row["end_date"],
+                "trend_points": int(row["trend_points"]),
+                "trend_changes": int(row["trend_changes"]),
+                "trend_start_date": row["trend_start_date"],
+                "trend_end_date": row["trend_end_date"],
                 "start_gmv": row["local_start_gmv"],
                 "end_gmv": row["local_end_gmv"],
                 "gmv_change_abs": row["local_gmv_change_abs"],
@@ -2661,6 +2724,14 @@ MOST_RECENT_CP_SEGMENTATION_COLUMNS = (
     "start_date",
     "end_date",
     "points",
+    "trend_start",
+    "trend_end",
+    "trend_start_date",
+    "trend_end_date",
+    "trend_points",
+    "trend_changes",
+    "trend_includes_left_cp",
+    "trend_includes_right_cp",
     "intercept",
     "slope",
     "rss",

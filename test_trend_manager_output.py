@@ -88,6 +88,9 @@ class ManagerTrendOutputTests(unittest.TestCase):
                     "start_date": 0,
                     "end_date": 3,
                     "points": 4,
+                    "trend_start_date": 0,
+                    "trend_end_date": 4,
+                    "trend_points": 5,
                     "local_start_gmv": 60.0,
                     "local_end_gmv": 30.0,
                     "local_gmv_change_abs": -30.0,
@@ -101,6 +104,9 @@ class ManagerTrendOutputTests(unittest.TestCase):
                     "start_date": 4,
                     "end_date": 7,
                     "points": 4,
+                    "trend_start_date": 4,
+                    "trend_end_date": 8,
+                    "trend_points": 5,
                     "local_start_gmv": 35.0,
                     "local_end_gmv": 65.0,
                     "local_gmv_change_abs": 30.0,
@@ -114,6 +120,9 @@ class ManagerTrendOutputTests(unittest.TestCase):
                     "start_date": 8,
                     "end_date": 11,
                     "points": 4,
+                    "trend_start_date": 8,
+                    "trend_end_date": 12,
+                    "trend_points": 5,
                     "local_start_gmv": 65.0,
                     "local_end_gmv": 65.0,
                     "local_gmv_change_abs": 0.0,
@@ -127,6 +136,9 @@ class ManagerTrendOutputTests(unittest.TestCase):
                     "start_date": 12,
                     "end_date": 16,
                     "points": 5,
+                    "trend_start_date": 12,
+                    "trend_end_date": 16,
+                    "trend_points": 5,
                     "local_start_gmv": 80.0,
                     "local_end_gmv": 120.0,
                     "local_gmv_change_abs": 40.0,
@@ -181,7 +193,7 @@ class ManagerTrendOutputTests(unittest.TestCase):
         self.assertEqual(row["pre_global_trend_direction"], "Падение")
         self.assertEqual(
             row["global_trend_structure"],
-            "Разворот: падение (4) → рост (4) → FLAT (4) → сдвиг вверх и ускорение роста (5)",
+            "Разворот: падение (5) → рост (5) → FLAT (5) → сдвиг вверх и ускорение роста (5)",
         )
         self.assertEqual(row["global_trend_total_gmv_share_dynamics"], "17,5% → 60%")
         self.assertAlmostEqual(float(row["global_trend_total_gmv_share_change_pp"]), 42.5)

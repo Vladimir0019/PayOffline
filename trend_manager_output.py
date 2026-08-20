@@ -456,6 +456,34 @@ def _transition_label(
     raise ValueError(f"Неподдерживаемый тип structural CP: {change_type}")
 
 
+def _regime_trend_value(
+    regime: Mapping[str, object],
+    trend_key: str,
+    structural_key: str,
+) -> object:
+    """Прочитать поле окна тренда с fallback на прежний структурный контракт.
+
+    Args:
+        regime: Строка локального режима.
+        trend_key: Имя нового поля окна тренда.
+        structural_key: Имя совместимого структурного поля старого результата.
+
+    Returns:
+        Значение нового поля либо прежнего структурного поля.
+
+    Raises:
+        KeyError: Если в строке отсутствуют оба поля.
+
+    Examples:
+        >>> _regime_trend_value({'points': 4, 'trend_points': 5}, 'trend_points', 'points')
+        5
+    """
+
+    if trend_key in regime:
+        return regime[trend_key]
+    return regime[structural_key]
+
+
 def _global_structure_text(
     segment_regimes: pd.DataFrame,
     segment_changepoints: pd.DataFrame,
@@ -501,13 +529,17 @@ def _global_structure_text(
             pre_global_direction = "Не подтверждено"
 
     first_class = str(first["local_regime_class"])
-    first_points = int(first["points"])
+    # [FIXED] Длительность подписи относится к окну классификации тренда, а не
+    # к непересекающемуся структурному сегменту CP/OLS.
+    first_points = int(
+        _regime_trend_value(first, "trend_points", "points")
+    )
     if reversal:
         previous_row = previous.iloc[0]
         tokens = [
             "Разворот: "
             f"{_direction_label(previous_row['local_regime_class'], capitalize=False)} "
-            f"({int(previous_row['points'])}) → "
+            f"({int(_regime_trend_value(previous_row, 'trend_points', 'points'))}) → "
             f"{_direction_label(first_class, capitalize=False)} ({first_points})"
         ]
     else:
@@ -530,7 +562,10 @@ def _global_structure_text(
             changepoints_by_current_index[regime_index],
             str(regime["local_regime_class"]),
         )
-        tokens.append(f"{label} ({int(regime['points'])})")
+        regime_points = int(
+            _regime_trend_value(regime, "trend_points", "points")
+        )
+        tokens.append(f"{label} ({regime_points})")
     return " → ".join(tokens), reversal, pre_global_direction
 
 
@@ -707,7 +742,9 @@ def build_manager_trend_output(
             global_direction,
         )
 
-        local_points = int(last_regime["points"])
+        local_points = int(
+            _regime_trend_value(last_regime, "trend_points", "points")
+        )
         global_length = int(summary_row["global_trend_length"])
         start_share = _safe_ratio(
             _as_finite_float(summary_row["global_trend_start_gmv"]),
@@ -740,8 +777,20 @@ def build_manager_trend_output(
                 **{dimension: attributes[dimension] for dimension in dim_cols},
                 "current_gmv": float(current_gmv_by_id[segment_id]),
                 "trend_direction": _direction_label(global_direction),
-                "local_trend_start_date": int(last_regime["start_date"]),
-                "local_trend_end_date": int(last_regime["end_date"]),
+                "local_trend_start_date": int(
+                    _regime_trend_value(
+                        last_regime,
+                        "trend_start_date",
+                        "start_date",
+                    )
+                ),
+                "local_trend_end_date": int(
+                    _regime_trend_value(
+                        last_regime,
+                        "trend_end_date",
+                        "end_date",
+                    )
+                ),
                 "local_trend_length": local_points,
                 "local_trend_gmv_change_abs": local_change,
                 "local_trend_gmv_change_relative": _as_finite_float(last_regime["local_gmv_change_relative"]),
