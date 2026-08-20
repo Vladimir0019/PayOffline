@@ -12,18 +12,35 @@ import numpy as np
 import pandas as pd
 
 from gmv_anomaly.trend_analysis import (
+    DECLINE,
     GROWTH,
     NO_DIRECTION,
     TrendModelConfig,
+    TrendThresholds,
     build_configured_trend_analysis,
     build_trend_analysis,
+    evaluate_trend,
 )
 from gmv_anomaly.trend_most_recent_cp import (
     DIFF_MAD,
+    LEVEL_AND_SLOPE,
+    LEVEL_SHIFT,
+    LOCAL_FLAT,
+    LOCAL_UNCONFIRMED,
+    NO_STRUCTURAL_CHANGE,
     PERFECT_FIT,
+    SLOPE_CHANGE,
+    WEAK_OR_UNCLASSIFIED,
+    _calculate_level_shift_statistics,
+    _calculate_slope_change_statistics,
+    _classify_structural_change,
+    _classify_local_regime,
+    _evaluate_selected_regimes,
+    _fit_ols_regime_diagnostic,
     _fit_ols_line,
     _huber_rho,
     _select_most_recent_profile_candidate,
+    _select_global_regime_indices,
     analyze_most_recent_cp_series,
     build_most_recent_cp_trend_analysis,
     calculate_segment_cost,
@@ -196,7 +213,11 @@ class MostRecentCPTests(unittest.TestCase):
             [100, 100, 100, 100, 300, 300, 300, 300]
         )
         self.assertIsNone(result.summary["last_cp_index"])
-        self.assertAlmostEqual(result.summary["beta"], 3.0 * math.log(8.0))
+        # FIXED: Источник истины — действующий penalty 3*ln(n)*1.5.
+        self.assertAlmostEqual(
+            result.summary["beta"],
+            3.0 * math.log(8.0) * 1.5,
+        )
         self.assertLess(
             result.summary["objective_no_change"],
             result.summary["beta"],
@@ -356,6 +377,13 @@ class MostRecentCPTests(unittest.TestCase):
             {"most_recent_cp_capped_k": 0.0},
             {"most_recent_cp_huber_delta": 0.0},
             {"most_recent_cp_min_segment_points": 3},
+            {"most_recent_cp_change_z_threshold": 0.0},
+            {"most_recent_cp_change_z_threshold": math.inf},
+            {"global_flat_max_relative_slope": -0.01},
+            {"global_flat_max_total_change": -0.01},
+            {"global_flat_max_noise_ratio": -0.01},
+            {"global_max_flat_bridge_regimes": -1},
+            {"global_max_flat_bridge_regimes": True},
         )
         for kwargs in invalid_configs:
             with self.subTest(kwargs=kwargs), self.assertRaises(ValueError):
@@ -365,12 +393,21 @@ class MostRecentCPTests(unittest.TestCase):
             [0, 0, 0, 100, 101, 100, 102, 300, 302, 301, 303]
         )
         self.assertEqual(active.summary["history_points_used"], 8)
-        self.assertAlmostEqual(active.summary["beta"], 3.0 * math.log(8.0))
+        self.assertAlmostEqual(
+            active.summary["beta"],
+            3.0 * math.log(8.0) * 1.5,
+        )
 
         panel = _panel([100, 110, 120, 130, 140, 150, 160, 170])
         dates = list(range(8))
         direct = build_trend_analysis(panel, dates)
-        dispatched = build_configured_trend_analysis(panel, dates)
+        # FIXED: Действующий default selector — most_recent_cp; legacy
+        # backward-compatibility проверяется только явной конфигурацией.
+        dispatched = build_configured_trend_analysis(
+            panel,
+            dates,
+            model_config=TrendModelConfig(trend_search_method="legacy"),
+        )
         self.assertEqual(set(direct), set(dispatched))
         for key in direct:
             pd.testing.assert_frame_equal(direct[key], dispatched[key])
@@ -429,6 +466,14 @@ class MostRecentCPTests(unittest.TestCase):
         self.assertEqual(
             [(row["start"], row["end"]) for row in result.segmentation],
             [(0, 4), (4, 8), (8, 12)],
+        )
+        self.assertEqual(
+            [row["cp_index"] for row in result.changepoints],
+            [4, 8],
+        )
+        self.assertEqual(
+            result.changepoints[-1]["structural_change_type"],
+            result.summary["structural_change_type"],
         )
 
     def test_t17_c2_matches_reference_and_is_not_ols_clipping(self) -> None:
@@ -515,6 +560,7 @@ class MostRecentCPTests(unittest.TestCase):
             {
                 "trend_summary",
                 "trend_cp_profile",
+                "trend_changepoints",
                 "trend_segment_diagnostics",
                 "trend_segmentation",
             },
@@ -573,6 +619,578 @@ class MostRecentCPTests(unittest.TestCase):
         )
         self.assertFalse(tied)
         self.assertEqual(selected["tau"], 4)
+
+    def test_structural_post_classification_level_slope_and_combined(self) -> None:
+        """Различить чистые level, slope и одновременные изменения.
+
+        Args:
+            Нет аргументов.
+
+        Returns:
+            None.
+
+        Raises:
+            AssertionError: Если standardized post-classification нарушена.
+
+        Examples:
+            >>> # Запускается через unittest.
+        """
+
+        config = TrendModelConfig(
+            trend_search_method="most_recent_cp",
+            most_recent_cp_cost="ols",
+        )
+        level = analyze_most_recent_cp_series(
+            [100, 101, 100, 102, 300, 302, 301, 303],
+            model_config=config,
+        ).summary
+        self.assertEqual(level["structural_change_type"], LEVEL_SHIFT)
+        self.assertGreaterEqual(level["level_shift_z"], level["change_z_threshold"])
+        self.assertLess(level["slope_change_z"], level["change_z_threshold"])
+        self.assertFalse(level["direction_change"])
+
+        slope = analyze_most_recent_cp_series(
+            [100, 110, 120, 130, 140, 150, 145, 140, 135],
+            model_config=config,
+        ).summary
+        self.assertEqual(slope["last_cp_index"], 5)
+        self.assertEqual(slope["structural_change_type"], SLOPE_CHANGE)
+        self.assertLess(slope["level_shift_z"], slope["change_z_threshold"])
+        self.assertGreaterEqual(slope["slope_change_z"], slope["change_z_threshold"])
+
+        combined = analyze_most_recent_cp_series(
+            [100, 101, 100, 102, 101, 103, 300, 320, 340, 360, 380, 400],
+            model_config=config,
+        ).summary
+        self.assertEqual(combined["last_cp_index"], 6)
+        self.assertEqual(combined["structural_change_type"], LEVEL_AND_SLOPE)
+        self.assertGreaterEqual(
+            combined["level_shift_z"],
+            combined["change_z_threshold"],
+        )
+        self.assertGreaterEqual(
+            combined["slope_change_z"],
+            combined["change_z_threshold"],
+        )
+
+    def test_direction_change_uses_evaluate_trend_business_contract(self) -> None:
+        """Отделить GROWTH/DECLINE reversal от знака OLS slope.
+
+        Args:
+            Нет аргументов.
+
+        Returns:
+            None.
+
+        Raises:
+            AssertionError: Если direction_change не ортогонален structural type.
+
+        Examples:
+            >>> # Запускается через unittest.
+        """
+
+        config = TrendModelConfig(
+            trend_search_method="most_recent_cp",
+            most_recent_cp_cost="ols",
+        )
+        scenarios = (
+            (
+                [100, 110, 120, 130, 140, 150, 145, 140, 135],
+                GROWTH,
+                DECLINE,
+                True,
+            ),
+            (
+                [300, 290, 280, 270, 260, 250, 260, 270, 280],
+                DECLINE,
+                GROWTH,
+                True,
+            ),
+            (
+                [100, 101, 99, 100, 100, 120, 140, 160],
+                NO_DIRECTION,
+                GROWTH,
+                False,
+            ),
+            (
+                [100, 105, 110, 115, 120, 125, 145, 165, 185],
+                GROWTH,
+                GROWTH,
+                False,
+            ),
+        )
+        for values, previous_direction, current_direction, expected in scenarios:
+            with self.subTest(values=values):
+                summary = analyze_most_recent_cp_series(
+                    values,
+                    model_config=config,
+                ).summary
+                self.assertEqual(summary["structural_change_type"], SLOPE_CHANGE)
+                self.assertEqual(
+                    summary["previous_regime_trend_direction"],
+                    previous_direction,
+                )
+                self.assertEqual(
+                    summary["current_trend_direction"],
+                    current_direction,
+                )
+                self.assertEqual(summary["direction_change"], expected)
+
+        combined_reversal = analyze_most_recent_cp_series(
+            [100, 110, 120, 130, 140, 150, 300, 280, 260, 240, 220, 200],
+            model_config=config,
+        ).summary
+        self.assertEqual(
+            combined_reversal["structural_change_type"],
+            LEVEL_AND_SLOPE,
+        )
+        self.assertTrue(combined_reversal["direction_change"])
+
+    def test_weak_and_threshold_boundary_classification_helper(self) -> None:
+        """Проверить weak fallback и включающую границу ``>= threshold``.
+
+        Args:
+            Нет аргументов.
+
+        Returns:
+            None.
+
+        Raises:
+            AssertionError: Если таблица structural classification нарушена.
+
+        Examples:
+            >>> # Запускается через unittest.
+        """
+
+        threshold = 2.0
+        below = math.nextafter(threshold, 0.0)
+        above = math.nextafter(threshold, math.inf)
+        self.assertEqual(
+            _classify_structural_change(True, below, below, threshold),
+            WEAK_OR_UNCLASSIFIED,
+        )
+        self.assertEqual(
+            _classify_structural_change(True, threshold, below, threshold),
+            LEVEL_SHIFT,
+        )
+        self.assertEqual(
+            _classify_structural_change(True, below, threshold, threshold),
+            SLOPE_CHANGE,
+        )
+        self.assertEqual(
+            _classify_structural_change(True, above, above, threshold),
+            LEVEL_AND_SLOPE,
+        )
+        self.assertEqual(
+            _classify_structural_change(False, math.nan, math.nan, threshold),
+            NO_STRUCTURAL_CHANGE,
+        )
+        high_threshold_summary = analyze_most_recent_cp_series(
+            [100, 101, 100, 102, 300, 302, 301, 303],
+            model_config=TrendModelConfig(
+                trend_search_method="most_recent_cp",
+                most_recent_cp_cost="ols",
+                most_recent_cp_change_z_threshold=200.0,
+            ),
+        ).summary
+        self.assertEqual(
+            high_threshold_summary["structural_change_type"],
+            WEAK_OR_UNCLASSIFIED,
+        )
+        self.assertEqual(high_threshold_summary["change_z_threshold"], 200.0)
+
+    def test_diagnostic_se_formulas_use_global_time_and_tau_boundary(self) -> None:
+        """Независимо проверить Sxx=5, slope SE и fitted-mean level SE.
+
+        Args:
+            Нет аргументов.
+
+        Returns:
+            None.
+
+        Raises:
+            AssertionError: Если Sxx, leverage или half-open индексы ошибочны.
+
+        Examples:
+            >>> # Запускается через unittest.
+        """
+
+        values = np.arange(8.0)
+        previous = _fit_ols_regime_diagnostic(values, 0, 4)
+        current = _fit_ols_regime_diagnostic(values, 4, 8)
+        sigma = 3.0
+        self.assertEqual(previous.sxx, 5.0)
+        self.assertEqual(current.sxx, 5.0)
+        _, slope_se, slope_z = _calculate_slope_change_statistics(
+            previous,
+            current,
+            sigma,
+            values,
+        )
+        _, level_se, level_z = _calculate_level_shift_statistics(
+            previous,
+            current,
+            4,
+            sigma,
+            values,
+        )
+        self.assertAlmostEqual(slope_se, sigma * math.sqrt(0.4), places=12)
+        self.assertAlmostEqual(level_se, sigma * math.sqrt(2.2), places=12)
+        self.assertEqual(slope_z, 0.0)
+        self.assertEqual(level_z, 0.0)
+        with self.assertRaises(ValueError):
+            _calculate_level_shift_statistics(previous, current, 3, sigma, values)
+
+    def test_post_classification_scale_invariance_and_raw_scaling(self) -> None:
+        """Сохранить Z/type/direction и масштабировать raw effects с GMV.
+
+        Args:
+            Нет аргументов.
+
+        Returns:
+            None.
+
+        Raises:
+            AssertionError: Если диагностический слой зависит от единиц GMV.
+
+        Examples:
+            >>> # Запускается через unittest.
+        """
+
+        values = [100, 101, 100, 102, 101, 103, 300, 320, 340, 360, 380, 400]
+        factor = 1000.0
+        config = TrendModelConfig(
+            trend_search_method="most_recent_cp",
+            most_recent_cp_cost="ols",
+        )
+        base = analyze_most_recent_cp_series(values, model_config=config).summary
+        scaled = analyze_most_recent_cp_series(
+            [factor * value for value in values],
+            model_config=config,
+        ).summary
+        for field in ("structural_change_type", "direction_change", "last_cp_index"):
+            self.assertEqual(base[field], scaled[field])
+        for field in ("level_shift_z", "slope_change_z"):
+            self.assertAlmostEqual(base[field], scaled[field], places=10)
+        for field in (
+            "classification_previous_slope_ols",
+            "classification_current_slope_ols",
+            "classification_delta_slope_ols",
+            "classification_level_shift_ols",
+            "slope_change_se",
+            "level_shift_se",
+            "sigma",
+        ):
+            self.assertAlmostEqual(scaled[field], factor * base[field], places=7)
+
+    def test_no_cp_and_zero_sigma_classification_are_deterministic(self) -> None:
+        """Вернуть neutral-поля без CP и 0/inf без деления на ноль.
+
+        Args:
+            Нет аргументов.
+
+        Returns:
+            None.
+
+        Raises:
+            AssertionError: Если no-CP или PERFECT_FIT обработан нестабильно.
+
+        Examples:
+            >>> # Запускается через unittest.
+        """
+
+        no_cp = analyze_most_recent_cp_series(
+            [100 + 10 * index for index in range(8)],
+            model_config=TrendModelConfig(
+                trend_search_method="most_recent_cp",
+                most_recent_cp_cost="ols",
+            ),
+        ).summary
+        self.assertEqual(no_cp["structural_change_type"], NO_STRUCTURAL_CHANGE)
+        self.assertFalse(no_cp["direction_change"])
+        self.assertFalse(no_cp["previous_regime_trend_exists"])
+        self.assertEqual(no_cp["previous_regime_trend_status"], "NOT_EVALUATED")
+        for field in (
+            "classification_previous_slope_ols",
+            "classification_current_slope_ols",
+            "classification_delta_slope_ols",
+            "classification_level_shift_ols",
+            "slope_change_se",
+            "level_shift_se",
+            "slope_change_z",
+            "level_shift_z",
+        ):
+            self.assertTrue(math.isnan(no_cp[field]))
+
+        zero_effect_values = np.arange(8.0)
+        previous = _fit_ols_regime_diagnostic(zero_effect_values, 0, 4)
+        current = _fit_ols_regime_diagnostic(zero_effect_values, 4, 8)
+        self.assertEqual(
+            _calculate_slope_change_statistics(
+                previous, current, 0.0, zero_effect_values
+            )[2],
+            0.0,
+        )
+        self.assertEqual(
+            _calculate_level_shift_statistics(
+                previous, current, 4, 0.0, zero_effect_values
+            )[2],
+            0.0,
+        )
+
+        nonzero_effect_values = np.asarray([0, 1, 2, 3, 4, 6, 8, 10], dtype=float)
+        previous = _fit_ols_regime_diagnostic(nonzero_effect_values, 0, 4)
+        current = _fit_ols_regime_diagnostic(nonzero_effect_values, 4, 8)
+        first = _calculate_slope_change_statistics(
+            previous, current, 0.0, nonzero_effect_values
+        )
+        second = _calculate_slope_change_statistics(
+            previous, current, 0.0, nonzero_effect_values
+        )
+        self.assertEqual(first, second)
+        self.assertEqual(first[1], 0.0)
+        self.assertTrue(math.isinf(first[2]))
+
+    def test_robust_search_coefficients_are_not_used_with_ols_se(self) -> None:
+        """Сохранить C2 coefficients и отдельно вычислить OLS diagnostics.
+
+        Args:
+            Нет аргументов.
+
+        Returns:
+            None.
+
+        Raises:
+            AssertionError: Если robust slope смешан с OLS standard error.
+
+        Examples:
+            >>> # Запускается через unittest.
+        """
+
+        values = [100, 101, 100, 102, 130, 103, 300, 302, 301, 303, 302, 304]
+        summary = analyze_most_recent_cp_series(
+            values,
+            model_config=TrendModelConfig(
+                trend_search_method="most_recent_cp",
+                most_recent_cp_cost="capped",
+            ),
+        ).summary
+        self.assertEqual(summary["last_cp_index"], 6)
+        self.assertNotAlmostEqual(
+            summary["previous_regime_slope"],
+            summary["classification_previous_slope_ols"],
+        )
+        expected = _fit_ols_regime_diagnostic(values, 0, 6)
+        self.assertAlmostEqual(
+            summary["classification_previous_slope_ols"],
+            expected.slope,
+        )
+
+    def test_global_trend_extends_only_when_combined_window_is_confirmed(self) -> None:
+        """Объединить небольшую коррекцию и остановиться на большом level drop.
+
+        Args:
+            Нет аргументов.
+
+        Returns:
+            None.
+
+        Raises:
+            AssertionError: Если повторный evaluate_trend не ограничивает merge.
+
+        Examples:
+            >>> # Запускается через unittest.
+        """
+
+        thresholds = TrendThresholds()
+        config = TrendModelConfig(trend_search_method="most_recent_cp")
+        segments = [(0, 4), (4, 8)]
+        dates = list(range(8))
+
+        small_drop = np.asarray(
+            [100, 110, 120, 130, 125, 135, 145, 155],
+            dtype=float,
+        )
+        rows, evaluations = _evaluate_selected_regimes(
+            small_drop,
+            dates,
+            segments,
+            thresholds,
+            config,
+        )
+        included, global_evaluation = _select_global_regime_indices(
+            small_drop,
+            rows,
+            evaluations,
+            thresholds,
+            config,
+        )
+        self.assertEqual(included, (0, 1))
+        self.assertIsNotNone(global_evaluation)
+        self.assertEqual(global_evaluation.direction, GROWTH)
+
+        large_drop = np.asarray(
+            [100, 110, 120, 130, 80, 90, 100, 110],
+            dtype=float,
+        )
+        rows, evaluations = _evaluate_selected_regimes(
+            large_drop,
+            dates,
+            segments,
+            thresholds,
+            config,
+        )
+        included, global_evaluation = _select_global_regime_indices(
+            large_drop,
+            rows,
+            evaluations,
+            thresholds,
+            config,
+        )
+        self.assertEqual(included, (1,))
+        self.assertIsNotNone(global_evaluation)
+        self.assertEqual(global_evaluation.direction, GROWTH)
+
+    def test_flat_bridge_is_single_internal_and_noise_is_not_flat(self) -> None:
+        """Разрешить один спокойный FLAT только между трендами одного знака.
+
+        Args:
+            Нет аргументов.
+
+        Returns:
+            None.
+
+        Raises:
+            AssertionError: Если FLAT-policy или noise guard нарушены.
+
+        Examples:
+            >>> # Запускается через unittest.
+        """
+
+        thresholds = TrendThresholds()
+        config = TrendModelConfig(trend_search_method="most_recent_cp")
+        one_flat = np.asarray(
+            [
+                100, 110, 120, 130,
+                135, 135, 135, 135,
+                140, 150, 160, 170,
+            ],
+            dtype=float,
+        )
+        rows, evaluations = _evaluate_selected_regimes(
+            one_flat,
+            list(range(12)),
+            [(0, 4), (4, 8), (8, 12)],
+            thresholds,
+            config,
+        )
+        self.assertEqual(
+            [row["local_regime_class"] for row in rows],
+            [GROWTH, LOCAL_FLAT, GROWTH],
+        )
+        included, evaluation = _select_global_regime_indices(
+            one_flat,
+            rows,
+            evaluations,
+            thresholds,
+            config,
+        )
+        self.assertEqual(included, (0, 1, 2))
+        self.assertEqual(evaluation.direction, GROWTH)
+
+        two_flats = np.asarray(
+            [
+                100, 110, 120, 130,
+                134, 134, 134, 134,
+                136, 136, 136, 136,
+                140, 150, 160, 170,
+            ],
+            dtype=float,
+        )
+        rows, evaluations = _evaluate_selected_regimes(
+            two_flats,
+            list(range(16)),
+            [(0, 4), (4, 8), (8, 12), (12, 16)],
+            thresholds,
+            config,
+        )
+        included, _ = _select_global_regime_indices(
+            two_flats,
+            rows,
+            evaluations,
+            thresholds,
+            config,
+        )
+        self.assertEqual(included, (3,))
+
+        trailing_flat = np.asarray(
+            [100, 110, 120, 130, 135, 135, 135, 135],
+            dtype=float,
+        )
+        rows, evaluations = _evaluate_selected_regimes(
+            trailing_flat,
+            list(range(8)),
+            [(0, 4), (4, 8)],
+            thresholds,
+            config,
+        )
+        included, evaluation = _select_global_regime_indices(
+            trailing_flat,
+            rows,
+            evaluations,
+            thresholds,
+            config,
+        )
+        self.assertEqual(included, tuple())
+        self.assertIsNone(evaluation)
+
+        noisy_horizontal = evaluate_trend(
+            [100, 200, 200, 100],
+            thresholds,
+        )
+        self.assertEqual(
+            _classify_local_regime(noisy_horizontal, config),
+            LOCAL_UNCONFIRMED,
+        )
+
+    def test_global_summary_and_changepoint_membership_are_additive(self) -> None:
+        """Сохранить current summary и добавить структуру/CP глобального роста.
+
+        Args:
+            Нет аргументов.
+
+        Returns:
+            None.
+
+        Raises:
+            AssertionError: Если новая long-диагностика не согласована.
+
+        Examples:
+            >>> # Запускается через unittest.
+        """
+
+        values = [
+            100, 110, 120, 130,
+            180, 190, 200, 210,
+            260, 270, 280, 290,
+        ]
+        result = analyze_most_recent_cp_series(values)
+        summary = result.summary
+        self.assertTrue(summary["current_trend_exists"])
+        self.assertTrue(summary["global_trend_exists"])
+        self.assertEqual(summary["global_trend_direction"], GROWTH)
+        self.assertGreaterEqual(
+            summary["global_trend_length"],
+            summary["current_trend_length"],
+        )
+        self.assertEqual(
+            summary["global_trend_changepoint_count"],
+            sum(row["cp_inside_global_trend"] for row in result.changepoints),
+        )
+        self.assertEqual(
+            len(json.loads(summary["global_trend_structure_json"])),
+            summary["global_trend_regime_count"],
+        )
 
     def test_c2_n20_performance_is_measured(self) -> None:
         """Ограничить регрессию времени C2 на максимальной длине ряда.

@@ -118,6 +118,17 @@ class TrendModelConfig:
         most_recent_cp_min_segment_points: Минимальная длина каждого режима.
         most_recent_cp_capped_k: Порог K capped quadratic objective.
         most_recent_cp_huber_delta: Порог delta нормированного Huber objective.
+        most_recent_cp_change_z_threshold: Единый технический порог
+            standardized effect scores для post-classification последнего CP.
+            Это диагностический порог, а не критерий проверки гипотезы.
+        global_flat_max_relative_slope: Максимальный модуль относительного
+            наклона локального режима, который можно считать ``FLAT``.
+        global_flat_max_total_change: Максимальный модуль накопленного
+            трендового изменения локального ``FLAT``-режима.
+        global_flat_max_noise_ratio: Максимальное отношение noise scale к
+            медианному GMV локального ``FLAT``-режима.
+        global_max_flat_bridge_regimes: Максимальное число последовательных
+            ``FLAT`` между однонаправленными подтверждёнными режимами.
 
     Returns:
         Неизменяемую конфигурацию selector и Most Recent CP.
@@ -135,6 +146,13 @@ class TrendModelConfig:
     most_recent_cp_min_segment_points: int = 4
     most_recent_cp_capped_k: float = 2.0
     most_recent_cp_huber_delta: float = 1.345
+    # [ADDED] Общий диагностический порог OLS post-classification level/slope.
+    most_recent_cp_change_z_threshold: float = 2.0
+    # [ADDED] FLAT определяется только в относительных scale-invariant единицах.
+    global_flat_max_relative_slope: float = 0.01
+    global_flat_max_total_change: float = 0.05
+    global_flat_max_noise_ratio: float = 0.05
+    global_max_flat_bridge_regimes: int = 1
 
     def __post_init__(self) -> None:
         """Проверить конфигурацию до запуска расчёта.
@@ -178,10 +196,35 @@ class TrendModelConfig:
         positive_values = {
             "most_recent_cp_capped_k": self.most_recent_cp_capped_k,
             "most_recent_cp_huber_delta": self.most_recent_cp_huber_delta,
+            "most_recent_cp_change_z_threshold": (
+                self.most_recent_cp_change_z_threshold
+            ),
         }
         for name, value in positive_values.items():
             if not math.isfinite(float(value)) or float(value) <= 0.0:
                 raise ValueError(f"{name} должен быть конечным положительным числом")
+        flat_thresholds = {
+            "global_flat_max_relative_slope": self.global_flat_max_relative_slope,
+            "global_flat_max_total_change": self.global_flat_max_total_change,
+            "global_flat_max_noise_ratio": self.global_flat_max_noise_ratio,
+        }
+        for name, value in flat_thresholds.items():
+            if not math.isfinite(float(value)) or float(value) < 0.0:
+                raise ValueError(
+                    f"{name} должен быть конечным неотрицательным числом"
+                )
+        if (
+            isinstance(self.global_max_flat_bridge_regimes, bool)
+            or not isinstance(
+                self.global_max_flat_bridge_regimes,
+                (int, np.integer),
+            )
+            or int(self.global_max_flat_bridge_regimes) < 0
+        ):
+            raise ValueError(
+                "global_max_flat_bridge_regimes должен быть целым "
+                "неотрицательным числом"
+            )
 
 
 @dataclass(frozen=True)

@@ -22,7 +22,10 @@ import numpy as np
 import pandas as pd
 
 from .trend_analysis import (
+    DECLINE,
+    GROWTH,
     NO_DIRECTION,
+    TrendEvaluation,
     TrendModelConfig,
     TrendThresholds,
     _coerce_finite_values,
@@ -38,6 +41,18 @@ DIFF_MAD = "DIFF_MAD"
 OLS_RESIDUAL_MAD = "OLS_RESIDUAL_MAD"
 MAE_FALLBACK = "MAE_FALLBACK"
 PERFECT_FIT = "PERFECT_FIT"
+
+LEVEL_SHIFT = "LEVEL_SHIFT"
+SLOPE_CHANGE = "SLOPE_CHANGE"
+LEVEL_AND_SLOPE = "LEVEL_AND_SLOPE"
+WEAK_OR_UNCLASSIFIED = "WEAK_OR_UNCLASSIFIED"
+NO_STRUCTURAL_CHANGE = "NONE"
+
+LOCAL_FLAT = "FLAT"
+LOCAL_UNCONFIRMED = "UNCONFIRMED"
+GLOBAL_DIRECTIONAL = "DIRECTIONAL"
+GLOBAL_FLAT_BRIDGE = "FLAT_BRIDGE"
+GLOBAL_NOT_INCLUDED = "NOT_INCLUDED"
 
 
 @dataclass(frozen=True)
@@ -102,14 +117,52 @@ class SegmentCostResult:
 
 
 @dataclass(frozen=True)
+class OLSRegimeDiagnostic:
+    """Хранить OLS fit и геометрию выбранного half-open режима.
+
+    Fit использует глобальную временную координату активного ряда и служит
+    только post-classification последнего уже выбранного changepoint.
+
+    Args:
+        start: Первый глобальный индекс режима, включительно.
+        end: Последний глобальный индекс режима, не включительно.
+        points: Число наблюдений режима.
+        time_mean: Средняя глобальная временная координата режима.
+        sxx: Сумма квадратов отклонений времени от ``time_mean``.
+        intercept: OLS intercept в глобальной временной координате.
+        slope: OLS slope в единицах GMV за период.
+
+    Returns:
+        Неизменяемую OLS-диагностику выбранного режима.
+
+    Raises:
+        ValueError: Не выбрасывается при создании результата.
+
+    Examples:
+        >>> diagnostic = _fit_ols_regime_diagnostic(np.arange(8.0), 0, 4)
+        >>> diagnostic.sxx
+        5.0
+    """
+
+    start: int
+    end: int
+    points: int
+    time_mean: float
+    sxx: float
+    intercept: float
+    slope: float
+
+
+@dataclass(frozen=True)
 class MostRecentCPAnalysis:
-    """Объединить summary и три QA-диагностики одного сегмента.
+    """Объединить summary и четыре QA-диагностики одного сегмента.
 
     Args:
         summary: Итоговая строка бизнес- и математического результата.
         cp_profile: Полный профиль допустимых ``G(tau)``.
         segment_diagnostics: Все рассчитанные и закэшированные ``C(s,e)``.
         segmentation: Сегменты выбранного оптимального решения.
+        changepoints: Диагностика всех границ выбранной сегментации.
 
     Returns:
         Неизменяемый контейнер результата одного сегмента.
@@ -126,6 +179,7 @@ class MostRecentCPAnalysis:
     cp_profile: Tuple[Dict[str, object], ...]
     segment_diagnostics: Tuple[Dict[str, object], ...]
     segmentation: Tuple[Dict[str, object], ...]
+    changepoints: Tuple[Dict[str, object], ...]
 
 
 def _objective_tolerance(left: float, right: float) -> float:
@@ -248,6 +302,756 @@ def _fit_ols_line(
     residuals = values - (intercept + slope * time)
     rss = float(np.dot(residuals, residuals))
     return intercept, slope, residuals, rss
+
+
+def _fit_ols_regime_diagnostic(
+    values: Sequence[float],
+    start: int,
+    end: int,
+) -> OLSRegimeDiagnostic:
+    """Отдельно оценить OLS-линию и геометрию выбранного режима.
+
+    Args:
+        values: Полная активная GMV-история.
+        start: Первый глобальный индекс режима, включительно.
+        end: Последний глобальный индекс режима, не включительно.
+
+    Returns:
+        OLS fit и ``Sxx`` на глобальной оси ``t=0,...,n-1``.
+
+    Raises:
+        ValueError: Если half-open границы или временная геометрия некорректны.
+
+    Examples:
+        >>> fit = _fit_ols_regime_diagnostic([1, 2, 3, 4, 5], 1, 5)
+        >>> (fit.time_mean, fit.sxx, fit.slope)
+        (2.5, 5.0, 1.0)
+    """
+
+    array = _coerce_finite_values(values)
+    if (
+        isinstance(start, bool)
+        or isinstance(end, bool)
+        or not isinstance(start, (int, np.integer))
+        or not isinstance(end, (int, np.integer))
+        or int(start) < 0
+        or int(end) > len(array)
+        or int(end) - int(start) < 2
+    ):
+        raise ValueError("Некорректные half-open границы OLS diagnostic режима")
+    time = np.arange(int(start), int(end), dtype=float)
+    segment_values = array[int(start) : int(end)]
+    time_mean = float(np.mean(time))
+    centered_time = time - time_mean
+    sxx = float(np.dot(centered_time, centered_time))
+    if not math.isfinite(sxx) or sxx <= 0.0:
+        raise ValueError("Некорректная временная геометрия OLS diagnostic режима")
+    intercept, slope, _, _ = _fit_ols_line(time, segment_values)
+    return OLSRegimeDiagnostic(
+        start=int(start),
+        end=int(end),
+        points=int(end) - int(start),
+        time_mean=time_mean,
+        sxx=sxx,
+        intercept=intercept,
+        slope=slope,
+    )
+
+
+def _standardized_effect_score(
+    effect: float,
+    standard_error: float,
+    reference_values: Sequence[float],
+) -> float:
+    """Рассчитать устойчивый standardized effect score ``|effect| / SE``.
+
+    Args:
+        effect: Signed OLS diagnostic effect.
+        standard_error: Неотрицательная standard error на общей sigma ряда.
+        reference_values: Активный ряд для scale-aware проверки машинного нуля.
+
+    Returns:
+        Конечный неотрицательный score либо ``+inf`` при ненулевом effect и
+        машинно нулевой SE.
+
+    Raises:
+        ValueError: Если effect, SE или reference некорректны.
+
+    Examples:
+        >>> _standardized_effect_score(2.0, 1.0, [1.0, 2.0])
+        2.0
+    """
+
+    reference = _coerce_finite_values(reference_values)
+    if not math.isfinite(float(effect)):
+        raise ValueError("Diagnostic effect должен быть конечным")
+    if (
+        not math.isfinite(float(standard_error))
+        or float(standard_error) < 0.0
+    ):
+        raise ValueError("Diagnostic standard error должна быть конечной и неотрицательной")
+    se_is_zero = _effectively_zero(
+        np.asarray([float(standard_error)], dtype=float),
+        reference,
+    )
+    if se_is_zero:
+        effect_is_zero = _effectively_zero(
+            np.asarray([float(effect)], dtype=float),
+            reference,
+        )
+        return 0.0 if effect_is_zero else math.inf
+    return abs(float(effect)) / float(standard_error)
+
+
+def _calculate_slope_change_statistics(
+    previous: OLSRegimeDiagnostic,
+    current: OLSRegimeDiagnostic,
+    sigma: float,
+    reference_values: Sequence[float],
+) -> Tuple[float, float, float]:
+    """Рассчитать OLS diagnostic slope effect, SE и standardized score.
+
+    Args:
+        previous: OLS diagnostic предыдущего выбранного режима.
+        current: OLS diagnostic текущего выбранного режима.
+        sigma: Существующая общая sigma активного ряда.
+        reference_values: Активный ряд для обработки машинного нуля.
+
+    Returns:
+        ``delta_slope_ols, slope_change_se, slope_change_z``.
+
+    Raises:
+        ValueError: Если sigma или геометрия режимов некорректны.
+
+    Examples:
+        >>> left = _fit_ols_regime_diagnostic(np.arange(8.0), 0, 4)
+        >>> right = _fit_ols_regime_diagnostic(np.arange(8.0), 4, 8)
+        >>> round(_calculate_slope_change_statistics(left, right, 2.0, np.arange(8.0))[1], 12)
+        1.264911064067
+    """
+
+    if not math.isfinite(float(sigma)) or float(sigma) < 0.0:
+        raise ValueError("Diagnostic sigma должна быть конечной и неотрицательной")
+    if previous.sxx <= 0.0 or current.sxx <= 0.0:
+        raise ValueError("Sxx OLS diagnostic режима должен быть положительным")
+    delta_slope = float(current.slope - previous.slope)
+    standard_error = float(
+        float(sigma)
+        * math.sqrt((1.0 / previous.sxx) + (1.0 / current.sxx))
+    )
+    score = _standardized_effect_score(
+        delta_slope,
+        standard_error,
+        reference_values,
+    )
+    return delta_slope, standard_error, score
+
+
+def _calculate_level_shift_statistics(
+    previous: OLSRegimeDiagnostic,
+    current: OLSRegimeDiagnostic,
+    tau: int,
+    sigma: float,
+    reference_values: Sequence[float],
+) -> Tuple[float, float, float]:
+    """Рассчитать fitted-mean jump на ``t=tau``, его SE и score.
+
+    Args:
+        previous: OLS diagnostic режима ``[s,tau)``.
+        current: OLS diagnostic режима ``[tau,n)``.
+        tau: Глобальная граница и первый индекс текущего режима.
+        sigma: Существующая общая sigma активного ряда.
+        reference_values: Активный ряд для обработки машинного нуля.
+
+    Returns:
+        ``level_shift_ols, level_shift_se, level_shift_z`` без prediction
+        variance нового наблюдения.
+
+    Raises:
+        ValueError: Если граница, sigma или геометрия режимов некорректны.
+
+    Examples:
+        >>> left = _fit_ols_regime_diagnostic(np.arange(8.0), 0, 4)
+        >>> right = _fit_ols_regime_diagnostic(np.arange(8.0), 4, 8)
+        >>> round(_calculate_level_shift_statistics(left, right, 4, 2.0, np.arange(8.0))[1], 12)
+        2.966479394838
+    """
+
+    if (
+        isinstance(tau, bool)
+        or not isinstance(tau, (int, np.integer))
+        or previous.end != int(tau)
+        or current.start != int(tau)
+    ):
+        raise ValueError("OLS diagnostic режимы должны стыковаться в глобальном t=tau")
+    if not math.isfinite(float(sigma)) or float(sigma) < 0.0:
+        raise ValueError("Diagnostic sigma должна быть конечной и неотрицательной")
+    if previous.sxx <= 0.0 or current.sxx <= 0.0:
+        raise ValueError("Sxx OLS diagnostic режима должен быть положительным")
+    boundary = float(tau)
+    fitted_previous = previous.intercept + previous.slope * boundary
+    fitted_current = current.intercept + current.slope * boundary
+    level_shift = float(fitted_current - fitted_previous)
+    previous_leverage = (
+        1.0 / float(previous.points)
+        + (boundary - previous.time_mean) ** 2 / previous.sxx
+    )
+    current_leverage = (
+        1.0 / float(current.points)
+        + (boundary - current.time_mean) ** 2 / current.sxx
+    )
+    leverage_sum = float(previous_leverage + current_leverage)
+    if not math.isfinite(leverage_sum) or leverage_sum <= 0.0:
+        raise ValueError("Leverage OLS diagnostic границы должен быть положительным")
+    standard_error = float(float(sigma) * math.sqrt(leverage_sum))
+    score = _standardized_effect_score(
+        level_shift,
+        standard_error,
+        reference_values,
+    )
+    return level_shift, standard_error, score
+
+
+def _classify_structural_change(
+    structural_change_detected: bool,
+    level_shift_z: float,
+    slope_change_z: float,
+    threshold: float,
+) -> str:
+    """Классифицировать ортогональные level/slope свойства последнего CP.
+
+    Args:
+        structural_change_detected: Был ли выбран ``tau > 0``.
+        level_shift_z: Standardized OLS fitted-level effect.
+        slope_change_z: Standardized OLS slope effect.
+        threshold: Единый положительный диагностический порог.
+
+    Returns:
+        ``NONE``, ``LEVEL_SHIFT``, ``SLOPE_CHANGE``, ``LEVEL_AND_SLOPE`` или
+        ``WEAK_OR_UNCLASSIFIED``. Равенство порогу считается подтверждением.
+
+    Raises:
+        ValueError: Если для найденного CP scores или threshold некорректны.
+
+    Examples:
+        >>> _classify_structural_change(True, 2.0, 1.0, 2.0)
+        'LEVEL_SHIFT'
+    """
+
+    if not structural_change_detected:
+        return NO_STRUCTURAL_CHANGE
+    if not math.isfinite(float(threshold)) or float(threshold) <= 0.0:
+        raise ValueError("Diagnostic change threshold должен быть конечным и положительным")
+    for name, value in (
+        ("level_shift_z", level_shift_z),
+        ("slope_change_z", slope_change_z),
+    ):
+        if math.isnan(float(value)) or float(value) < 0.0:
+            raise ValueError(f"{name} должен быть неотрицательным diagnostic score")
+    has_level_change = bool(float(level_shift_z) >= float(threshold))
+    has_slope_change = bool(float(slope_change_z) >= float(threshold))
+    if has_level_change and has_slope_change:
+        return LEVEL_AND_SLOPE
+    if has_level_change:
+        return LEVEL_SHIFT
+    if has_slope_change:
+        return SLOPE_CHANGE
+    return WEAK_OR_UNCLASSIFIED
+
+
+def _classify_direction_change(
+    structural_change_detected: bool,
+    previous_trend: Optional[TrendEvaluation],
+    current_trend: TrendEvaluation,
+) -> bool:
+    """Определить смену бизнес-направления независимо от structural type.
+
+    Args:
+        structural_change_detected: Был ли выбран structural CP.
+        previous_trend: Результат ``evaluate_trend`` предыдущего режима.
+        current_trend: Результат ``evaluate_trend`` текущего режима.
+
+    Returns:
+        True только для подтверждённых ``GROWTH <-> DECLINE``.
+
+    Raises:
+        ValueError: Не выбрасывается.
+
+    Examples:
+        >>> _classify_direction_change(False, None, evaluate_trend([1, 2, 3, 4]))
+        False
+    """
+
+    allowed_directions = {GROWTH, DECLINE}
+    return bool(
+        structural_change_detected
+        and previous_trend is not None
+        and previous_trend.trend_exists
+        and current_trend.trend_exists
+        and previous_trend.direction in allowed_directions
+        and current_trend.direction in allowed_directions
+        and previous_trend.direction != current_trend.direction
+    )
+
+
+def _local_noise_ratio(evaluation: TrendEvaluation) -> float:
+    """Нормировать noise scale локального режима на его типичный GMV.
+
+    Args:
+        evaluation: Каноническая диагностика ``evaluate_trend``.
+
+    Returns:
+        Конечное неотрицательное отношение либо ``+inf``, если scale режима
+        не позволяет безопасную нормировку.
+
+    Raises:
+        ValueError: Не выбрасывается.
+
+    Examples:
+        >>> _local_noise_ratio(evaluate_trend([100, 100, 100, 100]))
+        0.0
+    """
+
+    scale = float(evaluation.typical_scale)
+    noise = float(evaluation.noise_scale)
+    if (
+        not math.isfinite(scale)
+        or scale <= 0.0
+        or not math.isfinite(noise)
+        or noise < 0.0
+    ):
+        return math.inf
+    return float(noise / scale)
+
+
+def _classify_local_regime(
+    evaluation: TrendEvaluation,
+    model_config: TrendModelConfig,
+) -> str:
+    """Классифицировать выбранный режим как direction, FLAT или barrier.
+
+    Args:
+        evaluation: Результат существующего ``evaluate_trend``.
+        model_config: Пороговый контракт глобальной надстройки.
+
+    Returns:
+        ``GROWTH``, ``DECLINE``, ``FLAT`` либо ``UNCONFIRMED``.
+
+    Raises:
+        ValueError: Не выбрасывается для валидной конфигурации.
+
+    Examples:
+        >>> _classify_local_regime(
+        ...     evaluate_trend([100, 100, 100, 100]), TrendModelConfig()
+        ... )
+        'FLAT'
+    """
+
+    if evaluation.trend_exists and evaluation.direction in {GROWTH, DECLINE}:
+        return evaluation.direction
+    metrics = (
+        float(evaluation.relative_slope),
+        float(evaluation.total_change),
+        _local_noise_ratio(evaluation),
+    )
+    if not all(math.isfinite(metric) for metric in metrics):
+        return LOCAL_UNCONFIRMED
+    relative_slope, total_change, noise_ratio = metrics
+    if (
+        abs(relative_slope)
+        <= float(model_config.global_flat_max_relative_slope)
+        and abs(total_change)
+        <= float(model_config.global_flat_max_total_change)
+        and noise_ratio
+        <= float(model_config.global_flat_max_noise_ratio)
+    ):
+        return LOCAL_FLAT
+    return LOCAL_UNCONFIRMED
+
+
+def _evaluate_selected_regimes(
+    values: np.ndarray,
+    dates: Sequence[object],
+    selected_segments: Sequence[Tuple[int, int]],
+    thresholds: TrendThresholds,
+    model_config: TrendModelConfig,
+) -> Tuple[List[Dict[str, object]], List[TrendEvaluation]]:
+    """Оценить каждый локальный режим выбранной DP-сегментации.
+
+    Args:
+        values: Активная GMV-история.
+        dates: Синхронная активная календарная ось.
+        selected_segments: Упорядоченные half-open режимы.
+        thresholds: Неизменённый бизнес-контракт тренда.
+        model_config: Параметры FLAT-классификации.
+
+    Returns:
+        Строки локальной диагностики и соответствующие ``TrendEvaluation``.
+
+    Raises:
+        ValueError: Если границы выбранного режима некорректны.
+
+    Examples:
+        >>> rows, _ = _evaluate_selected_regimes(
+        ...     np.asarray([1, 2, 3, 4], dtype=float), [0, 1, 2, 3],
+        ...     [(0, 4)], TrendThresholds(), TrendModelConfig()
+        ... )
+        >>> rows[0]['local_regime_class']
+        'GROWTH'
+    """
+
+    rows: List[Dict[str, object]] = []
+    evaluations: List[TrendEvaluation] = []
+    for segment_index, (start, end) in enumerate(selected_segments):
+        if start < 0 or end > len(values) or start >= end:
+            raise ValueError("Некорректные границы выбранного локального режима")
+        evaluation = evaluate_trend(values[start:end], thresholds)
+        evaluations.append(evaluation)
+        start_gmv = float(values[start])
+        end_gmv = float(values[end - 1])
+        gmv_change = float(end_gmv - start_gmv)
+        gmv_change_relative = (
+            float(gmv_change / abs(start_gmv))
+            if not _effectively_zero(
+                np.asarray([start_gmv], dtype=float),
+                values[start:end],
+            )
+            else math.nan
+        )
+        local_class = _classify_local_regime(evaluation, model_config)
+        rows.append(
+            {
+                "segment_index": int(segment_index),
+                "start": int(start),
+                "end": int(end),
+                "start_date": dates[start],
+                "end_date": dates[end - 1],
+                "points": int(end - start),
+                "local_start_gmv": start_gmv,
+                "local_end_gmv": end_gmv,
+                "local_gmv_change_abs": gmv_change,
+                "local_gmv_change_relative": gmv_change_relative,
+                "local_trend_exists": bool(evaluation.trend_exists),
+                "local_trend_direction": (
+                    evaluation.direction
+                    if evaluation.trend_exists
+                    else NO_DIRECTION
+                ),
+                "local_trend_status": evaluation.status,
+                "local_trend_slope_abs": evaluation.slope,
+                "local_trend_slope_relative": evaluation.relative_slope,
+                "local_trend_total_change": evaluation.total_change,
+                "local_direction_count_share": (
+                    evaluation.direction_count_share
+                ),
+                "local_direction_movement_share": (
+                    evaluation.direction_movement_share
+                ),
+                "local_trend_to_noise": evaluation.trend_to_noise,
+                "local_typical_scale": evaluation.typical_scale,
+                "local_noise_scale": evaluation.noise_scale,
+                "local_noise_scale_source": evaluation.noise_scale_source,
+                "local_noise_ratio": _local_noise_ratio(evaluation),
+                "local_regime_class": local_class,
+                "in_global_trend": False,
+                "global_trend_regime_role": GLOBAL_NOT_INCLUDED,
+            }
+        )
+    return rows, evaluations
+
+
+def _select_global_regime_indices(
+    values: np.ndarray,
+    local_rows: Sequence[Dict[str, object]],
+    local_evaluations: Sequence[TrendEvaluation],
+    thresholds: TrendThresholds,
+    model_config: TrendModelConfig,
+) -> Tuple[Tuple[int, ...], Optional[TrendEvaluation]]:
+    """Расширить последний тренд назад через совместимые режимы и один FLAT.
+
+    Args:
+        values: Полная активная GMV-история.
+        local_rows: Диагностика выбранных режимов в хронологическом порядке.
+        local_evaluations: Синхронные результаты ``evaluate_trend``.
+        thresholds: Действующий бизнес-контракт тренда.
+        model_config: Ограничение числа FLAT-мостов.
+
+    Returns:
+        Индексы режимов глобального тренда и диагностику всего объединённого
+        окна. Пустой tuple означает, что последний режим не является трендом.
+
+    Raises:
+        ValueError: Если локальные таблицы не синхронны.
+
+    Examples:
+        >>> rows, evaluations = _evaluate_selected_regimes(
+        ...     np.asarray([1,2,3,4,5,6,7,8], dtype=float), list(range(8)),
+        ...     [(0,4),(4,8)], TrendThresholds(), TrendModelConfig()
+        ... )
+        >>> _select_global_regime_indices(
+        ...     np.asarray([1,2,3,4,5,6,7,8], dtype=float), rows,
+        ...     evaluations, TrendThresholds(), TrendModelConfig()
+        ... )[0]
+        (0, 1)
+    """
+
+    if len(local_rows) != len(local_evaluations):
+        raise ValueError("Локальные режимы и evaluations должны быть синхронны")
+    if not local_rows:
+        return tuple(), None
+    last_index = len(local_rows) - 1
+    direction = str(local_rows[last_index]["local_regime_class"])
+    if direction not in {GROWTH, DECLINE}:
+        return tuple(), None
+
+    committed_start = last_index
+    global_evaluation = local_evaluations[last_index]
+    pending_flat_count = 0
+    maximum_flats = int(model_config.global_max_flat_bridge_regimes)
+    global_end = int(local_rows[last_index]["end"])
+
+    for regime_index in range(last_index - 1, -1, -1):
+        local_class = str(local_rows[regime_index]["local_regime_class"])
+        if local_class == LOCAL_FLAT:
+            pending_flat_count += 1
+            if pending_flat_count > maximum_flats:
+                break
+            continue
+        if local_class != direction:
+            break
+
+        candidate_start = int(local_rows[regime_index]["start"])
+        candidate_evaluation = evaluate_trend(
+            values[candidate_start:global_end],
+            thresholds,
+        )
+        if not (
+            candidate_evaluation.trend_exists
+            and candidate_evaluation.direction == direction
+        ):
+            break
+        committed_start = regime_index
+        global_evaluation = candidate_evaluation
+        pending_flat_count = 0
+
+    included = tuple(range(committed_start, last_index + 1))
+    return included, global_evaluation
+
+
+def _build_selected_changepoint_rows(
+    values: np.ndarray,
+    dates: Sequence[object],
+    selected_segments: Sequence[Tuple[int, int]],
+    cache: Dict[Tuple[int, int], SegmentCostResult],
+    local_rows: Sequence[Dict[str, object]],
+    local_evaluations: Sequence[TrendEvaluation],
+    included_global_indices: Sequence[int],
+    sigma_estimate: SigmaEstimate,
+    beta: float,
+    model_config: TrendModelConfig,
+) -> List[Dict[str, object]]:
+    """Построить post-classification каждой выбранной structural CP.
+
+    Args:
+        values: Активная GMV-история.
+        dates: Активная календарная ось.
+        selected_segments: Выбранные режимы DP.
+        cache: Неизменённые segment costs.
+        local_rows: Локальная классификация режимов.
+        local_evaluations: Результаты ``evaluate_trend`` локальных режимов.
+        included_global_indices: Индексы режимов глобального тренда.
+        sigma_estimate: Единая sigma ряда.
+        beta: Неизменённый penalty за CP.
+        model_config: Порог structural post-classification.
+
+    Returns:
+        Одну строку на границу соседних выбранных режимов.
+
+    Raises:
+        ValueError: Если выбранные сегменты и диагностики не синхронны.
+
+    Examples:
+        >>> # Вызывается после восстановления selected_segments.
+    """
+
+    if not (
+        len(selected_segments) == len(local_rows) == len(local_evaluations)
+    ):
+        raise ValueError("Выбранные режимы и локальная диагностика не синхронны")
+    included = set(int(index) for index in included_global_indices)
+    global_start = min(included) if included else None
+    global_direction = (
+        str(local_rows[max(included)]["local_regime_class"])
+        if included
+        else NO_DIRECTION
+    )
+    rows: List[Dict[str, object]] = []
+    cp_count = max(0, len(selected_segments) - 1)
+    threshold = float(model_config.most_recent_cp_change_z_threshold)
+    for current_index in range(1, len(selected_segments)):
+        previous_index = current_index - 1
+        previous_start, previous_end = selected_segments[previous_index]
+        current_start, current_end = selected_segments[current_index]
+        if previous_end != current_start:
+            raise ValueError("Соседние выбранные режимы должны стыковаться")
+        tau = int(current_start)
+        previous_cost = cache[(previous_start, previous_end)]
+        current_cost = cache[(current_start, current_end)]
+        delta_slope = float(current_cost.slope - previous_cost.slope)
+        # [FIXED] Сохраняем прежний порядок float-операций последнего CP
+        # побитово; global layer не должен менять существующую диагностику.
+        level_shift = float(
+            (
+                current_cost.intercept
+                + current_cost.slope * float(tau)
+            )
+            - (
+                previous_cost.intercept
+                + previous_cost.slope * float(tau)
+            )
+        )
+        previous_diagnostic = _fit_ols_regime_diagnostic(
+            values,
+            previous_start,
+            previous_end,
+        )
+        current_diagnostic = _fit_ols_regime_diagnostic(
+            values,
+            current_start,
+            current_end,
+        )
+        (
+            classification_delta_slope,
+            slope_change_se,
+            slope_change_z,
+        ) = _calculate_slope_change_statistics(
+            previous_diagnostic,
+            current_diagnostic,
+            sigma_estimate.sigma,
+            values,
+        )
+        (
+            classification_level_shift,
+            level_shift_se,
+            level_shift_z,
+        ) = _calculate_level_shift_statistics(
+            previous_diagnostic,
+            current_diagnostic,
+            tau,
+            sigma_estimate.sigma,
+            values,
+        )
+        structural_type = _classify_structural_change(
+            True,
+            level_shift_z,
+            slope_change_z,
+            threshold,
+        )
+        previous_evaluation = local_evaluations[previous_index]
+        current_evaluation = local_evaluations[current_index]
+        inside_global = previous_index in included and current_index in included
+        start_cp = bool(
+            global_start is not None
+            and current_index == global_start
+            and previous_index not in included
+        )
+        adverse_level_shift = bool(
+            global_direction in {GROWTH, DECLINE}
+            and level_shift_z >= threshold
+            and (
+                (global_direction == GROWTH and classification_level_shift < 0.0)
+                or (
+                    global_direction == DECLINE
+                    and classification_level_shift > 0.0
+                )
+            )
+        )
+        rows.append(
+            {
+                "changepoint_order": int(current_index),
+                "changepoint_count": int(cp_count),
+                "is_last_changepoint": current_index == cp_count,
+                "cp_index": tau,
+                "left_end_date": dates[tau - 1],
+                "right_start_date": dates[tau],
+                "previous_regime_index": int(previous_index),
+                "current_regime_index": int(current_index),
+                "previous_regime_start": int(previous_start),
+                "previous_regime_end": int(previous_end),
+                "current_regime_start": int(current_start),
+                "current_regime_end": int(current_end),
+                "previous_regime_start_date": dates[previous_start],
+                "previous_regime_end_date": dates[previous_end - 1],
+                "current_regime_start_date": dates[current_start],
+                "current_regime_end_date": dates[current_end - 1],
+                "previous_regime_points": int(previous_end - previous_start),
+                "current_regime_points": int(current_end - current_start),
+                "previous_regime_class": local_rows[previous_index][
+                    "local_regime_class"
+                ],
+                "current_regime_class": local_rows[current_index][
+                    "local_regime_class"
+                ],
+                "connects_flat_regime": bool(
+                    local_rows[previous_index]["local_regime_class"]
+                    == LOCAL_FLAT
+                    or local_rows[current_index]["local_regime_class"]
+                    == LOCAL_FLAT
+                ),
+                "cp_inside_global_trend": inside_global,
+                "global_trend_start_cp": start_cp,
+                "global_trend_direction": global_direction,
+                "adverse_significant_level_shift": adverse_level_shift,
+                "cost_type": model_config.most_recent_cp_cost,
+                "sigma": sigma_estimate.sigma,
+                "sigma_source": sigma_estimate.source,
+                "beta": float(beta),
+                "change_z_threshold": threshold,
+                "previous_regime_slope": previous_cost.slope,
+                "current_regime_slope": current_cost.slope,
+                "delta_slope": delta_slope,
+                "level_shift": level_shift,
+                "structural_change_type": structural_type,
+                "classification_previous_slope_ols": (
+                    previous_diagnostic.slope
+                ),
+                "classification_current_slope_ols": current_diagnostic.slope,
+                "classification_delta_slope_ols": (
+                    classification_delta_slope
+                ),
+                "classification_level_shift_ols": (
+                    classification_level_shift
+                ),
+                "slope_change_se": slope_change_se,
+                "level_shift_se": level_shift_se,
+                "slope_change_z": slope_change_z,
+                "level_shift_z": level_shift_z,
+                "previous_regime_trend_exists": bool(
+                    previous_evaluation.trend_exists
+                ),
+                "previous_regime_trend_direction": (
+                    previous_evaluation.direction
+                    if previous_evaluation.trend_exists
+                    else NO_DIRECTION
+                ),
+                "previous_regime_trend_status": previous_evaluation.status,
+                "current_regime_trend_exists": bool(
+                    current_evaluation.trend_exists
+                ),
+                "current_regime_trend_direction": (
+                    current_evaluation.direction
+                    if current_evaluation.trend_exists
+                    else NO_DIRECTION
+                ),
+                "current_regime_trend_status": current_evaluation.status,
+                "direction_change": _classify_direction_change(
+                    True,
+                    previous_evaluation,
+                    current_evaluation,
+                ),
+            }
+        )
+    return rows
 
 
 def estimate_series_sigma(values: Sequence[float]) -> SigmaEstimate:
@@ -1012,6 +1816,19 @@ def _empty_summary(
         "min_segment_points": model_config.most_recent_cp_min_segment_points,
         "capped_k": model_config.most_recent_cp_capped_k,
         "huber_delta": model_config.most_recent_cp_huber_delta,
+        "change_z_threshold": model_config.most_recent_cp_change_z_threshold,
+        "global_flat_max_relative_slope": (
+            model_config.global_flat_max_relative_slope
+        ),
+        "global_flat_max_total_change": (
+            model_config.global_flat_max_total_change
+        ),
+        "global_flat_max_noise_ratio": (
+            model_config.global_flat_max_noise_ratio
+        ),
+        "global_max_flat_bridge_regimes": (
+            model_config.global_max_flat_bridge_regimes
+        ),
         "sigma": math.nan,
         "sigma_source": "NOT_EVALUATED",
         "beta": math.nan,
@@ -1043,6 +1860,42 @@ def _empty_summary(
         "current_regime_slope": math.nan,
         "delta_slope": math.nan,
         "level_shift": math.nan,
+        # [ADDED] OLS-only post-classification не вычисляется без structural CP.
+        "structural_change_type": NO_STRUCTURAL_CHANGE,
+        "classification_previous_slope_ols": math.nan,
+        "classification_current_slope_ols": math.nan,
+        "classification_delta_slope_ols": math.nan,
+        "classification_level_shift_ols": math.nan,
+        "slope_change_se": math.nan,
+        "level_shift_se": math.nan,
+        "slope_change_z": math.nan,
+        "level_shift_z": math.nan,
+        "previous_regime_trend_exists": False,
+        "previous_regime_trend_direction": NO_DIRECTION,
+        "previous_regime_trend_status": "NOT_EVALUATED",
+        "direction_change": False,
+        # [ADDED] Глобальный тренд — отдельная надстройка над current trend.
+        "global_trend_exists": False,
+        "global_trend_direction": NO_DIRECTION,
+        "global_trend_length": 0,
+        "global_trend_start_date": None,
+        "global_trend_end_date": None,
+        "global_trend_regime_count": 0,
+        "global_trend_changepoint_count": 0,
+        "global_trend_flat_regime_count": 0,
+        "global_trend_structure": "",
+        "global_trend_structure_json": "[]",
+        "global_trend_start_gmv": math.nan,
+        "global_trend_end_gmv": math.nan,
+        "global_trend_gmv_change_abs": math.nan,
+        "global_trend_gmv_change_relative": math.nan,
+        "global_trend_slope_abs": math.nan,
+        "global_trend_slope_relative": math.nan,
+        "global_trend_total_change": math.nan,
+        "global_direction_count_share": math.nan,
+        "global_direction_movement_share": math.nan,
+        "global_trend_to_noise": math.nan,
+        "global_trend_status": "NOT_EVALUATED",
     }
 
 
@@ -1103,6 +1956,7 @@ def analyze_most_recent_cp_series(
             cp_profile=tuple(),
             segment_diagnostics=tuple(),
             segmentation=tuple(),
+            changepoints=tuple(),
         )
     if used_points < minimum:
         return MostRecentCPAnalysis(
@@ -1115,6 +1969,7 @@ def analyze_most_recent_cp_series(
             cp_profile=tuple(),
             segment_diagnostics=tuple(),
             segmentation=tuple(),
+            changepoints=tuple(),
         )
 
     used_values = np.asarray(used_values_list, dtype=float)
@@ -1173,24 +2028,114 @@ def analyze_most_recent_cp_series(
     selected_objective = float(selected_candidate["G_tau"])
     current_start = tau_star
     current_cost = cache[(current_start, used_points)]
-    current_evaluation = evaluate_trend(
-        used_values[current_start:],
+    local_rows, local_evaluations = _evaluate_selected_regimes(
+        used_values,
+        used_dates,
+        selected_segments,
         thresholds,
+        model_config,
     )
+    current_evaluation = local_evaluations[-1]
     current_exists = bool(current_evaluation.trend_exists)
-    previous_slope = math.nan
-    delta_slope = math.nan
-    level_shift = math.nan
-    if tau_star > 0:
-        previous_start, previous_end = selected_segments[-2]
-        previous_cost = cache[(previous_start, previous_end)]
-        previous_slope = previous_cost.slope
-        delta_slope = current_cost.slope - previous_cost.slope
-        level_shift = (
-            current_cost.intercept + current_cost.slope * float(tau_star)
-        ) - (
-            previous_cost.intercept + previous_cost.slope * float(tau_star)
+    included_global_indices, global_evaluation = _select_global_regime_indices(
+        used_values,
+        local_rows,
+        local_evaluations,
+        thresholds,
+        model_config,
+    )
+    included_global_set = set(included_global_indices)
+    for regime_index, local_row in enumerate(local_rows):
+        in_global = regime_index in included_global_set
+        local_row["in_global_trend"] = in_global
+        local_row["global_trend_regime_role"] = (
+            GLOBAL_FLAT_BRIDGE
+            if in_global and local_row["local_regime_class"] == LOCAL_FLAT
+            else GLOBAL_DIRECTIONAL
+            if in_global
+            else GLOBAL_NOT_INCLUDED
         )
+
+    changepoint_rows = _build_selected_changepoint_rows(
+        used_values,
+        used_dates,
+        selected_segments,
+        cache,
+        local_rows,
+        local_evaluations,
+        included_global_indices,
+        sigma_estimate,
+        beta,
+        model_config,
+    )
+    last_changepoint = changepoint_rows[-1] if changepoint_rows else None
+    previous_evaluation = (
+        local_evaluations[-2] if len(local_evaluations) > 1 else None
+    )
+
+    global_exists = bool(included_global_indices)
+    global_start_index = (
+        int(local_rows[included_global_indices[0]]["start"])
+        if global_exists
+        else None
+    )
+    global_end_index = (
+        int(local_rows[included_global_indices[-1]]["end"])
+        if global_exists
+        else None
+    )
+    global_structure_rows = (
+        [local_rows[index] for index in included_global_indices]
+        if global_exists
+        else []
+    )
+    global_structure = " -> ".join(
+        f"{row['local_regime_class']}({int(row['points'])})"
+        for row in global_structure_rows
+    )
+    global_structure_json = json.dumps(
+        [
+            {
+                "segment_index": int(row["segment_index"]),
+                "type": row["local_regime_class"],
+                "role": row["global_trend_regime_role"],
+                "points": int(row["points"]),
+                "start_date": row["start_date"],
+                "end_date": row["end_date"],
+                "start_gmv": row["local_start_gmv"],
+                "end_gmv": row["local_end_gmv"],
+                "gmv_change_abs": row["local_gmv_change_abs"],
+                "gmv_change_relative": row["local_gmv_change_relative"],
+                "slope_abs": row["local_trend_slope_abs"],
+                "slope_relative": row["local_trend_slope_relative"],
+                "total_change": row["local_trend_total_change"],
+                "trend_to_noise": row["local_trend_to_noise"],
+            }
+            for row in global_structure_rows
+        ],
+        ensure_ascii=False,
+        default=str,
+    )
+    global_start_gmv = (
+        float(used_values[global_start_index]) if global_exists else math.nan
+    )
+    global_end_gmv = (
+        float(used_values[global_end_index - 1]) if global_exists else math.nan
+    )
+    global_gmv_change = (
+        float(global_end_gmv - global_start_gmv)
+        if global_exists
+        else math.nan
+    )
+    global_gmv_change_relative = (
+        float(global_gmv_change / abs(global_start_gmv))
+        if global_exists
+        and not _effectively_zero(
+            np.asarray([global_start_gmv], dtype=float),
+            used_values[global_start_index:global_end_index],
+        )
+        else math.nan
+    )
 
     summary = {
         "status": "TREND" if current_exists else "NO_TREND",
@@ -1202,6 +2147,19 @@ def analyze_most_recent_cp_series(
         "min_segment_points": minimum,
         "capped_k": model_config.most_recent_cp_capped_k,
         "huber_delta": model_config.most_recent_cp_huber_delta,
+        "change_z_threshold": model_config.most_recent_cp_change_z_threshold,
+        "global_flat_max_relative_slope": (
+            model_config.global_flat_max_relative_slope
+        ),
+        "global_flat_max_total_change": (
+            model_config.global_flat_max_total_change
+        ),
+        "global_flat_max_noise_ratio": (
+            model_config.global_flat_max_noise_ratio
+        ),
+        "global_max_flat_bridge_regimes": (
+            model_config.global_max_flat_bridge_regimes
+        ),
         "sigma": sigma_estimate.sigma,
         "sigma_source": sigma_estimate.source,
         "beta": beta,
@@ -1249,10 +2207,153 @@ def analyze_most_recent_cp_series(
             current_evaluation.trend_to_noise if current_exists else math.nan
         ),
         "current_regime_trend_status": current_evaluation.status,
-        "previous_regime_slope": previous_slope,
+        "previous_regime_slope": (
+            last_changepoint["previous_regime_slope"]
+            if last_changepoint is not None
+            else math.nan
+        ),
         "current_regime_slope": current_cost.slope,
-        "delta_slope": delta_slope,
-        "level_shift": level_shift,
+        "delta_slope": (
+            last_changepoint["delta_slope"]
+            if last_changepoint is not None
+            else math.nan
+        ),
+        "level_shift": (
+            last_changepoint["level_shift"]
+            if last_changepoint is not None
+            else math.nan
+        ),
+        "structural_change_type": (
+            last_changepoint["structural_change_type"]
+            if last_changepoint is not None
+            else NO_STRUCTURAL_CHANGE
+        ),
+        "classification_previous_slope_ols": (
+            last_changepoint["classification_previous_slope_ols"]
+            if last_changepoint is not None
+            else math.nan
+        ),
+        "classification_current_slope_ols": (
+            last_changepoint["classification_current_slope_ols"]
+            if last_changepoint is not None
+            else math.nan
+        ),
+        "classification_delta_slope_ols": (
+            last_changepoint["classification_delta_slope_ols"]
+            if last_changepoint is not None
+            else math.nan
+        ),
+        "classification_level_shift_ols": (
+            last_changepoint["classification_level_shift_ols"]
+            if last_changepoint is not None
+            else math.nan
+        ),
+        "slope_change_se": (
+            last_changepoint["slope_change_se"]
+            if last_changepoint is not None
+            else math.nan
+        ),
+        "level_shift_se": (
+            last_changepoint["level_shift_se"]
+            if last_changepoint is not None
+            else math.nan
+        ),
+        "slope_change_z": (
+            last_changepoint["slope_change_z"]
+            if last_changepoint is not None
+            else math.nan
+        ),
+        "level_shift_z": (
+            last_changepoint["level_shift_z"]
+            if last_changepoint is not None
+            else math.nan
+        ),
+        "previous_regime_trend_exists": bool(
+            last_changepoint is not None
+            and last_changepoint["previous_regime_trend_exists"]
+        ),
+        "previous_regime_trend_direction": (
+            last_changepoint["previous_regime_trend_direction"]
+            if last_changepoint is not None
+            else NO_DIRECTION
+        ),
+        "previous_regime_trend_status": (
+            last_changepoint["previous_regime_trend_status"]
+            if last_changepoint is not None
+            else "NOT_EVALUATED"
+        ),
+        "direction_change": (
+            bool(last_changepoint["direction_change"])
+            if last_changepoint is not None
+            else False
+        ),
+        "global_trend_exists": global_exists,
+        "global_trend_direction": (
+            global_evaluation.direction
+            if global_exists and global_evaluation is not None
+            else NO_DIRECTION
+        ),
+        "global_trend_length": (
+            int(global_end_index - global_start_index)
+            if global_exists
+            else 0
+        ),
+        "global_trend_start_date": (
+            used_dates[global_start_index] if global_exists else None
+        ),
+        "global_trend_end_date": (
+            used_dates[global_end_index - 1] if global_exists else None
+        ),
+        "global_trend_regime_count": len(included_global_indices),
+        "global_trend_changepoint_count": max(
+            0,
+            len(included_global_indices) - 1,
+        ),
+        "global_trend_flat_regime_count": sum(
+            row["local_regime_class"] == LOCAL_FLAT
+            for row in global_structure_rows
+        ),
+        "global_trend_structure": global_structure,
+        "global_trend_structure_json": global_structure_json,
+        "global_trend_start_gmv": global_start_gmv,
+        "global_trend_end_gmv": global_end_gmv,
+        "global_trend_gmv_change_abs": global_gmv_change,
+        "global_trend_gmv_change_relative": global_gmv_change_relative,
+        "global_trend_slope_abs": (
+            global_evaluation.slope
+            if global_exists and global_evaluation is not None
+            else math.nan
+        ),
+        "global_trend_slope_relative": (
+            global_evaluation.relative_slope
+            if global_exists and global_evaluation is not None
+            else math.nan
+        ),
+        "global_trend_total_change": (
+            global_evaluation.total_change
+            if global_exists and global_evaluation is not None
+            else math.nan
+        ),
+        "global_direction_count_share": (
+            global_evaluation.direction_count_share
+            if global_exists and global_evaluation is not None
+            else math.nan
+        ),
+        "global_direction_movement_share": (
+            global_evaluation.direction_movement_share
+            if global_exists and global_evaluation is not None
+            else math.nan
+        ),
+        "global_trend_to_noise": (
+            global_evaluation.trend_to_noise
+            if global_exists and global_evaluation is not None
+            else math.nan
+        ),
+        "global_trend_status": (
+            global_evaluation.status
+            if global_exists and global_evaluation is not None
+            else "NOT_EVALUATED"
+        ),
     }
 
     profile_rows: List[Dict[str, object]] = []
@@ -1308,22 +2409,37 @@ def analyze_most_recent_cp_series(
         cumulative_objective += cost_result.cost
         if segment_index > 0:
             cumulative_objective += beta
-        segmentation_rows.append(
+        segmentation_row = {
+            "segment_index": segment_index,
+            **asdict(cost_result),
+            "start_date": used_dates[cost_result.start],
+            "end_date": used_dates[cost_result.end - 1],
+            "changepoint_penalty": beta if segment_index > 0 else 0.0,
+            "cumulative_objective": cumulative_objective,
+        }
+        segmentation_row.update(
             {
-                "segment_index": segment_index,
-                **asdict(cost_result),
-                "start_date": used_dates[cost_result.start],
-                "end_date": used_dates[cost_result.end - 1],
-                "changepoint_penalty": beta if segment_index > 0 else 0.0,
-                "cumulative_objective": cumulative_objective,
+                key: value
+                for key, value in local_rows[segment_index].items()
+                if key
+                not in {
+                    "segment_index",
+                    "start",
+                    "end",
+                    "start_date",
+                    "end_date",
+                    "points",
+                }
             }
         )
+        segmentation_rows.append(segmentation_row)
 
     return MostRecentCPAnalysis(
         summary=summary,
         cp_profile=tuple(profile_rows),
         segment_diagnostics=tuple(segment_rows),
         segmentation=tuple(segmentation_rows),
+        changepoints=tuple(changepoint_rows),
     )
 
 
@@ -1398,6 +2514,9 @@ def analyze_segment_most_recent_cp(
         segmentation=tuple(
             {**metadata, **row} for row in result.segmentation
         ),
+        changepoints=tuple(
+            {**metadata, **row} for row in result.changepoints
+        ),
     )
 
 
@@ -1415,6 +2534,7 @@ MOST_RECENT_CP_SUMMARY_COLUMNS = (
     "min_segment_points",
     "capped_k",
     "huber_delta",
+    "change_z_threshold",
     "sigma",
     "sigma_source",
     "beta",
@@ -1446,6 +2566,44 @@ MOST_RECENT_CP_SUMMARY_COLUMNS = (
     "current_regime_slope",
     "delta_slope",
     "level_shift",
+    "structural_change_type",
+    "classification_previous_slope_ols",
+    "classification_current_slope_ols",
+    "classification_delta_slope_ols",
+    "classification_level_shift_ols",
+    "slope_change_se",
+    "level_shift_se",
+    "slope_change_z",
+    "level_shift_z",
+    "previous_regime_trend_exists",
+    "previous_regime_trend_direction",
+    "previous_regime_trend_status",
+    "direction_change",
+    "global_flat_max_relative_slope",
+    "global_flat_max_total_change",
+    "global_flat_max_noise_ratio",
+    "global_max_flat_bridge_regimes",
+    "global_trend_exists",
+    "global_trend_direction",
+    "global_trend_length",
+    "global_trend_start_date",
+    "global_trend_end_date",
+    "global_trend_regime_count",
+    "global_trend_changepoint_count",
+    "global_trend_flat_regime_count",
+    "global_trend_structure",
+    "global_trend_structure_json",
+    "global_trend_start_gmv",
+    "global_trend_end_gmv",
+    "global_trend_gmv_change_abs",
+    "global_trend_gmv_change_relative",
+    "global_trend_slope_abs",
+    "global_trend_slope_relative",
+    "global_trend_total_change",
+    "global_direction_count_share",
+    "global_direction_movement_share",
+    "global_trend_to_noise",
+    "global_trend_status",
 )
 
 MOST_RECENT_CP_PROFILE_COLUMNS = (
@@ -1511,6 +2669,83 @@ MOST_RECENT_CP_SEGMENTATION_COLUMNS = (
     "optimizer_status",
     "changepoint_penalty",
     "cumulative_objective",
+    "local_start_gmv",
+    "local_end_gmv",
+    "local_gmv_change_abs",
+    "local_gmv_change_relative",
+    "local_trend_exists",
+    "local_trend_direction",
+    "local_trend_status",
+    "local_trend_slope_abs",
+    "local_trend_slope_relative",
+    "local_trend_total_change",
+    "local_direction_count_share",
+    "local_direction_movement_share",
+    "local_trend_to_noise",
+    "local_typical_scale",
+    "local_noise_scale",
+    "local_noise_scale_source",
+    "local_noise_ratio",
+    "local_regime_class",
+    "in_global_trend",
+    "global_trend_regime_role",
+)
+
+MOST_RECENT_CP_CHANGEPOINT_COLUMNS = (
+    "segment_id",
+    "segment_key",
+    "segment_level",
+    "slice_depth",
+    "changepoint_order",
+    "changepoint_count",
+    "is_last_changepoint",
+    "cp_index",
+    "left_end_date",
+    "right_start_date",
+    "previous_regime_index",
+    "current_regime_index",
+    "previous_regime_start",
+    "previous_regime_end",
+    "current_regime_start",
+    "current_regime_end",
+    "previous_regime_start_date",
+    "previous_regime_end_date",
+    "current_regime_start_date",
+    "current_regime_end_date",
+    "previous_regime_points",
+    "current_regime_points",
+    "previous_regime_class",
+    "current_regime_class",
+    "connects_flat_regime",
+    "cp_inside_global_trend",
+    "global_trend_start_cp",
+    "global_trend_direction",
+    "adverse_significant_level_shift",
+    "cost_type",
+    "sigma",
+    "sigma_source",
+    "beta",
+    "change_z_threshold",
+    "previous_regime_slope",
+    "current_regime_slope",
+    "delta_slope",
+    "level_shift",
+    "structural_change_type",
+    "classification_previous_slope_ols",
+    "classification_current_slope_ols",
+    "classification_delta_slope_ols",
+    "classification_level_shift_ols",
+    "slope_change_se",
+    "level_shift_se",
+    "slope_change_z",
+    "level_shift_z",
+    "previous_regime_trend_exists",
+    "previous_regime_trend_direction",
+    "previous_regime_trend_status",
+    "current_regime_trend_exists",
+    "current_regime_trend_direction",
+    "current_regime_trend_status",
+    "direction_change",
 )
 
 
@@ -1530,7 +2765,8 @@ def build_most_recent_cp_trend_analysis(
 
     Returns:
         ``trend_summary``, ``trend_cp_profile``,
-        ``trend_segment_diagnostics`` и ``trend_segmentation``.
+        ``trend_segment_diagnostics``, ``trend_segmentation`` и
+        ``trend_changepoints``.
 
     Raises:
         ValueError: Если панель пуста или конфигурация не Most Recent CP.
@@ -1538,7 +2774,7 @@ def build_most_recent_cp_trend_analysis(
     Examples:
         >>> panel = pd.DataFrame({'segment_id': ['s'] * 4, 'cal_date': [1, 2, 3, 4], 'gmv': [1, 2, 3, 4]})
         >>> sorted(build_most_recent_cp_trend_analysis(panel, [1, 2, 3, 4]))
-        ['trend_cp_profile', 'trend_segment_diagnostics', 'trend_segmentation', 'trend_summary']
+        ['trend_changepoints', 'trend_cp_profile', 'trend_segment_diagnostics', 'trend_segmentation', 'trend_summary']
     """
 
     thresholds = thresholds or TrendThresholds()
@@ -1561,6 +2797,7 @@ def build_most_recent_cp_trend_analysis(
     profile_rows: List[Dict[str, object]] = []
     segment_rows: List[Dict[str, object]] = []
     segmentation_rows: List[Dict[str, object]] = []
+    changepoint_rows: List[Dict[str, object]] = []
     for _, segment_panel in panel_df.groupby(
         "segment_id",
         sort=True,
@@ -1576,6 +2813,7 @@ def build_most_recent_cp_trend_analysis(
         profile_rows.extend(result.cp_profile)
         segment_rows.extend(result.segment_diagnostics)
         segmentation_rows.extend(result.segmentation)
+        changepoint_rows.extend(result.changepoints)
     return {
         "trend_summary": _ordered_frame(
             summaries,
@@ -1593,14 +2831,26 @@ def build_most_recent_cp_trend_analysis(
             segmentation_rows,
             MOST_RECENT_CP_SEGMENTATION_COLUMNS,
         ),
+        "trend_changepoints": _ordered_frame(
+            changepoint_rows,
+            MOST_RECENT_CP_CHANGEPOINT_COLUMNS,
+        ),
     }
 
 
 __all__ = [
+    "LEVEL_AND_SLOPE",
+    "LEVEL_SHIFT",
+    "LOCAL_FLAT",
+    "LOCAL_UNCONFIRMED",
     "MAE_FALLBACK",
+    "NO_STRUCTURAL_CHANGE",
     "OLS_RESIDUAL_MAD",
+    "OLSRegimeDiagnostic",
     "PERFECT_FIT",
     "DIFF_MAD",
+    "SLOPE_CHANGE",
+    "WEAK_OR_UNCLASSIFIED",
     "MostRecentCPAnalysis",
     "SegmentCostResult",
     "SigmaEstimate",
